@@ -14,7 +14,7 @@ const logger = pino({ level: "silent" });
 const fixture = fileURLToPath(new URL("./fixtures/isolated-permission-agent.mjs", import.meta.url));
 const allow = { outcome: { outcome: "selected" as const, optionId: "allow" } };
 
-async function interruptedSchedule(policy: "always" | "ask") {
+async function interruptedSchedule(policy: "always" | "ask", detach = true) {
   const h = await savedSessionHost({ ...executables, agentFixture: fixture });
   const now = new Date().toISOString();
   h.store.upsert({ ...h.record, configJson: JSON.stringify({ permissionPolicy: policy }) });
@@ -30,8 +30,9 @@ async function interruptedSchedule(policy: "always" | "ask") {
   h.store.turnAttempts.registerOwner("old-controller");
   const attempt = h.store.turnAttempts.claim({ id: occurrence.id, target: row.channelRef, prompt: row.promptText,
     session: "isolated", kind: "scheduled", createdUtc: now }, occurrence.execution.fingerprint, "old-controller", "schedule");
+  let answerPending = false;
   const runtime = new AgentRuntime({ profile: router.getProfile("codex", "fixture")!, logger,
-    permissionPolicy: () => new Promise(() => {}),
+    permissionPolicy: () => answerPending ? Promise.resolve(allow) : new Promise(() => {}),
     bridgeHealth: h.mux,
     spawnFn: () => spawnRemoteSlot(h.mux, { agentId: "codex", cwd: h.root, mcpServers: [],
       rung1Recovery: DEFAULT_REMOTE_RUNG1_POLICY }) });
@@ -50,13 +51,67 @@ async function interruptedSchedule(policy: "always" | "ask") {
     .toMatchObject({ state: "pending" }), { timeout: 10_000 });
   expect(h.store.turnAttempts.get(attempt.id)?.remoteRecovery).toMatchObject({ slot, acpSessionId: info.sessionId });
   const owner = (await h.client.listSlots()).health.find(row => row.slot === slot)!;
-  await runtime.detach();
-  await original;
-  h.store.turnAttempts.suspendBoot("old-controller");
-  return { h, attempt, slot, permission, owner };
+  if (detach) {
+    await runtime.detach();
+    await original;
+    h.store.turnAttempts.suspendBoot("old-controller");
+  }
+  return { h, attempt, slot, permission, owner, runtime, original,
+    releasePolicy: () => { answerPending = true; } };
 }
 
 describe("isolated restart adoption services the surviving permission", () => {
+  it("re-delivers an acknowledged permission after replacing the bridge while its original ACP client stays connected", async () => {
+    const { h, slot, permission, owner, runtime, original, releasePolicy } = await interruptedSchedule("always", false);
+    try {
+      const replay = await h.client.replayOutput({ slot, afterSeq: 0 });
+      await h.slots.ack(slot, replay.frames.at(-1)!.seq);
+      releasePolicy();
+      await h.restartBridge();
+      await vi.waitFor(async () => {
+        const answers = (await h.requests()).filter(row => row.id === permission.requestId && row.result);
+        expect(answers).toHaveLength(1);
+        expect(answers[0]).toMatchObject({ result: allow });
+      }, { timeout: 10_000 });
+      await original;
+      const requests = await h.requests();
+      expect(requests.filter(row => row.method === "session/prompt")).toHaveLength(1);
+      expect(new Set(requests.map(row => row.pid)).size).toBe(1);
+      expect((await h.client.listSlots()).health.find(row => row.slot === slot))
+        .toMatchObject({ pid: owner.pid, alive: true });
+      expect(h.commands.filter(row => row.type === "kill")).toEqual([]);
+    } finally {
+      await runtime.detach();
+      await h.close();
+    }
+  }, 25_000);
+
+  it("settles the isolated occurrence after a bridge replacement with the permission output already acknowledged", async () => {
+    const { h, attempt, slot, permission, owner } = await interruptedSchedule("always");
+    const router = h.makeRouter();
+    const orch = h.makeOrchestrator(router);
+    try {
+      const replay = await h.client.replayOutput({ slot, afterSeq: 0 });
+      await h.slots.ack(slot, replay.frames.at(-1)!.seq);
+      await h.restartBridge();
+      const adoption = (orch as any).adoptRemoteRecoveryOwned(h.store.turnAttempts.get(attempt.id));
+      await vi.waitFor(() => expect(h.store.scheduledOccurrences.get(attempt.id)?.settled).toBe(true), { timeout: 10_000 });
+      await adoption;
+      const requests = await h.requests();
+      expect(requests.filter(row => row.id === permission.requestId && row.result)).toHaveLength(1);
+      expect(requests.filter(row => row.method === "session/prompt")).toHaveLength(1);
+      expect(new Set(requests.map(row => row.pid)).size).toBe(1);
+      expect((await h.client.listSlots()).health.find(row => row.slot === slot))
+        .toMatchObject({ pid: owner.pid, alive: true });
+      expect(h.notices.filter(row => row.text.includes("isolated finished once"))).toHaveLength(1);
+      expect(h.commands.filter(row => row.type === "kill")).toEqual([]);
+    } finally {
+      orch.suspendForRestart();
+      (orch as any).remoteAdoptionFinishers.get(attempt.id)?.();
+      await h.close();
+    }
+  }, 25_000);
+
   it("answers under the recorded policy, settles once without resending, and leaves a parallel live runtime untouched", async () => {
     const { h, attempt, slot, permission, owner } = await interruptedSchedule("always");
     const router = h.makeRouter();

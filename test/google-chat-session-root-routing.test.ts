@@ -19,9 +19,12 @@ function fixture() {
     thread: r.data?.thread ?? { name: `${space.name}/threads/new-output` }, sender: { name: "users/seam", type: "BOT" } }));
   const lifecycle = { space: () => space, appUser: () => "users/seam", recordAppUser: vi.fn(),
     start: vi.fn(async () => {}), stop: vi.fn(async () => {}), handle: vi.fn(async () => {}) };
+  const history = { getMessage: vi.fn(async (name: string) => ({ name, createTime: "2026-10-12T18:00:00Z",
+    sender: { name: "users/author", displayName: "Root Author", type: "HUMAN" },
+    text: "Root report", attachment: [{ contentName: "report.csv" }] })), readRawPage: vi.fn() };
   const adapter = new GoogleChatAdapter({ api: { request }, logger: pino({ level: "silent" }),
     subscription: "projects/test/subscriptions/events", allowedUserIds: new Set(["users/42"]),
-    defaultCwd: "/projects", spaceEvents: lifecycle, writeIntervalMs: 0 });
+    defaultCwd: "/projects", spaceEvents: lifecycle, historyReader: history, writeIntervalMs: 0 });
   const incoming: any[] = [];
   adapter.onMessage(msg => { incoming.push(msg); msg.onAdmitted?.(); });
   const ensureSessionRecord = vi.fn((input: any) => store.getByChannel("google-chat", input.channelRef) ?? {
@@ -35,7 +38,7 @@ function fixture() {
       thread: { name: `${space.name}/threads/${thread}` }, threadReply: reply,
       quotedMessageMetadata: reply ? { name: `${space.name}/messages/${thread}.root` } : undefined },
   }, undefined, undefined, source);
-  return { store, record, adapter, request, incoming, receive, ensureSessionRecord };
+  return { store, record, adapter, request, incoming, receive, ensureSessionRecord, history };
 }
 
 describe("one Google Chat session root with native per-prompt delivery", () => {
@@ -54,6 +57,27 @@ describe("one Google Chat session root with native per-prompt delivery", () => {
     await h.receive("not-ours", false, "workspace");
     expect(h.incoming).toHaveLength(0);
     expect(h.store.get(h.record.id)?.channelRef).toBe("elsewhere");
+  });
+
+  it("adds root context before admitting a native-thread prompt, while preserving its own delivery target", async () => {
+    const h = fixture(); await h.receive("reply", true, "workspace", "topic");
+    expect(h.incoming).toHaveLength(1);
+    expect(h.incoming[0]).toMatchObject({ channel, deliveryChannel: {
+      platform: "google-chat", id: "session-home.topic", parentId: "session-home" }, preemptive: false });
+    expect(h.incoming[0].text).toContain("[In thread under Root Author's message");
+    expect(h.incoming[0].text).toContain("2026-10-12T18:00:00Z");
+    expect(h.incoming[0].text).toContain("Root report");
+    expect(h.incoming[0].text).toContain("report.csv");
+    expect(h.incoming[0].text).toMatch(/\]\n\nPrompt reply$/);
+    expect(h.history.getMessage).toHaveBeenCalledExactlyOnceWith("spaces/session-home/messages/topic.root");
+    expect(h.history.readRawPage).not.toHaveBeenCalled();
+  });
+
+  it("keeps a context-read error's real cause and does not acknowledge an invented prompt", async () => {
+    const h = fixture(), cause = Object.assign(new Error("Google root read: permission denied"), { response: { status: 403 } });
+    h.history.getMessage.mockRejectedValueOnce(cause);
+    await expect(h.receive("reply", true, "workspace")).rejects.toBe(cause);
+    expect(h.incoming).toHaveLength(0);
   });
 
   it("keeps returned status-message references on their native thread, not the root", async () => {

@@ -37,3 +37,13 @@ export function googleErrorStatus(error: unknown): number | undefined {
   const e = error as { response?: { status?: number }; status?: number } | undefined;
   return e?.response?.status ?? e?.status;
 }
+
+export function isGoogleChatThreadReplyLimit(error: unknown): boolean {
+  const cause = (error as { response?: { data?: { error?: {
+    code?: number; status?: string; message?: string; errors?: Array<{ domain?: string; reason?: string }>;
+  } } } } | null)?.response?.data?.error;
+  return (googleErrorStatus(error) ?? cause?.code) === 429 && cause?.code === 429
+    && cause.status === "RESOURCE_EXHAUSTED"
+    && cause.message === "Cannot create reply since it has reached the threading reply limit."
+    && cause.errors?.some(item => item.domain === "global" && item.reason === "rateLimitExceeded") === true;
+}

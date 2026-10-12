@@ -1072,7 +1072,7 @@ export class Orchestrator {
       adapter: this.adapter,
       logger: this.logger,
       currentUserId: (channelRef) => this.currentAuthorIds.get(channelRef),
-      isTurnActive: (channelRef) => this.channelQueues.has(channelRef),
+      isTurnActive: (channelRef) => this.channelQueues.has(this.queueChannelRef(channelRef)),
       onCodexAsyncAnswer: (delivery) => this.admitCodexAsyncAnswer(delivery),
     });
     this.router.setElicitationHandlers({
@@ -2012,13 +2012,13 @@ export class Orchestrator {
   /** True when this thread has admitted work, including a tail whose runtime
    * has gone idle while its renderer/finalizer remains wedged (#180). */
   isChannelBusy(channelRef: string): boolean {
-    if (this.channelQueues.has(channelRef)) return true;
+    if (this.channelQueues.has(this.queueChannelRef(channelRef))) return true;
     return this.store.listInboundNonterminal(channelRef).length > 0;
   }
 
   private queueEpoch(channelRef: string): number {
     this.channelQueueEpochs ??= new Map<string, number>();
-    return this.channelQueueEpochs.get(channelRef) ?? 0;
+    return this.channelQueueEpochs.get(this.queueChannelRef(channelRef)) ?? 0;
   }
 
   private queueFenceCurrent(fence: ChannelQueueFence | undefined): boolean {
@@ -2039,7 +2039,13 @@ export class Orchestrator {
 
   /** Session for a bare channel ref on any platform. */
   private recordForChannel(channelRef: string): SessionRecord | null {
-    return this.store.getByChannelRef(channelRef);
+    return this.store.getByChannelRef(channelRef) ?? this.store.get(makeSessionId("google-chat", channelRef));
+  }
+
+  /** A moved Chat home still owns the original runtime's turn FIFO and fences. */
+  private queueChannelRef(channelRef: string): string {
+    const record = this.recordForChannel(channelRef);
+    return record?.platform === "google-chat" ? record.id.slice("google-chat:".length) : channelRef;
   }
 
   /** Platform that owns a bare channel ref; Discord when no session exists yet. */
@@ -2051,7 +2057,7 @@ export class Orchestrator {
   inspectChannelQueue(channelRef: string, nowMs = Date.now()): ChannelQueueHealth {
     this.channelQueueMeta ??= new Map<string, ChannelQueueMeta>();
     const record = this.recordForChannel(channelRef);
-    const meta = this.channelQueueMeta.get(channelRef);
+    const meta = this.channelQueueMeta.get(this.queueChannelRef(channelRef));
     // #570: a turn this queue is executing counts as busy even while the ACP
     // runtime reports idle between tool segments. Asking only the runtime let
     // the sweep fence work that was actively running.
@@ -2231,6 +2237,7 @@ export class Orchestrator {
   /** Detach the abandoned tail immediately. Old promises remain tracked by
    * #174's turn/continuation sets, but can no longer mutate this generation. */
   private advanceChannelQueueEpoch(channelRef: string): number {
+    channelRef = this.queueChannelRef(channelRef);
     this.channelQueueEpochs ??= new Map<string, number>();
     this.channelQueueMeta ??= new Map<string, ChannelQueueMeta>();
     const next = this.queueEpoch(channelRef) + 1;
@@ -2444,7 +2451,7 @@ export class Orchestrator {
     // "abort" mode falls through to the priority-interrupt path unchanged.
     if (
       this.config.SEAM_MIDTURN_REPLY_MODE === "inbox" &&
-      this.channelQueues.has(channelId) &&
+      this.channelQueues.has(this.queueChannelRef(channelId)) &&
       supersededElicitation === 0
     ) {
       await this.routeMidTurnReplyToInbox(msg);
@@ -2518,7 +2525,8 @@ export class Orchestrator {
 
     // Bump the generation so a preemptive recovered row queued before this
     // message stands down. Queued user messages are not superseded: each runs.
-    this.channelGenerations.set(channelId, (this.channelGenerations.get(channelId) ?? 0) + 1);
+    const queueRef = this.queueChannelRef(channelId);
+    this.channelGenerations.set(queueRef, (this.channelGenerations.get(queueRef) ?? 0) + 1);
 
     let interruptedDispatchFence: DispatchTargetFence | undefined;
     const resumeQueuedDispatches = async (): Promise<void> => {
@@ -2537,7 +2545,7 @@ export class Orchestrator {
       }
     };
 
-    if (this.channelQueues.has(channelId)) {
+    if (this.channelQueues.has(this.queueChannelRef(channelId))) {
       const channel = msg.channel;
       record ??= this.router.ensureSessionRecord({
         platform: channel.platform,
@@ -2652,6 +2660,7 @@ export class Orchestrator {
     recovery?: { lastActivityAt: () => number; onWatchdog: (error: TurnWatchdogTimeoutError) => Promise<void> },
     prepare?: (fence: ChannelQueueFence) => Promise<void>,
   ): Promise<T> {
+    channelId = this.queueChannelRef(channelId);
     this.channelQueueMeta ??= new Map<string, ChannelQueueMeta>();
     const epoch = this.queueEpoch(channelId);
     const existingMeta = this.channelQueueMeta.get(channelId);
@@ -2689,7 +2698,7 @@ export class Orchestrator {
           this.config.TURN_TIMEOUT_SECONDS ?? 900
         );
         const startedAt = Date.now();
-        const sessionId = makeSessionId(this.platformForChannel(channelId), channelId);
+        const sessionId = this.recordForChannel(channelId)?.id ?? makeSessionId(this.platformForChannel(channelId), channelId);
         const value = await settleWithTurnWatchdog(() => work, {
           timeoutMs,
           label: `channel turn ${channelId}`,
@@ -2868,12 +2877,12 @@ export class Orchestrator {
   private startRecoveredInbound(row: InboundAdmission, operatorResume = false,
     queueFence?: ChannelQueueFence): Promise<void> {
     const myGen = row.preemptive
-      ? (this.channelGenerations.get(row.channelRef) ?? 0) + 1
-      : this.channelGenerations.get(row.channelRef) ?? 0;
-    if (row.preemptive) this.channelGenerations.set(row.channelRef, myGen);
+      ? (this.channelGenerations.get(this.queueChannelRef(row.channelRef)) ?? 0) + 1
+      : this.channelGenerations.get(this.queueChannelRef(row.channelRef)) ?? 0;
+    if (row.preemptive) this.channelGenerations.set(this.queueChannelRef(row.channelRef), myGen);
     const msg = this.inboundMessage(row);
     const run = async (fence: ChannelQueueFence) => {
-      if (row.preemptive && (this.channelGenerations.get(row.channelRef) ?? 0) > myGen) return;
+      if (row.preemptive && (this.channelGenerations.get(this.queueChannelRef(row.channelRef)) ?? 0) > myGen) return;
       if (this.restartCutoff) return;
       if (!this.store.claimInbound(row.messageId, fence.epoch, new Date().toISOString())) return;
       try {
@@ -5995,7 +6004,8 @@ export class Orchestrator {
           profile,
           logger,
           ...this.router.permissionOptions(target
-            ? isSessionRecord(target) ? target : this.store.get(makeSessionId(target.platform, target.id)) ?? undefined
+            ? isSessionRecord(target) ? target : this.store.getByChannel(target.platform, target.id)
+              ?? this.store.get(makeSessionId(target.platform, target.id)) ?? undefined
             : undefined),
           mcpServers,
           // #487: isolated schedules/dispatches bypass SessionRouter's runtime
@@ -6245,7 +6255,7 @@ export class Orchestrator {
     if (!target) return undefined;
     const record = isSessionRecord(target)
       ? target
-      : this.store.get(makeSessionId(target.platform, target.id));
+      : this.store.getByChannel(target.platform, target.id) ?? this.store.get(makeSessionId(target.platform, target.id));
     if (!record) return undefined;
     const described = this.router.describeConfig(record);
     // #308: protects injectTurn's target profile resolution; deleting it lets
@@ -6713,7 +6723,7 @@ export class Orchestrator {
     const mcpServers = args.mcpServers ?? [];
     if (!this.bridgeHub) throw new Error(`bridge "${args.location}" is not connected`);
     const record = this.store.get(args.sessionId) ?? (args.thread
-      ? this.store.get(makeSessionId(args.thread.platform, args.thread.id)) ?? {
+      ? this.store.getByChannel(args.thread.platform, args.thread.id) ?? this.store.get(makeSessionId(args.thread.platform, args.thread.id)) ?? {
           platform: args.thread.platform, channelRef: args.thread.id, parentRef: args.thread.parentId ?? null,
         }
       : undefined);
@@ -8019,7 +8029,7 @@ export class Orchestrator {
       authorName: msg.authorName ?? null,
       kind: "bridge_offline",
       attachments: msg.attachments,
-      busy: this.channelQueues.has(msg.channel.id),
+      busy: this.channelQueues.has(this.queueChannelRef(msg.channel.id)),
       ...(inboundAdmissionId ? { inboundAdmissionId } : {}),
     });
   }
@@ -8187,7 +8197,7 @@ export class Orchestrator {
     consume = () => this.store.deleteParked(parked.id)
   ): Promise<void> {
     // Leave the row cancellable while the thread is busy.
-    if (this.channelQueues.has(parked.channelRef)) {
+    if (this.channelQueues.has(this.queueChannelRef(parked.channelRef))) {
       this.logger.info(
         { id: parked.id, channel: parked.channelRef },
         "parked: thread still busy; not firing"
@@ -8316,7 +8326,7 @@ export class Orchestrator {
     }
     // Cancellation or replacement during attachment transfer must still win.
     if (this.store.getParkedByChannel(PLATFORM, parked.channelRef)?.id !== parked.id) return;
-    if (this.channelQueues.has(parked.channelRef)) {
+    if (this.channelQueues.has(this.queueChannelRef(parked.channelRef))) {
       this.logger.info(
         { id: parked.id, channel: parked.channelRef },
         "parked: thread became busy before enqueue; not firing"
@@ -8360,7 +8370,7 @@ export class Orchestrator {
    * Admission consumes the row, as in the manager's location sweep.
    */
   async tryFireParked(channelRef: string): Promise<void> {
-    if (this.channelQueues.has(channelRef)) return;
+    if (this.channelQueues.has(this.queueChannelRef(channelRef))) return;
     // #174: once admission is closed, RETAIN the parked row instead of
     // deleting it and starting a turn. Firing here would admit a brand-new
     // channel turn after the quiesce snapshot; deleting without firing would
@@ -9210,7 +9220,7 @@ export class Orchestrator {
     }
     const channelId = record.channelRef;
     const location = resolveThreadLocation(this.config, channelId);
-    const busy = this.channelQueues.has(channelId);
+    const busy = this.channelQueues.has(this.queueChannelRef(channelId));
     const ready = !!this.bridgeHub?.isBridgeReady(location);
     const channel: ChannelRef = {
       platform: PLATFORM,
@@ -12956,10 +12966,10 @@ export class Orchestrator {
           // and force-aborts our turn. `handleIncomingMessageInner` swallows the
           // cancellation and returns void (D5), so detect the abort by comparing
           // the generation across the turn rather than from a return value.
-          const genAtStart = this.channelGenerations.get(row.channelRef) ?? 0;
+          const genAtStart = this.channelGenerations.get(this.queueChannelRef(row.channelRef)) ?? 0;
           if (owned) await this.handleIncomingMessageInner(synthetic, fence, owned.attempt, owned.operatorResume);
           else await this.handleIncomingMessageInner(synthetic, fence);
-          aborted = (this.channelGenerations.get(row.channelRef) ?? 0) > genAtStart;
+          aborted = (this.channelGenerations.get(this.queueChannelRef(row.channelRef)) ?? 0) > genAtStart;
         };
         await (owned?.queueFence ? run(owned.queueFence) : this.queueOnChannel(row.channelRef, run));
         // D4: record the abort; do NOT auto-retry (it would fight the user).
@@ -15112,10 +15122,10 @@ export class Orchestrator {
     this.pendingLiveResume.set(marker.channelRef, marker);
     try {
       await this.queueOnChannel(marker.channelRef, async (fence) => {
-        const genAtStart = this.channelGenerations.get(marker.channelRef) ?? 0;
+        const genAtStart = this.channelGenerations.get(this.queueChannelRef(marker.channelRef)) ?? 0;
         await this.handleIncomingMessageInner(synthetic, fence);
         const aborted =
-          (this.channelGenerations.get(marker.channelRef) ?? 0) > genAtStart;
+          (this.channelGenerations.get(this.queueChannelRef(marker.channelRef)) ?? 0) > genAtStart;
         if (aborted) {
           this.logger.info({ id: marker.id }, "live-turn resume aborted by user");
         }
@@ -16127,7 +16137,8 @@ export class Orchestrator {
             await this.abandonDispatchSpec(spec, "bridge not ready (past max-age)");
             return;
           }
-          bindSessionLocation(this.bridgeHub, makeSessionId(this.platformForChannel(spec.target), spec.target), loc);
+          bindSessionLocation(this.bridgeHub, this.recordForChannel(spec.target)?.id
+            ?? makeSessionId(this.platformForChannel(spec.target), spec.target), loc);
           const refusal = await this.requestDispatchContinuation(spec);
           if (refusal) await this.observeRetainedDispatch(spec, DispatchSuspendedError.defect(spec.id, refusal));
         })());
@@ -16481,7 +16492,8 @@ export class Orchestrator {
       for (const a of this.store.turnAttempts.list(state)) {
         if (a.source === "dispatch") continue;
         legacy.push({ id: a.id, kind: "live", channelRef: a.spec.target,
-          sessionRecordId: makeSessionId(this.platformForChannel(a.spec.target), a.spec.target),
+          sessionRecordId: this.recordForChannel(a.spec.target)?.id
+            ?? makeSessionId(this.platformForChannel(a.spec.target), a.spec.target),
           startedUtc: a.spec.createdUtc ?? a.updatedUtc,
           ...(a.acpSessionId ? { acpSessionId: a.acpSessionId } : {}),
           promptStarted: a.promptStarted,

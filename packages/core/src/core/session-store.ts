@@ -1144,7 +1144,6 @@ export class SessionStore {
             @repoPath, @configJson, @namePrefix, @createdUtc, @updatedUtc)
          ON CONFLICT(id) DO UPDATE SET
            platform        = excluded.platform,
-           channel_ref     = excluded.channel_ref,
            parent_ref      = excluded.parent_ref,
            agent_id        = excluded.agent_id,
            ${binding ? "acp_session_id = excluded.acp_session_id," : ""}
@@ -1170,6 +1169,14 @@ export class SessionStore {
   onSessionWrite(listener: (record: Readonly<SessionRecord>) => void): () => void {
     this.sessionWrites.add(listener);
     return () => this.sessionWrites.delete(listener);
+  }
+
+  /** Move the chat home without replacing its runtime, ACP session, or token identity. */
+  rebindChannel(id: string, channelRef: string, parentRef: string | null): void {
+    this.db.prepare("UPDATE sessions SET channel_ref = ?, parent_ref = ?, updated_utc = ? WHERE id = ?")
+      .run(channelRef, parentRef, new Date().toISOString(), id);
+    const committed = this.get(id)!;
+    for (const listener of this.sessionWrites) listener({ ...committed });
   }
 
   /** Atomically supersede every conflicting open request and publish a new one. */

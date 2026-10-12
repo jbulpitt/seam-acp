@@ -1,8 +1,8 @@
 import type { Logger } from "pino";
 import { setTimeout as delay } from "node:timers/promises";
-import { googleErrorStatus } from "./api.js";
+import { googleErrorStatus, isGoogleChatThreadReplyLimit } from "./api.js";
 
-type Write = { run: () => Promise<unknown>; key?: string;
+type Write = { run: (nextWrite: () => Promise<void>) => Promise<unknown>; key?: string;
   waiters: Array<{ resolve: (value: any) => void; reject: (error: unknown) => void }> };
 type Lane = { pending: Write[]; lastStart: number; spacing: number; draining?: Promise<void> };
 
@@ -15,7 +15,7 @@ export class SpaceWriteQueue {
     this.intervalMs = opts.intervalMs ?? 1100;
   }
 
-  enqueue<T>(space: string, run: () => Promise<T>, editKey?: string): Promise<T> {
+  enqueue<T>(space: string, run: (nextWrite: () => Promise<void>) => Promise<T>, editKey?: string): Promise<T> {
     let lane = this.lanes.get(space);
     if (!lane) {
       lane = { pending: [], lastStart: -Infinity, spacing: this.intervalMs };
@@ -44,6 +44,11 @@ export class SpaceWriteQueue {
   }
 
   private async drain(space: string, lane: Lane): Promise<void> {
+    const nextWrite = async () => {
+      const wait = lane.lastStart + lane.spacing - Date.now();
+      if (wait > 0) await delay(wait);
+      lane.lastStart = Date.now();
+    };
     while (lane.pending.length) {
       const wait = lane.lastStart + lane.spacing - Date.now();
       if (wait > 0) await delay(wait);
@@ -51,13 +56,15 @@ export class SpaceWriteQueue {
       for (;;) {
         lane.lastStart = Date.now();
         try {
-          const value = await write.run();
+          const value = await write.run(nextWrite);
           for (const waiter of write.waiters) waiter.resolve(value);
           lane.spacing = Math.max(this.intervalMs, lane.spacing / 2);
           break;
         } catch (err) {
           const status = googleErrorStatus(err);
-          if (status !== undefined && status !== 408 && status !== 429 && status < 500) {
+          if (isGoogleChatThreadReplyLimit(err)
+            || (status !== undefined && status !== 408 && status !== 429 && status < 500)) {
+            this.opts.logger.warn({ err, space }, "Google Chat write rejected");
             for (const waiter of write.waiters) waiter.reject(err);
             break;
           }

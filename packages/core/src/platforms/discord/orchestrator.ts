@@ -2039,7 +2039,7 @@ export class Orchestrator {
 
   /** Session for a bare channel ref on any platform. */
   private recordForChannel(channelRef: string): SessionRecord | null {
-    return this.store.getByChannelRef(channelRef) ?? this.store.get(makeSessionId("google-chat", channelRef));
+    return this.store.getByChannelRef(channelRef);
   }
 
   /** A moved Chat home still owns the original runtime's turn FIFO and fences. */
@@ -3824,7 +3824,8 @@ export class Orchestrator {
     );
     this.assertQueueFence(queueFence);
     const persistedStatusCard = humanAttempt?.statusCard;
-    if (persistedStatusCard && persistedStatusCard.channelId !== channel.id) {
+    // Chat may continue elsewhere while this attempt keeps its immutable status message.
+    if (persistedStatusCard && persistedStatusCard.channelId !== channel.id && channel.platform !== "google-chat") {
       throw DispatchSuspendedError.defect(humanAttempt!.id,
         "persisted status card belongs to a different channel");
     }

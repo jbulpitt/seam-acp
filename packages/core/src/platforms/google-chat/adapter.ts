@@ -254,7 +254,8 @@ export class GoogleChatAdapter implements ChatAdapter {
     const { store } = this.commandDeps;
     const channel = this.channelFor(command.space, command.thread);
     store.admitInbound({ messageId, platform: this.platform, channelRef: channel.id, parentRef: channel.parentId,
-      sessionRecordId: `${this.platform}:${channel.id}`, authorId: resourceId(command.user.id, "users"),
+      sessionRecordId: store.getByChannel(this.platform, channel.id)?.id ?? `${this.platform}:${channel.id}`,
+      authorId: resourceId(command.user.id, "users"),
       authorName: command.user.name, text: `/${command.command} ${command.args}`.trim(),
       createdUtc: new Date().toISOString(), preemptive: false, commandResult: { replies: [] } });
     const admitted = store.getInbound(messageId)!;
@@ -384,7 +385,6 @@ export class GoogleChatAdapter implements ChatAdapter {
           this.opts.logger.info({ session: current.id, acpSessionId: current.acpSessionId,
             from: current.channelRef, to: destination.id }, "Google Chat session rebound to continuation thread");
         }
-        Object.assign(channel, destination);
         thread = result.thread.name;
       }
       return result;
@@ -538,7 +538,8 @@ export class GoogleChatAdapter implements ChatAdapter {
   async findMessageByNonce(channel: ChannelRef, nonce: string, sinceMs: number): Promise<DeliveryNonceLookup> {
     if (!this.opts.historyReader) return { status: "indeterminate",
       reason: "Google Chat nonce lookup is unsupported until history access is configured with admin-approved chat.app.messages.readonly" };
-    const result = await findSpaceMessageByNonce(this.opts.historyReader, await this.historyTarget(channel), nonce, sinceMs);
+    const result = await findSpaceMessageByNonce(this.opts.historyReader,
+      await this.historyTarget(await this.resolveChannel(channel)), nonce, sinceMs);
     if (result.status === "unsupported") return { status: "indeterminate", reason: result.cause };
     if (result.status === "absent") return result;
     const { message } = result;

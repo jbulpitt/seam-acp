@@ -967,11 +967,20 @@ export class SessionStore {
   }
 
   getByChannel(platform: string, channelRef: string): SessionRecord | null {
-    const row = this.db
+    let row = this.db
       .prepare<[string, string], Row>(
         "SELECT * FROM sessions WHERE platform = ? AND channel_ref = ?"
       )
       .get(platform, channelRef);
+    if (!row && platform === "google-chat") {
+      // The original ID and admitted messages already identify moved Chat homes.
+      row = this.db.prepare<[string], Row>("SELECT * FROM sessions WHERE id = ?")
+        .get(makeSessionId(platform, channelRef))
+        ?? this.db.prepare<[string, string, string], Row>(`SELECT s.* FROM sessions s
+          JOIN inbound_admissions i ON i.session_record_id = s.id
+          WHERE i.channel_ref = ? AND i.platform = ? AND s.platform = ?
+          ORDER BY i.created_utc DESC LIMIT 1`).get(channelRef, platform, platform);
+    }
     return row ? mapRow(row) : null;
   }
 
@@ -982,7 +991,7 @@ export class SessionStore {
         "SELECT * FROM sessions WHERE channel_ref = ? ORDER BY platform = 'discord' DESC LIMIT 1"
       )
       .get(channelRef);
-    return row ? mapRow(row) : null;
+    return row ? mapRow(row) : this.getByChannel("google-chat", channelRef);
   }
 
   list(limit = 100): SessionRecord[] {

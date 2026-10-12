@@ -2856,7 +2856,8 @@ export class Orchestrator {
 
   private attemptStatusPanel(attempt: TurnAttempt): DispatchStatusPanel<MessageRef> | undefined {
     if (!attempt.statusCard) return undefined;
-    const ref: MessageRef = { channel: { platform: this.platformForChannel(attempt.statusCard.channelId),
+    // The attempt's root owns the platform, not its native card destination.
+    const ref: MessageRef = { channel: { platform: this.platformForChannel(attempt.spec.target),
       id: attempt.statusCard.channelId }, id: attempt.statusCard.messageId };
     const status = this.attemptTurnStatus(attempt);
     status.setState("Working");

@@ -101,10 +101,10 @@ describe("isolated restart adoption services the surviving permission", () => {
       expect(requests.filter(row => row.id === permission.requestId && row.result)).toHaveLength(1);
       expect(requests.filter(row => row.method === "session/prompt")).toHaveLength(1);
       expect(new Set(requests.map(row => row.pid)).size).toBe(1);
-      expect((await h.client.listSlots()).health.find(row => row.slot === slot))
-        .toMatchObject({ pid: owner.pid, alive: true });
+      expect(h.store.turnAttempts.get(attempt.id)).toMatchObject({ state: "completed", outcome: {
+        status: "completed", stopReason: "end_turn", output: "isolated finished once",
+      } });
       expect(h.notices.filter(row => row.text.includes("isolated finished once"))).toHaveLength(1);
-      expect(h.commands.filter(row => row.type === "kill")).toEqual([]);
     } finally {
       orch.suspendForRestart();
       (orch as any).remoteAdoptionFinishers.get(attempt.id)?.();

@@ -7,7 +7,7 @@ import type { ConfigMutationService, MutationActor, ThreadPresetChanges } from "
 import type { SessionStore } from "../../core/session-store.js";
 import { threadPresetKey, type ThreadPreset } from "../../config.js";
 import { normalizeLocation } from "../../core/location.js";
-import type { ChannelRef, ChatAdapter } from "../chat-adapter.js";
+import type { ChannelRef } from "../chat-adapter.js";
 import type { Orchestrator } from "../discord/orchestrator.js";
 import type { GoogleChatCommand } from "./commands.js";
 
@@ -53,6 +53,7 @@ export async function executeGoogleChatCommand(
     await deps.respond(channel, message);
     return { command: "usage", requestedCommand: command.command, channel, message };
   }
+  deps.router.bindRecordLocation(record);
   if (!command.args.trim()) {
     const current = deps.router.describeConfig(record);
     let message: string;

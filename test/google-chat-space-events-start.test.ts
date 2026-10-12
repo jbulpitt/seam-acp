@@ -53,6 +53,10 @@ function setup() {
   const adapter = new GoogleChatAdapter({ api: { request }, subscription: "projects/test/subscriptions/events",
     allowedUserIds: new Set(["users/42"]), defaultCwd: "/projects", logger,
     spaceEvents: worker, writeIntervalMs: 0 });
+  adapter.setCommandDeps({ store, router: { ensureSessionRecord: (input: { channelRef: string }) => store.getByChannel("google-chat", input.channelRef),
+    bindRecordLocation: () => "local" }, mutation: { readThreadPresetEntry: () => undefined,
+    applyThreadOverlay: () => ({ ok: true }), restoreThreadPresetEntry: () => ({ ok: true }) },
+    runtimeTransition: {}, cancelChannel: async () => {} } as any);
   adapters.push(adapter);
   return { adapter, worker, client, request, store, logs, logger };
 }

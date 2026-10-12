@@ -220,8 +220,9 @@ export class GoogleChatAdapter implements ChatAdapter {
     if (command) {
       const identity = event.type === "APP_COMMAND" ? interactionId : message?.name ?? interactionId;
       if (!identity) throw new Error("Google Chat command has no durable message identity");
-      const replyChannel = message && message.threadReply !== true
-        && event.appCommandMetadata?.appCommandType !== "QUICK_COMMAND"
+      const replyChannel = space.spaceThreadingState === "UNTHREADED_MESSAGES"
+        || (message && message.threadReply !== true
+        && event.appCommandMetadata?.appCommandType !== "QUICK_COMMAND")
         ? { platform: this.platform, id: resourceId(command.space, "spaces") }
         : command.thread ? channelForThread(command.thread) : undefined;
       await this.receiveCommand(command, inboundId(identity), replyChannel);

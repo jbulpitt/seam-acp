@@ -91,6 +91,14 @@ describe("Chat launches new session Spaces instead of thread sessions", () => {
     expect(h.store.getByChannel("google-chat", "launcher.invocation")).toBeNull();
   });
 
+  it("bare /new creates the default-title Space and never admits a name as a prompt", async () => {
+    const h = fixture(), raw = h.raw("/new");
+    Object.assign(raw.message, { argumentText: null, slashCommand: { commandId: 1 } });
+    await h.adapter.receiveEvent(raw);
+    expect(h.request).toHaveBeenCalledWith("spaces", expect.objectContaining({ data: expect.objectContaining({ displayName: "seam" }) }));
+    expect(h.incoming).toHaveLength(0);
+  });
+
   it("shares one creation/first-prompt admission across concurrent direct and Workspace mention deliveries", async () => {
     const h = fixture(), raw = h.raw("@Seam New report", true);
     await Promise.all([h.adapter.receiveEvent(raw), h.adapter.receiveEvent(raw, undefined, undefined, "workspace")]);

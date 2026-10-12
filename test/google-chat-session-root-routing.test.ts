@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { pino } from "pino";
 import { GoogleChatAdapter } from "../packages/core/src/platforms/google-chat/adapter.js";
 import { SessionStore } from "../packages/core/src/core/session-store.js";
+import { GoogleChatSpaceEvents } from "../packages/core/src/platforms/google-chat/space-events.js";
 
 const stores: SessionStore[] = [];
 afterEach(() => { stores.splice(0).forEach(store => store.close()); vi.restoreAllMocks(); });
@@ -105,6 +106,24 @@ describe("one Google Chat session root with native per-prompt delivery", () => {
     expect(h.incoming[0].text).toContain("Completed report");
     expect(h.incoming[0].text).not.toContain("cardsV2");
     expect(h.history.readRawPage).not.toHaveBeenCalled(); expect(h.history.getMessage).not.toHaveBeenCalled();
+  });
+
+  it("keeps a local root delivery record written during asynchronous subscription registration", async () => {
+    const h = fixture(); let release!: (value: any) => void, began!: () => void;
+    const creating = new Promise<void>(resolve => { began = resolve; });
+    const subscribed = new Promise<any>(resolve => { release = resolve; });
+    const events = new GoogleChatSpaceEvents({ api: { request: h.request }, store: h.store.googleChatSpaces,
+      logger: h.logger, pubsubTopic: "projects/test/topics/events", subscriptions: {
+        list: async () => [], create: async () => { began(); return subscribed; }, delete: async () => {}, renew: vi.fn() } as any });
+    const register = events.register(space);
+    try {
+      await creating; await h.adapter.sendMessage(channel, "Retain this own root");
+      release({ name: "subscriptions/one", expireTime: new Date(Date.now() + 3_600_000).toISOString(), state: "ACTIVE" });
+      await register;
+      await h.receive("reply", true, "workspace", "new-output");
+      expect(h.incoming[0].text).toContain("Retain this own root");
+      expect(h.history.readRawPage).not.toHaveBeenCalled();
+    } finally { release({ name: "subscriptions/one", expireTime: new Date(Date.now() + 3_600_000).toISOString() }); await register; await events.stop(); }
   });
 
   it("deduplicated continuation after a restart redirects later turn writes to the root", async () => {

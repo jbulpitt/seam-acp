@@ -746,6 +746,11 @@ export class TurnAttemptStore {
       .run(index + 1, a.id, a.generation, a.ownerBoot, index);
   }
 
+  continueDelivery(id: string, from: string, destination: string): void {
+    this.db.prepare("UPDATE turn_attempts SET delivery_channel=?, updated_utc=? WHERE id=? AND delivery_channel=?")
+      .run(destination, new Date().toISOString(), id, from);
+  }
+
   /** A permanent invalid-payload rejection did not consume the planned nonce. */
   discardStreamDelivery(a: TurnAttempt, index: number): void {
     this.db.prepare(`UPDATE turn_attempts

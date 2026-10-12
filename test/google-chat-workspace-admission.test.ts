@@ -3,6 +3,7 @@ import { pino } from "pino";
 import { GoogleChatAdapter } from "../packages/core/src/platforms/google-chat/adapter.js";
 import { PubSubPullTransport } from "../packages/core/src/platforms/google-chat/transport.js";
 import { SessionStore } from "../packages/core/src/core/session-store.js";
+import { seedLegacyChatRecords } from "./helpers/google-chat-legacy-fixture.js";
 import { GOOGLE_CHAT_MESSAGE_CREATED, GOOGLE_CHAT_MESSAGE_BATCH_CREATED } from "../packages/core/src/platforms/google-chat/space-subscriptions.js";
 
 const stores: SessionStore[] = [];
@@ -18,12 +19,13 @@ function setup(state = "THREADED_MESSAGES", allowed = ["spaces/team"]) {
   const logger = pino({ level: "debug" }, { write: line => logs.push(JSON.parse(line)) });
   const request = vi.fn(async (_scope: string, _r: any): Promise<any> => ({}));
   const store = new SessionStore(":memory:"); stores.push(store);
+  seedLegacyChatRecords(store, state === "UNTHREADED_MESSAGES" ? ["team"] : ["team.session"]);
   const lifecycle = { start: vi.fn(async () => {}), stop: vi.fn(async () => {}),
     handle: vi.fn(async () => {}), space: () => ({ ...space, spaceThreadingState: state }),
     appUser: () => "users/seam", recordAppUser: vi.fn() };
   const adapter = new GoogleChatAdapter({ api: { request }, subscription: "projects/test/subscriptions/events",
     allowedUserIds: new Set(["users/42"]), allowedSpaceIds: new Set(allowed), logger, defaultCwd: "/projects",
-    spaceEvents: lifecycle, hasSession: (channel: any) => ["team.session", "team"].includes(channel.id),
+    spaceEvents: lifecycle,
     writeIntervalMs: 0 } as any);
   const incoming: any[] = [], runs: string[] = [];
   adapter.onMessage(msg => {
@@ -130,14 +132,6 @@ describe("Workspace Events use the Google Chat durable admission path", () => {
     await h.workspace({ message: message("mentions", { text: "@Seam ask @Other", annotations: [mention,
       { ...mention, startIndex: 10, length: 6, userMention: { ...mention.userMention, user: { name: "users/other", type: "BOT" } } }] }) });
     expect(h.incoming[0]?.text).toBe("ask @Other");
-  });
-
-  it("starts a session for a native Seam mention but not an unmentioned new thread", async () => {
-    const h = setup();
-    const m = message("new", { text: "@Seam start", annotations: [mention], thread: { name: "spaces/team/threads/new" } });
-    await h.workspace({ message: m }); expect(h.incoming[0]?.channel.id).toBe("team.new");
-    await h.workspace({ message: message("new-unmentioned", { thread: { name: "spaces/team/threads/other" } }) }, undefined, "other");
-    expect(h.runs).toHaveLength(1);
   });
 
   it("hydrates a name-only reference using the approved app scope, never an empty turn", async () => {

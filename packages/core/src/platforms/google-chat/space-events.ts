@@ -21,6 +21,7 @@ export class GoogleChatSpaceEvents {
     subscriptions: Subscriptions;
     store: GoogleChatSpaceStore;
     allowedSpaceIds?: ReadonlySet<string>;
+    isSessionSpace?: (space: string) => boolean;
     logger: Logger;
     renewalLeadMs?: number;
   }) {}
@@ -35,7 +36,8 @@ export class GoogleChatSpaceEvents {
 
   private allowed(space: GoogleChatSpace): boolean {
     const ids = this.opts.allowedSpaceIds;
-    return isSharedSpace(space) && !!space.name && (!ids?.size || ids.has(space.name) || ids.has(space.name.slice("spaces/".length)));
+    return isSharedSpace(space) && !!space.name && (this.opts.isSessionSpace?.(space.name)
+      || !ids?.size || ids.has(space.name) || ids.has(space.name.slice("spaces/".length)));
   }
 
   async start(): Promise<void> {
@@ -130,7 +132,9 @@ export class GoogleChatSpaceEvents {
   }
 
   private saveAndArm(state: StoredGoogleChatSpace, subscription: GoogleChatSpaceSubscription): void {
-    this.opts.store.put({ ...state, appUser: this.opts.store.get(state.space.name)?.appUser ?? state.appUser, subscription });
+    const latest = this.opts.store.get(state.space.name);
+    this.opts.store.put({ ...state, messageRoots: latest?.messageRoots ?? state.messageRoots,
+      appUser: latest?.appUser ?? state.appUser, subscription });
     if (this.controller.signal.aborted) return;
     const renewAt = nextGoogleChatSubscriptionRenewalTime(subscription, this.opts.renewalLeadMs ?? 5 * 60_000);
     this.arm(state.space.name, renewAt);

@@ -97,7 +97,7 @@ describe("Google Chat app-auth history", () => {
     });
     expect(params(chat.request.mock.calls[0]![0])).toEqual({
       pageSize: "100", orderBy: "createTime ASC",
-      filter: `thread.name = ${thread} AND createTime < "${secondTime}" AND createTime > "${firstTime}"`,
+      filter: `thread.name = "${thread}" AND createTime < "${secondTime}" AND createTime > "${firstTime}"`,
     });
   });
 

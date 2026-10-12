@@ -10,6 +10,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { createHash, randomUUID } from "node:crypto";
 import type { AgyIdentityChange } from "./agy-identity-migration.js";
+import type { ChannelRef } from "../platforms/chat-adapter.js";
 import { logger } from "../lib/logger.js";
 import {
   defaultSessionConfig,
@@ -397,6 +398,7 @@ export class SessionStore {
       "ALTER TABLE inbound_admissions ADD COLUMN expected_acp_session_id TEXT",
       "ALTER TABLE inbound_admissions ADD COLUMN preemptive INTEGER NOT NULL DEFAULT 1",
       "ALTER TABLE inbound_admissions ADD COLUMN command_result_json TEXT",
+      "ALTER TABLE inbound_admissions ADD COLUMN delivery_channel_json TEXT",
     ]) {
       try { this.db.exec(ddl); } catch { /* column already exists */ }
     }
@@ -2599,11 +2601,11 @@ export class SessionStore {
           `INSERT OR IGNORE INTO inbound_admissions
              (message_id, platform, channel_ref, parent_ref, session_record_id,
               author_id, author_name, prompt, attachments_json, state,
-              queue_epoch, created_utc, updated_utc, expected_acp_session_id, preemptive, command_result_json)
+              queue_epoch, created_utc, updated_utc, expected_acp_session_id, preemptive, command_result_json, delivery_channel_json)
            VALUES
              (@messageId, @platform, @channelRef, @parentRef, @sessionRecordId,
               @authorId, @authorName, @text, @attachmentsJson, 'pending',
-              NULL, @createdUtc, @createdUtc, @expectedAcpSessionId, @preemptive, @commandResultJson)`
+              NULL, @createdUtc, @createdUtc, @expectedAcpSessionId, @preemptive, @commandResultJson, @deliveryChannelJson)`
         )
         .run({
           ...input,
@@ -2613,6 +2615,7 @@ export class SessionStore {
           expectedAcpSessionId: input.expectedAcpSessionId ?? null,
           preemptive: input.preemptive === false ? 0 : 1,
           commandResultJson: input.commandResult ? JSON.stringify(input.commandResult) : null,
+          deliveryChannelJson: input.deliveryChannel ? JSON.stringify(input.deliveryChannel) : null,
         });
         if (result.changes !== 1) return false;
       // A normal Discord message is a priority replacement, not FIFO. Make
@@ -2644,6 +2647,16 @@ export class SessionStore {
       )
       .get(messageId);
     return row ? mapInboundAdmission(row) : null;
+  }
+
+  continueInboundDelivery(messageId: string, channel: ChannelRef): void {
+    this.db.prepare("UPDATE inbound_admissions SET delivery_channel_json=?, updated_utc=? WHERE message_id=?")
+      .run(JSON.stringify(channel), new Date().toISOString(), messageId);
+  }
+
+  createdGoogleChatSpace(name: string): boolean {
+    return Boolean(this.db.prepare(`SELECT 1 FROM inbound_admissions WHERE platform='google-chat'
+      AND json_extract(command_result_json, '$.spaceCreation.space.name')=? LIMIT 1`).get(name));
   }
 
   /** Newest admitted message id on the catch-up adapter's platform. */
@@ -2735,9 +2748,8 @@ export class SessionStore {
   }
 
   /**
-   * Reconcile one thread after a crash or an operator fence. Ordinary user
-   * messages are replacement semantics, so only the newest nonterminal row is
-   * recoverable; a recorded continuation selects only its own admission.
+   * Recover the FIFO head, or the newest replacement admission. Recorded
+   * continuations select only their own admission.
    */
   recoverInboundChannel(channelRef: string, updatedUtc: string, messageId?: string): InboundAdmission | null {
     const recover = this.db.transaction(() => {
@@ -2749,18 +2761,19 @@ export class SessionStore {
            ORDER BY created_utc ASC, rowid ASC`
         )
         .all(channelRef, messageId ?? null, messageId ?? null);
-      const newest = rows.at(-1);
+      const newest = rows.find(row => row.preemptive === 0) ?? rows.at(-1);
       if (!newest) return null;
       for (const old of rows) {
-        if (old.message_id !== newest.message_id) this.turnAttempts.cancel(inboundAttemptId(old.message_id));
+        if (newest.preemptive !== 0 && old.preemptive !== 0 && old.message_id !== newest.message_id) this.turnAttempts.cancel(inboundAttemptId(old.message_id));
       }
       this.db
         .prepare(
           `UPDATE inbound_admissions SET state = 'completed', updated_utc = ?
            WHERE channel_ref = ? AND state IN ('pending','running') AND message_id <> ? AND command_result_json IS NULL
+           AND preemptive <> 0 AND ? <> 0
            AND (? IS NULL OR message_id = ?)`
         )
-        .run(updatedUtc, channelRef, newest.message_id, messageId ?? null, messageId ?? null);
+        .run(updatedUtc, channelRef, newest.message_id, newest.preemptive, messageId ?? null, messageId ?? null);
       this.db
         .prepare(
           `UPDATE inbound_admissions SET state = 'pending', queue_epoch = NULL, updated_utc = ?
@@ -7300,6 +7313,7 @@ CREATE TABLE IF NOT EXISTS inbound_admissions (
   expected_acp_session_id TEXT,
   preemptive        INTEGER NOT NULL DEFAULT 1,
   command_result_json TEXT,
+  delivery_channel_json TEXT,
   created_utc       TEXT NOT NULL,
   updated_utc       TEXT NOT NULL
 );
@@ -7419,6 +7433,7 @@ interface InboundAdmissionRow {
   expected_acp_session_id: string | null;
   preemptive: number;
   command_result_json: string | null;
+  delivery_channel_json: string | null;
   created_utc: string;
   updated_utc: string;
 }
@@ -7460,6 +7475,7 @@ const mapInboundAdmission = (r: InboundAdmissionRow): InboundAdmission => ({
   updatedUtc: r.updated_utc,
   expectedAcpSessionId: r.expected_acp_session_id,
   preemptive: r.preemptive !== 0,
+  ...(r.delivery_channel_json == null ? {} : { deliveryChannel: JSON.parse(r.delivery_channel_json) as ChannelRef }),
   ...(r.command_result_json === null ? {} : { commandResult: JSON.parse(r.command_result_json) as InboundCommandResult }),
 });
 

@@ -28,6 +28,13 @@ export interface MessageRef extends MessageLink {
 export interface DeliveryNonceOptions {
   nonce: string;
   enforceNonce: true;
+  /** Original inbound owner when replaying a per-prompt delivery. */
+  inboundMessageId?: string;
+}
+
+export interface DeliveryChannelContext {
+  channel: ChannelRef;
+  continued?: (destination: ChannelRef) => void;
 }
 
 /** Result of asking the platform whether this bot already created a nonce. */
@@ -59,6 +66,10 @@ export interface IncomingMessage {
    * synthetic turns omit it and therefore do not enter the inbound ledger. */
   messageId?: string;
   channel: ChannelRef;
+  /** Reply destination when the session/FIFO is bound to a broader endpoint. */
+  deliveryChannel?: ChannelRef;
+  /** False queues behind active work instead of replacing it. */
+  preemptive?: boolean;
   authorId: string;
   /** Resolved, sanitized display name of the author (issue #57). Optional so
    *  other adapters and synthetic messages need no change; the Discord adapter

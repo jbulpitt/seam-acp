@@ -58,7 +58,7 @@ function history(messages: GoogleChatHistoryMessage[], nativePageSize = 23) {
       return found;
     }
     const filter = url.searchParams.get("filter") ?? "";
-    const threadName = /thread.name = (\S+)/.exec(filter)?.[1];
+    const threadName = /thread.name = "([^"]+)"/.exec(filter)?.[1];
     const before = /createTime < "([^"]+)"/.exec(filter)?.[1];
     const after = /createTime > "([^"]+)"/.exec(filter)?.[1];
     let rows = messages.filter((item) =>
@@ -105,7 +105,7 @@ describe("Google Chat named-space history source", () => {
     expect(result).toMatchObject({ rawCount: 3, oldestRawId: message(1).name });
     const queries = chat.request.mock.calls.map(([options]) => Object.fromEntries(new URL(String(options.url)).searchParams));
     expect(queries).toEqual([
-      { pageSize: "3", orderBy: "createTime DESC", filter: `thread.name = ${thread}` },
+      { pageSize: "3", orderBy: "createTime DESC", filter: `thread.name = "${thread}"` },
       { ...queries[0], pageToken: "short/+=" },
       { ...queries[0], pageToken: "empty/+=" },
     ]);
@@ -123,7 +123,7 @@ describe("Google Chat named-space history source", () => {
     expect(result.messages.map((item) => item.messageId)).toEqual([rows[3]!.name, rows[2]!.name, rows[1]!.name]);
     expect(new URL(String(chat.request.mock.calls[0]![0].url)).pathname).toBe(`/v1/${rows[4]!.name}`);
     expect(new URL(String(chat.request.mock.calls[1]![0].url)).searchParams.get("filter"))
-      .toBe(`thread.name = ${thread} AND createTime < "2026-10-10T12:00:00.124Z"`);
+      .toBe(`thread.name = "${thread}" AND createTime < "2026-10-10T12:00:00.124Z"`);
   });
 
   it("returns the nearest messages after the anchor, including timestamp ties", async () => {
@@ -134,7 +134,7 @@ describe("Google Chat named-space history source", () => {
     const list = chat.request.mock.calls[1]![0];
     expect(new URL(String(list.url)).searchParams.get("orderBy")).toBe("createTime ASC");
     expect(new URL(String(list.url)).searchParams.get("filter"))
-      .toBe(`thread.name = ${thread} AND createTime > "2026-10-10T11:59:59.999Z"`);
+      .toBe(`thread.name = "${thread}" AND createTime > "2026-10-10T11:59:59.999Z"`);
   });
 
   it.each([
@@ -253,8 +253,8 @@ describe("Google Chat named-space delivery nonce lookup", () => {
     expect(chat.request).toHaveBeenCalledTimes(3);
     const queries = chat.request.mock.calls.slice(1).map(([options]) => Object.fromEntries(new URL(String(options.url)).searchParams));
     expect(queries).toEqual([
-      { pageSize: "100", orderBy: "createTime DESC", filter: `thread.name = ${thread} AND createTime > "2026-10-09T23:55:00.000Z"` },
-      { pageSize: "100", orderBy: "createTime DESC", filter: `thread.name = ${thread} AND createTime > "2026-10-09T23:55:00.000Z"`, pageToken: "more" },
+      { pageSize: "100", orderBy: "createTime DESC", filter: `thread.name = "${thread}" AND createTime > "2026-10-09T23:55:00.000Z"` },
+      { pageSize: "100", orderBy: "createTime DESC", filter: `thread.name = "${thread}" AND createTime > "2026-10-09T23:55:00.000Z"`, pageToken: "more" },
     ]);
   });
 
@@ -279,7 +279,7 @@ describe("Google Chat named-space delivery nonce lookup", () => {
     await expect(findMessageByNonce(chat.reader, target, "delivery-1", sinceMs)).resolves.toEqual({ status: "absent" });
     expect(chat.request).toHaveBeenCalledOnce();
     expect(new URL(String(chat.request.mock.calls[0]![0].url)).searchParams.get("filter"))
-      .toBe(`thread.name = ${thread} AND createTime > "2026-10-09T23:55:00.000Z"`);
+      .toBe(`thread.name = "${thread}" AND createTime > "2026-10-09T23:55:00.000Z"`);
   });
 
   it("preserves the real denial from an incomplete Space-history proof after an ambiguous GET", async () => {

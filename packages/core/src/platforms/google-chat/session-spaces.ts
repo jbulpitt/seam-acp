@@ -60,7 +60,7 @@ export function bindGoogleChatSessionSpace(channel: ChannelRef, snapshot: Google
   if (prior) return prior;
   const applied = deps.mutation.applyThreadOverlay({ threadId: channel.id, platform,
     changes: { agent: snapshot.agentId, location: snapshot.location, model: snapshot.model,
-      effort: snapshot.effort, cwd: snapshot.repo }, actor });
+      effort: normalizeStoredEffort(snapshot.effort) ?? null, cwd: snapshot.repo }, actor });
   if (!applied.ok) throw new Error(applied.error);
   const record = deps.router.ensureSessionRecord({ platform, channelRef: channel.id, cwd: snapshot.repo });
   deps.router.bindRecordLocation(record);
@@ -72,6 +72,8 @@ export interface GoogleChatSpaceLaunch {
   origin: ChannelRef;
   requester: { id: string; name: string };
   args: string;
+  name?: string;
+  replyChannel?: ChannelRef;
 }
 
 export interface GoogleChatSessionSpaceResult {
@@ -124,7 +126,7 @@ export class GoogleChatSessionSpaces {
       if (overrides.repo !== undefined) snapshot.repo = overrides.repo;
       const receipt: InboundCommandResult = { replies: [], spaceCreation: {
         requestId: randomUUID(), customer: this.opts.customer ?? "customers/my_customer",
-        displayName: [...name].slice(0, 128).join(""), requester: { ...input.requester }, snapshot,
+        displayName: [...(input.name ?? name)].slice(0, 128).join(""), requester: { ...input.requester }, snapshot,
       } };
       const now = new Date().toISOString();
       store.admitInbound({ messageId: input.messageId, platform, channelRef: input.origin.id,
@@ -198,6 +200,8 @@ export class GoogleChatSessionSpaces {
         const record = await this.opts.bind(channel, setup.snapshot, setup.requester);
         setup.sessionRecordId = record.id; checkpoint();
       }
+      if (input.replyChannel) receipt!.replies.push({ channel: input.replyChannel,
+        text: `${setup.displayName}: ${space.spaceUri ?? space.name}`, index: 0 });
       if (!store.completeInboundCommand(input.messageId, receipt!, new Date().toISOString())) {
         throw new Error(`Google Chat Space command ${input.messageId} did not complete its setup receipt`);
       }

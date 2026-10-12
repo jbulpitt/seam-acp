@@ -6,6 +6,16 @@ export interface StoredGoogleChatSpace {
   space: GoogleChatSpace & { name: string };
   appUser?: string;
   subscription?: GoogleChatSpaceSubscription;
+  messageRoots?: Record<string, GoogleChatMessageRoot>;
+}
+
+export interface GoogleChatMessageRoot {
+  name: string;
+  sender: string;
+  createTime: string;
+  text: string;
+  filename?: string;
+  own: boolean;
 }
 
 /** Membership, native threading metadata and Google's returned renewal deadline. */
@@ -30,6 +40,15 @@ export class GoogleChatSpaceStore {
   put(state: StoredGoogleChatSpace): void {
     this.db.prepare("INSERT INTO google_chat_spaces(name, state_json) VALUES (?, ?) ON CONFLICT(name) DO UPDATE SET state_json=excluded.state_json")
       .run(state.space.name, JSON.stringify(state));
+  }
+
+  messageRoot(space: string, thread: string): GoogleChatMessageRoot | undefined {
+    return this.get(space)?.messageRoots?.[thread];
+  }
+
+  recordMessageRoot(space: string, thread: string, message: GoogleChatMessageRoot): void {
+    const prior = this.get(space) ?? { space: { name: space } };
+    this.put({ ...prior, messageRoots: { ...prior.messageRoots, [thread]: message } });
   }
 
   delete(name: string): void { this.db.prepare("DELETE FROM google_chat_spaces WHERE name = ?").run(name); }

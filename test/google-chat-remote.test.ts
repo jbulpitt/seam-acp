@@ -12,6 +12,7 @@ import { SessionRouter } from "../packages/core/src/core/session-router.js";
 import { SessionStore } from "../packages/core/src/core/session-store.js";
 import { GoogleDriveUploader } from "../packages/core/src/core/files/google-drive-upload.js";
 import { GoogleChatAdapter } from "../packages/core/src/platforms/google-chat/adapter.js";
+import { bindGoogleChatSession, bindGoogleChatSessionSpace, prepareGoogleChatSpaceSelection } from "../packages/core/src/platforms/google-chat/command-actions.js";
 import { multiplexChatAdapters } from "../packages/core/src/platforms/google-chat/multiplex.js";
 import { Orchestrator } from "../packages/core/src/platforms/discord/orchestrator.js";
 import { discordRenderer } from "../packages/core/src/platforms/discord/renderer.js";
@@ -81,9 +82,15 @@ function setup(presets: Record<string, unknown> = {}) {
     defaultAgentId: profile.id, defaultModel: model, defaultCwd: dir,
     executionBridge: wiring as any, seamMcp: wiring });
   cleanups.push(() => router.disposeAll());
-  const request = vi.fn(async (_scope: string, req: any): Promise<any> => req.responseType === "arraybuffer"
-    ? Buffer.from("CHAT949_INCOMING_BYTES") : ({ name: `spaces/dm/messages/app-${++sequence}`,
-      thread: req.data?.thread ?? { name: "spaces/dm/threads/new" } }));
+  const request = vi.fn(async (_scope: string, req: any): Promise<any> => {
+    if (req.responseType === "arraybuffer") return Buffer.from("CHAT949_INCOMING_BYTES");
+    if (req.method === "POST" && req.url.endsWith("/spaces")) return { name: "spaces/session-new", displayName: req.data.displayName,
+      spaceType: "SPACE", spaceThreadingState: "THREADED_MESSAGES", spaceUri: "https://chat.google.com/room/session-new" };
+    if (req.method === "POST" && req.url.endsWith("/members")) return { name: "spaces/session-new/members/42" };
+    if (req.method === "PATCH") return {};
+    const space = req.url.replace("https://chat.googleapis.com/v1/", "").replace(/\/messages$/, "");
+    return { name: `${space}/messages/app-${++sequence}`, thread: req.data?.thread ?? { name: `${space}/threads/new` } };
+  });
   const driveRequest = vi.fn(async (req: any): Promise<any> => req.method === "POST"
     ? { data: {}, headers: new Headers({ location: "https://drive.example/upload" }) }
     : { data: { id: "remote-file", webViewLink: "https://drive.example/remote-file" }, headers: new Headers() });
@@ -91,11 +98,14 @@ function setup(presets: Record<string, unknown> = {}) {
     sharing: { kind: "members-only" } }, { request: driveRequest });
   const chat = new GoogleChatAdapter({ api: { request }, subscription: "projects/test/subscriptions/events",
     allowedUserIds: new Set(["users/42"]), defaultCwd: remoteCwd, defaultLocation: remote,
-    logger, writeIntervalMs: 0, driveUploader: drive } as any);
+    logger, writeIntervalMs: 0, driveUploader: drive, spaceEvents: { start: vi.fn(), stop: vi.fn(), handle: vi.fn(),
+      space: () => undefined, appUser: () => "users/seam", recordAppUser: vi.fn(), register: vi.fn() } } as any);
   const discord = { platform: "discord", onMessage() {}, sendMessage: vi.fn() } as any;
   const adapter = multiplexChatAdapters([discord, chat]);
   const config = { ...maps, DATA_DIR: dir, REPOS_ROOT: dir, CHANNEL_PRESETS_FILE: file,
-    DEFAULT_AGENT: profile.id, DEFAULT_MODEL: model, TURN_TIMEOUT_SECONDS: 15, SEAM_TURN_RESUME_ENABLED: true,
+    DEFAULT_AGENT: profile.id, DEFAULT_MODEL: model, GOOGLE_CHAT_DEFAULT_AGENT: profile.id,
+    GOOGLE_CHAT_DEFAULT_MODEL: model, GOOGLE_CHAT_DEFAULT_CWD: remoteCwd, GOOGLE_CHAT_DEFAULT_LOCATION: remote,
+    TURN_TIMEOUT_SECONDS: 15, SEAM_TURN_RESUME_ENABLED: true,
     SEAM_CONFIG_ADMIN_USER_IDS: new Set(), SEAM_PARTICIPANT_USER_IDS: new Set(),
     REPO_EMOJIS: new Map(), ATTACH_ALLOW_ANY_PATH: false } as unknown as Config;
   const orch = new Orchestrator({ logger, store, router, adapter, config, modelCatalog, renderer: discordRenderer });
@@ -109,7 +119,14 @@ function setup(presets: Record<string, unknown> = {}) {
   hub.readAttachmentForSession = vi.fn(async () => ({ bytes: Buffer.from("CHAT949_REMOTE_OUTPUT"), filename: "out.bin", size: 21 }));
   orch.setBridgeHub(hub);
   chat.setCommandDeps({ store, router, mutation: orch.getConfigMutation(), runtimeTransition: orch.getRuntimeTransition(),
-    cancelChannel: (ch: ChannelRef) => orch.cancelChannel(ch) } as any);
+    cancelChannel: (ch: ChannelRef) => orch.cancelChannel(ch), deliveryForChannel: (ch: ChannelRef, id?: string) => orch.deliveryForChannel(ch, id) } as any);
+  chat.installSessionSpaces({ config, prepare: selection => prepareGoogleChatSpaceSelection(selection, {
+    router, modelCatalog, configPlan: { prepareRepoChange: async () => ({ ok: true, cwd: remoteCwd }) } as any, defaultCwd: remoteCwd }),
+    bind: (ch, snapshot, actor) => bindGoogleChatSessionSpace(ch, snapshot, { store, router,
+      mutation: orch.getConfigMutation() }, actor) });
+  if ((presets.threads as any)?.["google-chat:dm.thread"]) router.ensureSessionRecord({ platform: channel.platform,
+    channelRef: channel.id, parentRef: "dm", cwd: dir });
+  else bindGoogleChatSession(channel, { store, router, mutation: orch.getConfigMutation(), cwd: remoteCwd, location: remote }, { id: "42", name: "Tester" });
   let work: Promise<void> = Promise.resolve();
   chat.onMessage(msg => { work = (orch as any).handleIncomingMessage(msg); return work; });
   const deliver = async (raw = event()) => { await chat.receiveEvent(raw); await work; };
@@ -120,7 +137,7 @@ function setup(presets: Record<string, unknown> = {}) {
 }
 
 describe("Google Chat sessions use the existing host binding", () => {
-  it("binds the first ordinary message's location and repo before ACP acquisition", async () => {
+  it("keeps a legacy thread's location and repo binding before ACP acquisition", async () => {
     const h = setup();
     await h.deliver();
     expect(h.bindings.get(h.record().id)).toBe(remote);
@@ -137,10 +154,23 @@ describe("Google Chat sessions use the existing host binding", () => {
     const old = h.router.ensureSessionRecord({ platform: channel.platform, channelRef: channel.id, parentRef: "dm", cwd: h.dir });
     const before = h.store.get(old.id);
     await h.chat.receiveEvent(event("/new New task", 1));
-    const created = h.store.getByChannel("google-chat", "dm.new")!;
+    const created = h.store.getByChannel("google-chat", "session-new")!;
     expect(h.router.describeConfig(created)).toMatchObject({ location: { value: remote }, cwd: { value: remoteCwd } });
     expect(h.store.get(old.id)).toEqual(before);
     expect(h.launches).toEqual([]);
+  });
+
+  it("auto-launches an unbound DM and runs its first prompt on the new Space root and selected bridge", async () => {
+    const h = setup();
+    await h.deliver(event("New Space prompt", undefined, "unbound"));
+    const record = h.store.getByChannel("google-chat", "session-new")!;
+    expect(record).toMatchObject({ parentRef: null });
+    expect(h.bindings.get(record.id)).toBe(remote);
+    expect(h.store.getByChannel("google-chat", "dm.unbound")).toBeNull();
+    expect(h.prompts).toHaveLength(1); expect(h.prompts[0]).toContain("New Space prompt");
+    expect(h.sessions).toEqual([expect.objectContaining({ cwd: remoteCwd })]);
+    expect(h.request.mock.calls.some(([, req]) => req.data?.text?.includes("CHAT949_FINAL")
+      && req.url.includes("spaces/session-new/messages") && !req.data.thread)).toBe(true);
   });
 
   it("preserves an existing session's selection instead of reapplying deployment defaults", async () => {

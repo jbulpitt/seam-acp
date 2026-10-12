@@ -17,7 +17,6 @@ export { GoogleChatSessionSpaces, resolveGoogleChatOrgDefaults, prepareGoogleCha
 export interface GoogleChatCommandDeps {
   /** The adapter owns resource-name -> canonical ChannelRef mapping. */
   channelFor(space: string, thread: string | null): ChannelRef;
-  createThread: NonNullable<ChatAdapter["createThread"]>;
   router: Pick<SessionRouter, "ensureSessionRecord" | "describeConfig" | "bindRecordLocation">;
   store: Pick<SessionStore, "getByChannel">;
   mutation: Pick<ConfigMutationService, "readThreadPresetEntry" | "applyThreadOverlay">;
@@ -33,29 +32,27 @@ export interface GoogleChatCommandDeps {
 type CancelOutcome = Awaited<ReturnType<Orchestrator["cancelChannel"]>>;
 type SwitchOutcome = Awaited<ReturnType<RuntimeTransition["applyModelChange"]>>;
 export type GoogleChatCommandResult =
-  | { command: "new"; channel: ChannelRef; record: SessionRecord }
   | { command: "cancel"; channel: ChannelRef; outcome: CancelOutcome }
   | { command: "usage"; requestedCommand: "agent" | "model" | "repo" | "effort"; channel: ChannelRef; message: string }
   | { command: "agent" | "model"; channel: ChannelRef; outcome: SwitchOutcome }
   | { command: "repo"; channel: ChannelRef; outcome: Awaited<ReturnType<ConfigApplyPlan["applyRepoChange"]>> }
   | { command: "effort"; channel: ChannelRef; outcome: Awaited<ReturnType<RuntimeTransition["configure"]>> };
 
-/** Uses the same core operations as /seam new, /seam cancel and /seam config. */
+/** Uses the same core cancellation and configuration operations as Discord. */
 export async function executeGoogleChatCommand(
-  command: GoogleChatCommand,
+  command: Omit<GoogleChatCommand, "command"> & { command: Exclude<GoogleChatCommand["command"], "new"> },
   deps: GoogleChatCommandDeps,
 ): Promise<GoogleChatCommandResult> {
-  if (command.command === "new") {
-    const parent = deps.channelFor(command.space, null);
-    const channel = await deps.createThread(parent, command.args ? `**${command.args}**` : "seam");
-    const record = bindGoogleChatSession(channel, deps, { id: command.user.id, name: command.user.name });
-    return { command: "new", channel, record };
-  }
   const channel = deps.channelFor(command.space, command.thread);
   if (command.command === "cancel") return {
     command: "cancel", channel, outcome: await deps.cancelChannel(channel),
   };
-  const record = bindGoogleChatSession(channel, deps, { id: command.user.id, name: command.user.name });
+  const record = deps.store.getByChannel(channel.platform, channel.id);
+  if (!record) {
+    const message = "Start a session Space with /new before changing its configuration.";
+    await deps.respond(channel, message);
+    return { command: "usage", requestedCommand: command.command, channel, message };
+  }
   if (!command.args.trim()) {
     const current = deps.router.describeConfig(record);
     let message: string;

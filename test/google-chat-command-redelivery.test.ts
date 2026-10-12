@@ -7,6 +7,7 @@ import { pino } from "pino";
 import { SessionStore } from "../packages/core/src/core/session-store.js";
 import { GoogleChatAdapter } from "../packages/core/src/platforms/google-chat/adapter.js";
 import { PubSubPullTransport } from "../packages/core/src/platforms/google-chat/transport.js";
+import { seedLegacyChatRecords } from "./helpers/google-chat-legacy-fixture.js";
 
 const logger = pino({ level: "silent" });
 const stores = new Set<SessionStore>();
@@ -26,12 +27,21 @@ const admissionId = (id: number) => `gchat_${createHash("sha256").update(event(i
 
 function setup(db = ":memory:") {
   const store = new SessionStore(db); stores.add(store);
+  seedLegacyChatRecords(store, ["dm.invocation"]);
   let creates = 0;
-  const request = vi.fn(async (scope: string, r: any): Promise<any> => scope === "pubsub" ? {} : ({
-    name: `spaces/dm/messages/app-${++creates}`, thread: r.data?.thread ?? { name: `spaces/dm/threads/new-${creates}` },
-  }));
+  const google = async (scope: string, r: any): Promise<any> => {
+    if (scope === "pubsub") return {};
+    if (r.method === "POST" && r.url.endsWith("/spaces")) return { name: "spaces/session-new", displayName: r.data.displayName,
+      spaceType: "SPACE", spaceUri: "https://chat.google.com/room/session-new" };
+    if (r.method === "POST" && r.url.endsWith("/members")) return { name: "spaces/session-new/members/42" };
+    if (r.method === "PATCH") return {};
+    return { name: `spaces/dm/messages/app-${++creates}`, thread: r.data?.thread ?? { name: `spaces/dm/threads/new-${creates}` } };
+  };
+  const request = vi.fn(google);
   const adapter = new GoogleChatAdapter({ api: { request }, logger, subscription: "projects/test/subscriptions/events",
-    defaultCwd: "/projects", allowedUserIds: new Set(["users/42"]), writeIntervalMs: 0 });
+    defaultCwd: "/projects", allowedUserIds: new Set(["users/42"]), writeIntervalMs: 0,
+    spaceEvents: { start: vi.fn(), stop: vi.fn(), handle: vi.fn(), space: () => undefined, appUser: () => undefined,
+      recordAppUser: vi.fn(), register: vi.fn() } });
   const ensureSessionRecord = vi.fn((r: any) => ({ id: `google-chat:${r.channelRef}`, platform: "google-chat",
     channelRef: r.channelRef, parentRef: r.parentRef, agentId: "claude", acpSessionId: "saved-session" }));
   const applyAgentChange = vi.fn(async (_ch, _record, _arg, _actor, respond) => {
@@ -50,11 +60,18 @@ function setup(db = ":memory:") {
     mutation: { readThreadPresetEntry: () => undefined, applyThreadOverlay: () => ({ ok: true }) },
     runtimeTransition: { applyAgentChange, applyModelChange, configure }, cancelChannel,
     configPlan: { applyRepoChange, listRepos: async () => [] }, modelCatalog: { effortChoices: () => [] } } as any);
+  adapter.installSessionSpaces({ config: { DEFAULT_AGENT: "codex", REPOS_ROOT: "/projects" } as any,
+    prepare: async snapshot => snapshot, bind: async (channel, snapshot) => {
+      const now = new Date().toISOString();
+      const record = { id: `google-chat:${channel.id}`, platform: "google-chat", channelRef: channel.id, parentRef: null,
+        agentId: snapshot.agentId, acpSessionId: "", repoPath: snapshot.repo, configJson: "{}", createdUtc: now, updatedUtc: now };
+      store.upsert(record); return record;
+    } });
   const transport = new PubSubPullTransport({ api: { request }, logger, subscription: "projects/test/subscriptions/events",
     receive: (...args) => adapter.receiveEvent(...args) });
   const deliver = (raw: unknown, publication = "first") => transport.process({ ackId: `ack-${publication}`,
     message: { messageId: publication, data: Buffer.from(JSON.stringify(raw)).toString("base64") } });
-  return { store, adapter, request, ensureSessionRecord, applyAgentChange, applyModelChange, cancelChannel, deliver, applyRepoChange, configure };
+  return { store, adapter, request, google, ensureSessionRecord, applyAgentChange, applyModelChange, cancelChannel, deliver, applyRepoChange, configure };
 }
 
 describe("durable Google Chat command effects before reply delivery", () => {
@@ -80,14 +97,14 @@ describe("durable Google Chat command effects before reply delivery", () => {
     expect(restarted.request.mock.calls.map(([scope]) => scope)).toEqual(["pubsub"]);
   });
 
-  it("redelivered /new with a different publication id creates and binds exactly one thread", async () => {
+  it("redelivered /new with a different publication id creates and binds exactly one session Space", async () => {
     const h = setup();
     await h.deliver(event(1, "/new Another task"));
     await h.deliver(event(1, "/new Another task"), "redelivery");
     expect(h.request.mock.calls.filter(([scope]) => scope === "chat")).toHaveLength(1);
-    expect(h.request.mock.calls[0]![1].data.text).toBe("*Another task*");
-    expect(h.ensureSessionRecord).toHaveBeenCalledExactlyOnceWith({ platform: "google-chat", channelRef: "dm.new-1",
-      parentRef: "dm", cwd: "/projects" });
+    expect(h.request.mock.calls.filter(([, r]) => r.method === "POST" && r.url.endsWith("/spaces"))).toHaveLength(1);
+    expect(h.store.getByChannel("google-chat", "session-new")).toMatchObject({ parentRef: null });
+    expect(h.ensureSessionRecord).not.toHaveBeenCalled();
     expect(h.request.mock.calls.filter(([scope]) => scope === "pubsub")).toHaveLength(2);
     expect(h.store.getInbound(admissionId(1))?.state).toBe("completed");
   });
@@ -99,7 +116,7 @@ describe("durable Google Chat command effects before reply delivery", () => {
     const ackFailure = Object.assign(new Error("Pub/Sub acknowledge unavailable"), { response: { status: 503 } });
     h.request.mockImplementation(async (scope, r) => {
       if (scope === "pubsub") throw ackFailure;
-      return { name: "spaces/dm/messages/new", thread: { name: "spaces/dm/threads/new" } };
+      return h.google(scope, r);
     });
     await expect(h.deliver(event(1, "/new Another task"))).rejects.toBe(ackFailure);
     h.store.close(); stores.delete(h.store);

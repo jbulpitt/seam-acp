@@ -42,6 +42,7 @@ export interface InboundAdmission {
   platform: string;
   channelRef: string;
   parentRef: string | null;
+  deliveryChannel?: ChannelRef;
   sessionRecordId: string;
   authorId: string;
   authorName: string | null;
@@ -64,6 +65,7 @@ export interface NewInboundAdmission {
   platform: string;
   channelRef: string;
   parentRef?: string | null;
+  deliveryChannel?: ChannelRef;
   sessionRecordId: string;
   authorId: string;
   authorName?: string | null;

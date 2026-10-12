@@ -541,6 +541,8 @@ describe("#158 file-free dispatch", () => {
       logger: silent,
       store: testSessionStore({ getScheduled: () => row }),
       channelGenerations: new Map<string, number>(),
+      queueChannelRef: Orchestrator.prototype["queueChannelRef" as never],
+      recordForChannel: Orchestrator.prototype["recordForChannel" as never],
       queueOnChannel: async (_c: string, fn: () => Promise<void>) => fn(),
       handleIncomingMessageInner: async (m: Record<string, unknown>) => {
         seen.push(m);

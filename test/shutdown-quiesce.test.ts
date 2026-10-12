@@ -1126,6 +1126,8 @@ describe("#174 admission gates", () => {
         deleteParked,
       }),
       fireParked,
+      queueChannelRef: Orchestrator.prototype["queueChannelRef" as never],
+      recordForChannel: Orchestrator.prototype["recordForChannel" as never],
       tryFireParked: Orchestrator.prototype["tryFireParked" as never],
     } as unknown as { tryFireParked(c: string): Promise<void> };
 

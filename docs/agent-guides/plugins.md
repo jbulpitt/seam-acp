@@ -168,6 +168,14 @@ activity-based cadence, refresh bounds and stale-value policy.
 `DISCORD_AGENT_QUOTA_THREAD_ID` and `QUOTA_STALE_RETENTION_MS` are unchanged;
 the storage alias keeps `agent-quota-card.json` and its pinned message.
 
+Antigravity readings include `pools`, using the native labels **Gemini Models**
+and **Claude and GPT models**. Each pool has its own `rolling` (5-hour) and
+`weekly` windows, with `usedPercent` and Unix-second `resetsAt`. The existing
+top-level windows remain the worst reported value across pools, not one shared
+allowance. Cards and usage replies show both pools. Missing pools/windows have
+null usage/reset values and an `error` explaining the absent source reading;
+they are not unused allowances. Other providers' shapes are unchanged.
+
 The kernel emits immutable `turn-started` and `turn-completed` facts once,
 ordered per agent, with the turn id, timestamp, host binding and account id.
 Recovery adoption emits completion, not another start. Emission never waits

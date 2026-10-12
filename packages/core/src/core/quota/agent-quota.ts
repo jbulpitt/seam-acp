@@ -14,6 +14,15 @@ export interface QuotaWindow {
   /** Unix seconds, or null when the window has no reset. */
   resetsAt: number | null;
   label: string;
+  /** Why this window is unknown, when the source did not report it. */
+  error?: string;
+}
+
+export interface QuotaPool {
+  displayName: string;
+  description?: string;
+  rolling: QuotaWindow;
+  weekly: QuotaWindow;
 }
 
 export interface AgentQuota {
@@ -25,6 +34,8 @@ export interface AgentQuota {
   noSubscription?: boolean;
   rolling: QuotaWindow;
   weekly: QuotaWindow;
+  /** Independent provider pools; top-level windows remain the worst reported. */
+  pools?: QuotaPool[];
   credits?: { balance: string; unlimited: boolean } | null;
   /** Unix seconds of the observation; null when its timestamp is unknown. */
   fetchedAt: number | null;
@@ -255,20 +266,42 @@ function agyWindow(
   );
 }
 
+function unknownAgyWindow(label: "rolling" | "weekly", error: string): QuotaWindow {
+  return { usedPercent: null, resetsAt: null, label, error };
+}
+
+function agyPools(data: AgyUsage, error?: string): QuotaPool[] {
+  // Native RetrieveUserQuotaSummary labels; never fill an absent pool with 0%.
+  const groups = [...data.groups];
+  for (const displayName of ["Gemini Models", "Claude and GPT models"]) {
+    if (!groups.some(group => group.displayName === displayName)) groups.push({ displayName, buckets: [] });
+  }
+  return groups.map(group => ({
+    displayName: group.displayName,
+    ...(group.description ? { description: group.description } : {}),
+    rolling: agyWindow({ groups: [group] }, "5h", "rolling") ?? unknownAgyWindow("rolling",
+      error ?? `RetrieveUserQuotaSummary: ${group.displayName} did not report a usable 5h bucket`),
+    weekly: agyWindow({ groups: [group] }, "weekly", "weekly") ?? unknownAgyWindow("weekly",
+      error ?? `RetrieveUserQuotaSummary: ${group.displayName} did not report a usable weekly bucket`),
+  }));
+}
+
 export function mapAgyQuota(
   identity: QuotaAgentIdentity,
   data: AgyUsage,
   fetchedAt = Math.floor(Date.now() / 1000)
 ): AgentQuota {
-  const hasBuckets = data.groups.some((group) => group.buckets.length > 0);
   const rolling = agyWindow(data, "5h", "rolling");
   const weekly = agyWindow(data, "weekly", "weekly");
+  const hasBuckets = rolling !== null || weekly !== null;
   return {
     ...identity,
     ok: hasBuckets,
     ...(!hasBuckets ? { error: "Antigravity quota data unavailable" } : {}),
     plan: null,
-    ...normalizeQuotaWindows({ rolling, weekly }, fetchedAt),
+    rolling: rolling ?? unknownAgyWindow("rolling", "RetrieveUserQuotaSummary did not report a usable 5h bucket"),
+    weekly: weekly ?? unknownAgyWindow("weekly", "RetrieveUserQuotaSummary did not report a usable weekly bucket"),
+    pools: agyPools(data),
     credits: null,
     fetchedAt,
   };
@@ -328,6 +361,15 @@ export function mapUnavailableQuota(
   error: string,
   fetchedAt = Math.floor(Date.now() / 1000)
 ): AgentQuota {
+  if (identity.agentId === "agy") {
+    return {
+      ...mapAgyQuota(identity, { groups: [] }, fetchedAt),
+      error,
+      rolling: unknownAgyWindow("rolling", error),
+      weekly: unknownAgyWindow("weekly", error),
+      pools: agyPools({ groups: [] }, error),
+    };
+  }
   return {
     ...identity,
     ok: false,

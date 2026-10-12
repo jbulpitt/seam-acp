@@ -2,7 +2,7 @@ import fs from "node:fs";
 import type { Logger } from "../../lib/logger.js";
 import type { ChatAdapter, MessageRef } from "../../platforms/chat-adapter.js";
 import type { LayoutBlock, PanelButton, StructuredLayout, StructuredPanel } from "../types.js";
-import type { AgentQuota, QuotaWindow } from "./agent-quota.js";
+import type { AgentQuota, QuotaPool, QuotaWindow } from "./agent-quota.js";
 import { formatUsageObservation } from "./usage-observation.js";
 
 const DEBOUNCE_MS = 500;
@@ -33,10 +33,19 @@ function resetLabel(window: QuotaWindow): string {
   return window.resetsAt === null ? "reset unknown" : `resets <t:${window.resetsAt}:R>`;
 }
 
-function quotaLine(label: "rolling" | "weekly", window: QuotaWindow): string {
+function quotaLine(label: string, window: QuotaWindow): string {
   if (window.label === "unlimited") return `**${label}** unlimited`;
-  if (window.usedPercent === null) return `**${label}** not reported`;
+  if (window.usedPercent === null) return `**${label}** ${window.error ? `unknown · ${window.error}` : "not reported"}`;
   return `**${label}** \`${usageBar(window.usedPercent)}\` ${Math.round(window.usedPercent)}% · ${resetLabel(window)}`;
+}
+
+export function renderQuotaPools(pools: QuotaPool[]): string {
+  return pools.map(pool => [
+    `**${pool.displayName}**`,
+    ...(pool.description ? [pool.description] : []),
+    quotaLine("5h", pool.rolling),
+    quotaLine("weekly", pool.weekly),
+  ].join("\n")).join("\n\n");
 }
 
 export function renderAgentQuotaRow(quota: AgentQuota): string {
@@ -58,8 +67,7 @@ export function renderAgentQuotaRow(quota: AgentQuota): string {
     quota.source ? formatUsageObservation(quota.source) : `updated <t:${quota.fetchedAt}:R>`,
   ].join(" · ");
   return [
-    `${quotaLine("rolling", quota.rolling)}`,
-    `${quotaLine("weekly", quota.weekly)}`,
+    ...(quota.pools ? [renderQuotaPools(quota.pools)] : [quotaLine("rolling", quota.rolling), quotaLine("weekly", quota.weekly)]),
     `${meta}${warning}${quota.liveError ? `\nLive read unavailable: ${quota.liveError}` : ""}`,
   ].join("\n");
 }
@@ -85,7 +93,8 @@ function oldestReadingLabel(quotas: AgentQuota[], nowMs: number): string {
 function isWarning(quotas: AgentQuota[]): boolean {
   return quotas.some(
     (quota) =>
-      !quota.ok || (quota.rolling.usedPercent ?? 0) >= 90 || (quota.weekly.usedPercent ?? 0) >= 90
+      !quota.ok || (quota.rolling.usedPercent ?? 0) >= 90 || (quota.weekly.usedPercent ?? 0) >= 90 ||
+      quota.pools?.some(pool => pool.rolling.error || pool.weekly.error) === true
   );
 }
 

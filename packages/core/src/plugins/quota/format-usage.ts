@@ -1,5 +1,7 @@
 import type { ProviderUsage } from "../../core/quota/usage-provider.js";
 import { formatUsageObservation } from "../../core/quota/usage-observation.js";
+import { mapAgyQuota } from "../../core/quota/agent-quota.js";
+import { renderQuotaPools } from "../../core/quota/agent-quota-card.js";
 
 export function formatUsage(usage: ProviderUsage): string {
   switch (usage.provider) {
@@ -24,24 +26,8 @@ function usageLine(pct: number | null, label: string): string {
 }
 
 function formatAgyUsage(d: import("@seam/adapters").AgyUsage): string {
-  const lines = ["**Antigravity usage**", "", "**Models & Quota**"];
-  const windows = [
-    { window: "weekly", label: "Weekly" },
-    { window: "5h", label: "Five-Hour" },
-  ] as const;
-  for (const group of d.groups) {
-    lines.push("", `**${group.displayName}**`);
-    for (const { window, label } of windows) {
-      const bucket = group.buckets.find((candidate) => candidate.window === window);
-      if (!bucket) continue;
-      const usedPercent = (1 - bucket.remainingFraction) * 100;
-      const reset = bucket.resetTime
-        ? ` · resets ${formatResetTime(bucket.resetTime)}`
-        : "";
-      lines.push(usageLine(usedPercent, `${label}${reset}`));
-    }
-  }
-  return lines.join("\n");
+  const quota = mapAgyQuota({ agentId: "agy", displayName: "Antigravity" }, d);
+  return `**Antigravity usage**\n\n${renderQuotaPools(quota.pools!)}`;
 }
 
 function formatOllamaCloudUsage(

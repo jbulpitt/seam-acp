@@ -1,0 +1,80 @@
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import path from "node:path";
+import { pino } from "pino";
+import { Orchestrator } from "../packages/core/src/platforms/discord/orchestrator.js";
+import { SessionStore } from "../packages/core/src/core/session-store.js";
+import { fixtureModelCatalog } from "./model-catalog-fixture.js";
+import { testSessionRouter } from "./helpers/session-fixture.js";
+
+const cleanups: Array<() => void> = [];
+afterEach(() => { for (const cleanup of cleanups.splice(0).reverse()) cleanup(); vi.restoreAllMocks(); });
+const channel = { platform: "google-chat", id: "session-home" };
+const target = (thread: string) => ({ platform: "google-chat", id: `session-home.${thread}`, parentId: "session-home" });
+const now = "2026-10-12T18:00:00.000Z";
+
+function fixture() {
+  const dir = mkdtempSync(path.join(tmpdir(), "gchat-root-fifo-"));
+  cleanups.push(() => rmSync(dir, { recursive: true, force: true }));
+  const file = path.join(dir, "seam.db"), store = new SessionStore(file);
+  cleanups.push(() => store.close());
+  const record = { id: "google-chat:stable-record", platform: "google-chat", channelRef: channel.id,
+    parentRef: null, agentId: "codex", acpSessionId: "keep-acp", repoPath: "/projects", configJson: "{}", createdUtc: now, updatedUtc: now };
+  store.upsert(record);
+  const router = testSessionRouter({ ensureSessionRecord: () => record, listProfiles: () => [],
+    isBusy: () => true, abortTurn: vi.fn(async () => "cancelled"),
+    describeConfig: () => ({ agent: { value: "codex" }, model: { value: "default" },
+      location: { value: "local" }, effort: { value: null }, cwd: { value: "/projects" } }) });
+  const host = new Orchestrator({ store, router: router as any, modelCatalog: fixtureModelCatalog([]),
+    logger: pino({ level: "silent" }) as any, adapter: {} as any, renderer: {} as any,
+    config: { DATA_DIR: dir, REPOS_ROOT: "/projects", channelPresets: new Map(), threadPresets: new Map() } as any });
+  Object.assign(host, { tryConsumeConfigEditorRiderUpload: async () => false, wouldParkForOfflineBridge: () => false,
+    tryParkForOfflineBridge: async () => false, clearParkedForChannel: vi.fn(async () => null),
+    clearTurnMarkersForChannel: vi.fn(async () => undefined), tryFireParked: async () => undefined,
+    handleIncomingMessageInner: vi.fn(async () => undefined) });
+  const input = (id: string, thread: string) => ({ messageId: id, channel, deliveryChannel: target(thread),
+    preemptive: false, authorId: "42", authorName: "Tester", authorIsBot: false, text: `Prompt ${id}` });
+  return { store, file, record, host, router, input };
+}
+
+describe("Space-root FIFO keeps per-prompt delivery across restart", () => {
+  it("persists each queued prompt's own thread without replacing its predecessor", () => {
+    const h = fixture();
+    for (const [id, thread] of [["first", "A"], ["second", "B"]]) h.store.admitInbound({ ...h.input(id!, thread!),
+      platform: "google-chat", channelRef: channel.id, sessionRecordId: h.record.id, createdUtc: now } as any);
+    expect(h.store.listInboundNonterminal(channel.id)).toMatchObject([
+      { messageId: "first", preemptive: false, deliveryChannel: target("A") },
+      { messageId: "second", preemptive: false, deliveryChannel: target("B") },
+    ]);
+    const reopened = new SessionStore(h.file); cleanups.push(() => reopened.close());
+    expect(reopened.getInbound("first")).toMatchObject({ deliveryChannel: target("A") });
+    expect(reopened.getInbound("second")).toMatchObject({ deliveryChannel: target("B") });
+    expect(reopened.get(h.record.id)?.acpSessionId).toBe("keep-acp");
+  });
+
+  it("does not cancel a live Space turn when another native thread queues a prompt", async () => {
+    const h = fixture();
+    (h.host as any).channelQueues.set(channel.id, Promise.resolve());
+    await (h.host as any).handleIncomingMessage(h.input("queued", "B"));
+    expect(h.router.abortTurn).not.toHaveBeenCalled();
+    expect((h.host as any).clearTurnMarkersForChannel).not.toHaveBeenCalled();
+    expect(h.store.getInbound("queued")).toMatchObject({ channelRef: channel.id, preemptive: false, deliveryChannel: target("B") });
+  });
+
+  it("restores a saved delivery target into the recovery message instead of replacing it with the root", () => {
+    const h = fixture();
+    h.store.admitInbound({ ...h.input("resume", "A"), platform: "google-chat", channelRef: channel.id,
+      sessionRecordId: h.record.id, createdUtc: now } as any);
+    const row = h.store.getInbound("resume")!;
+    expect((h.host as any).inboundMessage(row)).toMatchObject({ channel, deliveryChannel: target("A"), preemptive: false });
+  });
+
+  it("keeps old admissions' delivery target equal to their original channel", () => {
+    const h = fixture();
+    h.store.admitInbound({ messageId: "legacy", platform: "discord", channelRef: "123", parentRef: "12",
+      sessionRecordId: "discord:123", authorId: "42", text: "Old prompt", createdUtc: now });
+    expect((h.host as any).inboundMessage(h.store.getInbound("legacy"))).toMatchObject({
+      channel: { platform: "discord", id: "123", parentId: "12" } });
+  });
+});

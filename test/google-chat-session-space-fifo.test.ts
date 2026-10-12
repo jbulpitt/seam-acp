@@ -148,4 +148,16 @@ describe("Space-root FIFO keeps per-prompt delivery across restart", () => {
     await (h.host as any).queueOnChannel(channel.id, async () => {});
     expect(seen).toEqual(["first", "second"]);
   });
+
+  it("leaves a queued prompt pending while a previously prompted human turn is suspended", async () => {
+    const h = fixture();
+    h.store.turnAttempts.registerOwner("old-boot");
+    const attempt = h.store.turnAttempts.claim({ id: "inbound-first", target: channel.id, prompt: "First", session: "live", kind: "handoff", createdUtc: now }, "codex@local", "old-boot", "inbound");
+    h.store.turnAttempts.bind(attempt, "keep-acp"); h.store.turnAttempts.startPrompt(attempt);
+    h.store.turnAttempts.suspendBoot("old-boot");
+    await (h.host as any).handleIncomingMessage(h.input("second", "B"));
+    expect(h.store.getInbound("second")).toMatchObject({ state: "pending", deliveryChannel: target("B") });
+    expect((h.host as any).handleIncomingMessageInner).not.toHaveBeenCalled();
+    expect(h.router.abortTurn).not.toHaveBeenCalled();
+  });
 });

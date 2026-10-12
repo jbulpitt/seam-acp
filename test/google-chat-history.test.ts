@@ -50,6 +50,13 @@ function params(options: ChatHistoryHttpRequest) {
 beforeEach(() => vi.clearAllMocks());
 
 describe("Google Chat app-auth history", () => {
+  it("reads one unseen native-thread root with the approved quoted filter and oldest-first order", async () => {
+    const chat = fakeChat({ messages: [human] });
+    await new GoogleChatHistoryReader(config, chat.client).readRawPage({ space, thread, order: "oldest", limit: 1 });
+    expect(params(chat.request.mock.calls[0]![0])).toEqual({ pageSize: "1", orderBy: "createTime ASC",
+      filter: `thread.name = "${thread}"` });
+    expect(chat.request).toHaveBeenCalledTimes(1);
+  });
   it("uses the explicit service-account key and admin-approved message read scope", async () => {
     auth.request.mockResolvedValue({ data: {} });
     await new GoogleChatHistoryReader(config).readPage({ space, limit: 25 });

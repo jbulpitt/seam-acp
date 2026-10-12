@@ -97,6 +97,26 @@ describe("one Google Chat session root with native per-prompt delivery", () => {
     expect(h.history.getMessage).not.toHaveBeenCalled(); expect(h.history.readRawPage).not.toHaveBeenCalled();
   });
 
+  it("uses the edited status root's readable content, not cardsV2 JSON, without a history call", async () => {
+    const h = fixture();
+    const ref = await h.adapter.sendPanel(channel, { title: "Working", description: "First report", fields: [] });
+    await h.adapter.editPanel(ref, { title: "Done", description: "Completed report", fields: [] });
+    await h.receive("reply", true, "workspace", "new-output");
+    expect(h.incoming[0].text).toContain("Completed report");
+    expect(h.incoming[0].text).not.toContain("cardsV2");
+    expect(h.history.readRawPage).not.toHaveBeenCalled(); expect(h.history.getMessage).not.toHaveBeenCalled();
+  });
+
+  it("deduplicated continuation after a restart redirects later turn writes to the root", async () => {
+    const h = fixture(), continued = vi.fn();
+    (h.adapter as any).commandDeps.deliveryForChannel = () => ({ channel: {
+      platform: "google-chat", id: "session-home.full", parentId: "session-home" }, continued });
+    h.request.mockRejectedValueOnce(Object.assign(new Error("Already exists"), { response: { status: 409 } }));
+    await h.adapter.sendMessage(channel, "Saved answer", { nonce: "stable", enforceNonce: true });
+    expect(continued).toHaveBeenCalledExactlyOnceWith(channel);
+    expect(h.store.get(h.record.id)).toMatchObject({ channelRef: channel.id, acpSessionId: "same-acp" });
+  });
+
   it("keeps returned status-message references on their native thread, not the root", async () => {
     const h = fixture();
     const target = { platform: "google-chat", id: "session-home.topic", parentId: "session-home" };

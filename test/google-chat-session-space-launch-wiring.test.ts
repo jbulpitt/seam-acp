@@ -68,9 +68,10 @@ function fixture() {
 }
 
 describe("Chat launches new session Spaces instead of thread sessions", () => {
-  it.each(["DIRECT_MESSAGE", "SPACE"])("native /new in %s creates a Space without admitting a prompt", async type => {
+  it.each(["DIRECT_MESSAGE", "SPACE", "UNTHREADED_MESSAGES"])("native /new in %s creates a Space without admitting a prompt", async type => {
     const h = fixture(), raw = h.raw("/new Multi word name agent=codex@local model=chosen effort=high repo=/chosen", type === "SPACE");
     Object.assign(raw.message, { argumentText: raw.message.text, slashCommand: { commandId: 1 }, annotations: [] });
+    if (type === "UNTHREADED_MESSAGES") Object.assign(raw.space, { spaceType: "SPACE", spaceThreadingState: type });
     await h.adapter.receiveEvent(raw);
     expect(h.request.mock.calls.filter(([, r]) => r.method === "POST" && r.url.endsWith("/spaces"))).toHaveLength(1);
     expect(h.prepare).toHaveBeenCalledWith({ agentId: "codex", location: "local", model: "chosen", effort: "high", repo: "/chosen" });

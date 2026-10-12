@@ -87,4 +87,44 @@ describe("Space-root FIFO keeps per-prompt delivery across restart", () => {
     expect((h.host as any).inboundMessage(h.store.getInbound("legacy"))).toMatchObject({
       channel: { platform: "discord", id: "123", parentId: "12" } });
   });
+
+  it("executes queued prompts from different threads serially with each prompt's own target", async () => {
+    const h = fixture(); (h.router as any).isBusy = () => false;
+    let release!: () => void, began!: () => void;
+    const started = new Promise<void>(resolve => { began = resolve; });
+    const held = new Promise<void>(resolve => { release = resolve; });
+    const seen: any[] = [];
+    (h.host as any).handleIncomingMessageInner.mockImplementation(async (msg: any) => {
+      (h.host as any).liveTurnByChannel.set(channel.id, `inbound-${msg.messageId}`);
+      seen.push(h.host.deliveryForChannel(channel).channel);
+      if (msg.messageId === "first") { began(); await held; }
+      (h.host as any).liveTurnByChannel.delete(channel.id);
+    });
+    const first = (h.host as any).handleIncomingMessage(h.input("first", "A"));
+    await started;
+    const second = (h.host as any).handleIncomingMessage(h.input("second", "B"));
+    await vi.waitFor(() => expect(h.store.getInbound("second")?.state).toBe("pending"));
+    expect(seen).toEqual([target("A")]);
+    release(); await Promise.all([first, second]);
+    expect(seen).toEqual([target("A"), target("B")]);
+    expect(h.router.abortTurn).not.toHaveBeenCalled();
+    expect(h.store.get(h.record.id)?.acpSessionId).toBe("keep-acp");
+  });
+
+  it("reattached bridge output uses its own receipt and continuation does not change a queued prompt", () => {
+    const h = fixture();
+    for (const [id, thread] of [["first", "A"], ["second", "B"]]) h.store.admitInbound({ ...h.input(id!, thread!),
+      platform: "google-chat", channelRef: channel.id, sessionRecordId: h.record.id, createdUtc: now } as any);
+    h.store.turnAttempts.registerOwner("old-boot");
+    const attempt = h.store.turnAttempts.claim({ id: "inbound-first", target: channel.id, prompt: "First", session: "live", kind: "handoff", createdUtc: now }, "codex@local", "old-boot", "inbound");
+    h.store.turnAttempts.prepareStreamDelivery(attempt, target("A").id, "Saved fragment", 0);
+    (h.host as any).adoptingRemoteResults.add(attempt.id);
+    const route = h.host.deliveryForChannel(channel);
+    expect(route.channel).toEqual(target("A"));
+    route.continued!(channel);
+    expect(h.store.getInbound("first")?.deliveryChannel).toEqual(channel);
+    expect(h.store.turnAttempts.get(attempt.id)?.deliveryChannel).toBe(channel.id);
+    expect(h.store.getInbound("second")?.deliveryChannel).toEqual(target("B"));
+    expect(h.store.get(h.record.id)?.acpSessionId).toBe("keep-acp");
+  });
 });

@@ -20,7 +20,11 @@ function setup() {
     GOOGLE_CHAT_DEFAULT_EFFORT: "medium", GOOGLE_CHAT_DEFAULT_CWD: "/org/repo" };
   const requestIds = new Set<string>(); let membershipPresent = false;
   const request = vi.fn(async (_scope: string, r: any): Promise<any> => {
-    if (r.method === "POST" && r.url.endsWith("/spaces")) { requestIds.add(r.params.requestId); return { ...space }; }
+    if (r.method === "POST" && r.url.endsWith("/spaces")) {
+      if (requestIds.has(r.params.requestId)) return { name: space.name };
+      requestIds.add(r.params.requestId); return { ...space };
+    }
+    if (r.method === "GET" && r.url.endsWith("/spaces/created")) return { ...space };
     if (r.method === "POST" && r.url.endsWith("/members")) {
       if (membershipPresent) throw Object.assign(new Error("Member already exists"), { response: { status: 409 } });
       membershipPresent = true; return { ...membership };
@@ -135,6 +139,7 @@ describe("durable Google Chat session Space creation", () => {
     expect(h.requestIds.size).toBe(1);
     const posts = h.request.mock.calls.filter(([, r]) => r.method === "POST" && r.url.endsWith("/spaces"));
     expect(posts).toHaveLength(2); expect(posts[0]![1].data).toEqual(posts[1]![1].data);
+    expect(h.request).toHaveBeenCalledWith("spaces", { method: "GET", url: "https://chat.googleapis.com/v1/spaces/created" });
   });
 
   it("reconciles a membership collision after its API effect outran its SQLite checkpoint", async () => {
@@ -155,6 +160,48 @@ describe("durable Google Chat session Space creation", () => {
     const h = setup(), cause = new Error("pwd: /missing: Permission denied"); h.prepare.mockRejectedValueOnce(cause);
     await expect(Promise.resolve().then(() => h.make().create(h.input))).rejects.toBe(cause);
     expect(h.request).not.toHaveBeenCalled(); expect(h.bind).not.toHaveBeenCalled();
+  });
+
+  it("preserves a real permission failure during collision reconciliation instead of treating it as absence", async () => {
+    const h = setup(), cause = Object.assign(new Error("Google membership read: permission denied"), { response: { status: 403 } });
+    let interrupted = false;
+    const save = (h.store as any).saveInboundCommandProgress?.bind(h.store);
+    vi.spyOn(h.store as any, "saveInboundCommandProgress").mockImplementation((...args: any[]) => {
+      if (args[1].spaceCreation?.membershipName && !interrupted) { interrupted = true; throw new Error("checkpoint interrupted"); }
+      return save(...args);
+    });
+    await expect(h.make().create(h.input)).rejects.toThrow("checkpoint interrupted");
+    const request = h.request.getMockImplementation()!;
+    h.request.mockImplementation((scope, r) => r.method === "GET" && r.url.includes("/members/")
+      ? Promise.reject(cause) : request(scope, r));
+    await expect(h.make().create(h.input)).rejects.toBe(cause);
+    expect(h.store.getInbound(h.input.messageId)?.state).not.toBe("completed");
+  });
+
+  it("persists a new root's complete snapshot through the existing overlay/binding path", () => {
+    const snapshot = { agentId: "codex", location: "remote", model: "org-model", effort: "medium", repo: "/org/repo" };
+    const record: any = { id: "google-chat:new-home", channelRef: "new-home", acpSessionId: "" };
+    const applyThreadOverlay = vi.fn(() => ({ ok: true }));
+    const ensureSessionRecord = vi.fn(() => record), bindRecordLocation = vi.fn();
+    const actor = { id: "person", name: "Person" };
+    const result = (actions as any).bindGoogleChatSessionSpace({ platform: "google-chat", id: "new-home" }, snapshot,
+      { store: { getByChannel: () => null }, mutation: { applyThreadOverlay }, router: { ensureSessionRecord, bindRecordLocation } }, actor);
+    expect(result).toBe(record);
+    expect(applyThreadOverlay).toHaveBeenCalledWith({ threadId: "new-home", platform: "google-chat",
+      changes: { agent: "codex", location: "remote", model: "org-model", effort: "medium", cwd: "/org/repo" }, actor });
+    expect(ensureSessionRecord).toHaveBeenCalledWith({ platform: "google-chat", channelRef: "new-home", cwd: "/org/repo" });
+    expect(bindRecordLocation).toHaveBeenCalledWith(record);
+  });
+
+  it("does not reset or reconfigure an already-bound root on setup replay", () => {
+    const record: any = { id: "google-chat:original", channelRef: "new-home", acpSessionId: "keep-acp" };
+    const applyThreadOverlay = vi.fn(), ensureSessionRecord = vi.fn(), bindRecordLocation = vi.fn();
+    const result = (actions as any).bindGoogleChatSessionSpace({ platform: "google-chat", id: "new-home" },
+      { agentId: "other", location: "local", model: "other", effort: "low", repo: "/other" },
+      { store: { getByChannel: () => record }, mutation: { applyThreadOverlay }, router: { ensureSessionRecord, bindRecordLocation } },
+      { id: "person", name: "Person" });
+    expect(result).toBe(record); expect(result.acpSessionId).toBe("keep-acp");
+    expect(applyThreadOverlay).not.toHaveBeenCalled(); expect(ensureSessionRecord).not.toHaveBeenCalled(); expect(bindRecordLocation).not.toHaveBeenCalled();
   });
 
   it("does not terminalize a command merely because a partial result was checkpointed", () => {

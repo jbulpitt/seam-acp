@@ -79,7 +79,11 @@ describe("durable Google Chat session Space creation", () => {
 
   it("retains the real media membership failure and resumes its checkpoint without another Space or requester membership", async () => {
     const h = setup(); h.config.GOOGLE_CHAT_MEDIA_USER = "users/poster";
-    const original = h.request.getMockImplementation()!, cause = new Error("Google media member permission denied");
+    const message = "Permission denied to perform the requested action on the specified resource, or the resource doesn't exist.";
+    const cause = Object.assign(new Error(message), { name: "GaxiosError", response: { status: 403,
+      data: { error: { code: 403, status: "PERMISSION_DENIED", message,
+        errors: [{ domain: "global", reason: "forbidden", message }] } } } });
+    const original = h.request.getMockImplementation()!;
     let failed = false;
     h.request.mockImplementation(async (scope, r) => {
       if (!failed && r.method === "POST" && r.data?.member?.name === "users/poster") { failed = true; throw cause; }

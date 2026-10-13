@@ -7,14 +7,17 @@ import { GoogleChatAdapter } from "../packages/core/src/platforms/google-chat/ad
 import { GoogleChatHistoryReader } from "../packages/core/src/core/messages/google-chat-history.js";
 import { projectDiscordConversation } from "../packages/core/src/core/reconstruction/project.js";
 import { SessionStore } from "../packages/core/src/core/session-store.js";
+import { SessionRouter } from "../packages/core/src/core/session-router.js";
+import { fixtureModelCatalog } from "./model-catalog-fixture.js";
 import { parseGoogleChatWorkspaceMessages } from "../packages/core/src/platforms/google-chat/workspace-message-event.js";
 import { GoogleChatSpaceEvents } from "../packages/core/src/platforms/google-chat/space-events.js";
 
 const user = "users/poster", bot = "users/app", space = "spaces/test", thread = `${space}/threads/native`;
 const channel = { platform: "google-chat", id: "test" };
 const image = { data: Buffer.from([137, 80, 78, 71, 0, 255]), filename: "result.png", mimeType: "image/png", caption: "Result" };
-const stores: SessionStore[] = [], dirs: string[] = [];
-afterEach(() => { stores.splice(0).forEach(s => s.close()); dirs.splice(0).forEach(d => rmSync(d, { recursive: true })); vi.restoreAllMocks(); });
+const stores: SessionStore[] = [], dirs: string[] = [], routers: SessionRouter[] = [];
+afterEach(async () => { await Promise.all(routers.splice(0).map(r => r.disposeAll()));
+  stores.splice(0).forEach(s => s.close()); dirs.splice(0).forEach(d => rmSync(d, { recursive: true })); vi.restoreAllMocks(); });
 
 function fixture(path = ":memory:") {
   const store = new SessionStore(path); stores.push(store);
@@ -22,6 +25,8 @@ function fixture(path = ":memory:") {
   store.upsert({ id: "google-chat:test", platform: "google-chat", channelRef: "test", parentRef: null,
     agentId: "codex", acpSessionId: "same-acp", repoPath: "/fixture", configJson: "{}", createdUtc: now, updatedUtc: now });
   const logger = pino({ level: "silent" });
+  const router = new SessionRouter({ store, logger, profiles: [], modelCatalog: fixtureModelCatalog([]),
+    defaultAgentId: "codex", defaultModel: "default", defaultCwd: "/fixture" }); routers.push(router);
   const cause = new Error("fixture");
   const drive = { upload: vi.fn(async () => "https://drive.google.com/file/d/original/view") };
   const history = new Map<string, any>();
@@ -47,10 +52,10 @@ function fixture(path = ":memory:") {
     const adapter = new GoogleChatAdapter({ api: { request }, subscription: "unused", allowedUserIds: new Set([user]),
       defaultCwd: "/fixture", logger, writeIntervalMs: 0, driveUploader: drive, historyReader: reader,
       ...(native ? { mediaUser: user, nativeImages: true } : {}) } as any);
-    adapter.setCommandDeps({ store, mutation: {}, deliveryForChannel: () => ({ channel }) } as any);
+    adapter.setCommandDeps({ store, router, mutation: {}, deliveryForChannel: () => ({ channel }) } as any);
     return adapter;
   };
-  return { store, logger, cause, drive, request, reader, history, make, adapter: make() };
+  return { store, router, logger, cause, drive, request, reader, history, make, adapter: make() };
 }
 
 async function echo(adapter: GoogleChatAdapter, message: any, source: "direct" | "workspace") {
@@ -83,7 +88,13 @@ describe("Google Chat native images", () => {
   it.each(["direct", "workspace"] as const)("drops the %s echo before create resolves and after restarting, but admits Jesse's own prompt", async source => {
     const dir = mkdtempSync(join(tmpdir(), "chat-images-")); dirs.push(dir);
     const h = fixture(join(dir, "seam.db"));
-    const handler = vi.fn((m: any) => m.onAdmitted()); h.adapter.onMessage(handler);
+    const handler = vi.fn((m: any) => {
+      const record = h.store.getByChannel(m.channel.platform, m.channel.id)!;
+      h.store.admitInbound({ messageId: m.messageId, platform: m.channel.platform, channelRef: m.channel.id,
+        sessionRecordId: record.id, authorId: m.authorId, authorName: m.authorName,
+        text: m.text, attachments: m.attachments, createdUtc: new Date().toISOString(), preemptive: m.preemptive });
+      m.onAdmitted();
+    }); h.adapter.onMessage(handler);
     const original = h.request.getMockImplementation()!;
     let own: any;
     h.request.mockImplementation(async (scope, r) => {
@@ -97,12 +108,15 @@ describe("Google Chat native images", () => {
       return original(scope, r);
     });
     const ref = await h.adapter.sendFile(channel, image, { nonce: "echo-test" });
+    expect(own).toBeDefined();
     expect(handler).not.toHaveBeenCalled();
     const restarted = h.make(); restarted.onMessage(handler);
     await echo(restarted, { ...own, name: ref.id }, source);
     await echo(restarted, { ...own, name: `${space}/messages/human`, text: "My own prompt", attachment: [] }, source);
     expect(handler).toHaveBeenCalledOnce();
     expect(handler.mock.calls[0]?.[0].text).toBe("My own prompt");
+    expect(h.store.getInbound(handler.mock.calls[0]?.[0].messageId)).toMatchObject({ channelRef: "test", text: "My own prompt" });
+    expect(h.store.get("google-chat:test")?.acpSessionId).toBe("same-acp");
   });
 
   it("classifies recorded user-auth images as Seam output in history and reconstruction, not the user's other messages", async () => {

@@ -41,9 +41,9 @@ export function readProcessIdentity(pid: number, includeExited = false): Process
 export function ownedProcessGroupAlive(identity: ProcessIdentity): boolean {
   const leader = readProcessIdentity(identity.pid, true);
   if (leader && (leader.started !== identity.started || leader.pgid !== identity.pgid)) return false;
-  try { process.kill(-identity.pgid, 0); }
-  catch (error) { if ((error as NodeJS.ErrnoException).code === "ESRCH") return false; throw error; }
   if (process.platform === "linux") {
+    try { process.kill(-identity.pgid, 0); }
+    catch (error) { if ((error as NodeJS.ErrnoException).code === "ESRCH") return false; throw error; }
     return readdirSync("/proc").some(name => /^\d+$/.test(name) && readProcessIdentity(Number(name))?.pgid === identity.pgid);
   }
   const members = execFileSync("/bin/ps", ["-ax", "-o", "pgid=", "-o", "stat="], {

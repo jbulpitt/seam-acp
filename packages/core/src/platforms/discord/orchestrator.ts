@@ -1111,23 +1111,7 @@ export class Orchestrator {
       isAgentAvailable: (agentId, location) => Boolean(this.router.getProfile(agentId, location)),
       presetsFile: this.config.CHANNEL_PRESETS_FILE,
       tierCEnabled: this.config.SEAM_CONFIG_MUTATION_TIER_C_ENABLED,
-      reloadPresets: () => {
-        const before = new Map(this.config.channelPresets);
-        const result = reloadChannelPresets(
-          {
-            channelPresets: this.config.channelPresets,
-            threadPresets: this.config.threadPresets,
-            bridgePresets: this.config.bridgePresets,
-          },
-          this.config.CHANNEL_PRESETS_FILE,
-          this.logger
-        );
-        if (result.ok) this.identityEffects.presetsCommitted(new Set(
-          [...new Set([...before.keys(), ...this.config.channelPresets.keys()])]
-            .filter(id => JSON.stringify(before.get(id)) !== JSON.stringify(this.config.channelPresets.get(id)))
-        ));
-        return result;
-      },
+      reloadPresets: () => this.reloadPresets(),
       // #69 Tier D: (re)arm the manager's croner timer after a schedule write, so
       // the row and the live timer never diverge. `scheduledManager` is set by
       // index.ts after construction; the `?.` guards the pre-wire window.
@@ -1264,6 +1248,19 @@ export class Orchestrator {
 
   /** Wait for the effects of committed identity changes. */
   async flushIdentityEffects(sessionId?: string): Promise<void> { await this.identityEffects.flush(sessionId); }
+
+  /** Shared commit path for mutation writes and the raw preset-file watcher. */
+  reloadPresets() {
+    return this.getConfigApplyPlan().reloadPresets(() => {
+      const before = new Map(this.config.channelPresets);
+      const result = reloadChannelPresets(this.config, this.config.CHANNEL_PRESETS_FILE, this.logger);
+      if (result.ok) this.identityEffects.presetsCommitted(new Set(
+        [...new Set([...before.keys(), ...this.config.channelPresets.keys()])]
+          .filter(id => JSON.stringify(before.get(id)) !== JSON.stringify(this.config.channelPresets.get(id)))
+      ));
+      return result;
+    });
+  }
 
   async loadPlugins(): Promise<void> { await Promise.all([this.identityEffects.ready, this.cardVisualsReady, this.scheduleUi.ready, this.configUi.ready, this.presetsUi.ready, this.sessionBrowserReady]); }
 

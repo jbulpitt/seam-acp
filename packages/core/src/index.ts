@@ -1475,7 +1475,9 @@ async function main(): Promise<void> {
     stopPresetsWatch = watchChannelPresets(
       config.CHANNEL_PRESETS_FILE,
       config,
-      logger
+      logger,
+      150,
+      () => orchestrator.reloadPresets()
     );
   }
 

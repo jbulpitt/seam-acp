@@ -17,6 +17,7 @@ import path from "node:path";
 import { bindSessionLocation } from "./location-bind.js";
 import { buildSavePlan, snapshotFromDescribe, fastModeWillResetSession, willVerifyFastMode, type ThreadConfigDraft } from "../platforms/discord/config-editor.js";
 import { FAST_MODE_CONFIG_ID, settleFastMode, fastModeRetirementFailure } from "./fast-mode.js";
+import type { ReloadResult } from "./config-reload.js";
 
 export interface TargetIdentityChanges {
   agent?: string;
@@ -140,6 +141,7 @@ export class ConfigApplyPlan {
     const consequence = RuntimeTransition.consequence({
       previousAgentId: before.agent.value,
       nextAgentId,
+      locationChanged: (input.threadPreset?.location ?? before.location.value) !== before.location.value,
       modelChanged: nextModel !== before.model.value,
       modelApplicationMode: this.modelCatalog.model({ agentId: nextAgentId, location: before.location.value }, nextModel)?.applicationMode,
       fastModeChanged: input.threadPreset?.fastMode !== undefined && input.threadPreset.fastMode !== before.fastMode?.value,
@@ -168,6 +170,25 @@ export class ConfigApplyPlan {
   readThreadPresetEntry(...args: Parameters<ConfigMutationService["readThreadPresetEntry"]>) { return this.configMutation.readThreadPresetEntry(...args); }
   readPresetsSnapshot() { return this.configMutation.readPresetsSnapshot(); }
   restoreThreadPresetEntry(...args: Parameters<ConfigMutationService["restoreThreadPresetEntry"]>) { return this.configMutation.restoreThreadPresetEntry(...args); }
+
+  /** Snapshot effective bindings before the atomic map swap, then transition on reuse. */
+  reloadPresets(reload: () => ReloadResult): ReloadResult {
+    const before = this.settings!.store.listSessionsUncapped().map(record => ({
+      record, config: this.router.describeConfig(record),
+    }));
+    const result = reload();
+    if (!result.ok) return result;
+    for (const previous of before) {
+      const record = this.store.get(previous.record.id) ?? previous.record;
+      const next = this.router.describeConfig(record);
+      if (previous.config.agent.value === next.agent.value && previous.config.location.value === next.location.value) continue;
+      this.runtime.queueSavedSelection(record, previous.config);
+      this.logger.info({ sessionId: record.id, previousAgent: previous.config.agent.value,
+        agent: next.agent.value, previousLocation: previous.config.location.value, location: next.location.value },
+      "committed preset binding transition queued for next turn");
+    }
+    return result;
+  }
 
   /** The repo picker inventory belongs to the session's execution host. */
   async listRepos(record: SessionRecord): Promise<string[]> {

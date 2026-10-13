@@ -953,11 +953,16 @@ export class SessionRouter {
   async transitionWhenIdle(sessionId: string, apply: () => Promise<void>, opts?: { replacePending?: boolean }): Promise<void> {
     const applying = this.pendingRuntimeTransitions.get(sessionId)?.applying;
     if (applying) await applying;
+    this.queueRuntimeTransition(sessionId, apply, opts);
+    if (!this.runtimes.get(sessionId)?.busy) await this.applyPendingRuntimeTransition(sessionId);
+  }
+
+  /** Register a committed selection without touching its current execution. */
+  queueRuntimeTransition(sessionId: string, apply: () => Promise<void>, opts?: { replacePending?: boolean }): void {
     // Coalesce saves; a seeded attachment supersedes an earlier reset.
     if (opts?.replacePending || !this.pendingRuntimeTransitions.has(sessionId)) {
       this.pendingRuntimeTransitions.set(sessionId, { apply });
     }
-    if (!this.runtimes.get(sessionId)?.busy) await this.applyPendingRuntimeTransition(sessionId);
   }
 
   private async applyPendingRuntimeTransition(sessionId: string): Promise<void> {

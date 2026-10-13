@@ -105,7 +105,8 @@ export function watchChannelPresets(
   file: string,
   target: PresetMaps,
   logger: Logger,
-  debounceMs = 150
+  debounceMs = 150,
+  reload: () => ReloadResult = () => reloadChannelPresets(target, path.resolve(file), logger)
 ): () => void {
   const abs = path.resolve(file);
   const dir = path.dirname(abs);
@@ -118,7 +119,7 @@ export function watchChannelPresets(
       if (filename && path.basename(filename.toString()) !== base) return;
       if (timer) clearTimeout(timer);
       timer = setTimeout(() => {
-        reloadChannelPresets(target, abs, logger);
+        reload();
       }, debounceMs);
     });
   } catch (err) {

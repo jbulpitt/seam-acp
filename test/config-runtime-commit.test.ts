@@ -6,6 +6,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import type { AgentProfile } from "@seam/adapters";
 import { loadConfig } from "../packages/core/src/config.js";
 import { watchChannelPresets } from "../packages/core/src/core/config-reload.js";
+import { type ConfigSetRequest } from "../packages/core/src/core/config-apply-plan.js";
 import { SessionStore } from "../packages/core/src/core/session-store.js";
 import { SessionRouter } from "../packages/core/src/core/session-router.js";
 import { Orchestrator } from "../packages/core/src/platforms/discord/orchestrator.js";
@@ -16,7 +17,9 @@ import { localBridgeWiring } from "./local-bridge-fixture.js";
 // Only the provider is fake; commits, reloads, queues and acquisition are real.
 vi.mock("../packages/core/src/agents/agent-runtime.js", async importOriginal => {
   const actual = await importOriginal<typeof import("../packages/core/src/agents/agent-runtime.js")>();
-  return { ...actual, AgentRuntime: class {
+  return { ...actual, AgentRuntime: class TestRuntime {
+    static nextSlot = 0;
+    readonly slot = TestRuntime.nextSlot++;
     busy = false;
     disposed = false;
     lastActivityAtMs = Date.now();
@@ -32,6 +35,7 @@ vi.mock("../packages/core/src/agents/agent-runtime.js", async importOriginal => 
       return { sessionId: this.sessionId };
     }
     getSessionInfo() { return { sessionId: this.sessionId, currentModelId: this.modelOverride, availableModels: [] }; }
+    getSlot() { return this.slot; }
     hasDelegatedTurnInFlight() { return false; }
     supportsSessionLoad() { return true; }
     getConfigSelectValues() { return []; }
@@ -53,16 +57,16 @@ const logger = pino({ level: "silent" });
 const actor = { id: "123", name: "Operator" };
 const channel = { platform: "discord", id: "111111111111111111", parentId: "222222222222222222" };
 const profiles = ["claude", "codex"].map(id => ({ id, displayName: id, defaultModel: "old",
-  staticModels: [{ modelId: "old", name: "Old" }], effort: { mechanism: "meta", levels: ["low", "high"] },
+  staticModels: [{ modelId: "old", name: "Old" }, { modelId: "new", name: "New" }], effort: { mechanism: "meta", levels: ["low", "high"] },
 })) as unknown as AgentProfile[];
 const cleanups: Array<() => void | Promise<void>> = [];
 afterEach(async () => { for (const stop of cleanups.splice(0).reverse()) await stop(); vi.restoreAllMocks(); });
 
-async function fixture() {
+async function fixture(threadPreset?: unknown) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "config-runtime-commit-"));
   cleanups.push(() => fs.rmSync(dir, { recursive: true, force: true }));
   const file = path.join(dir, "presets.json");
-  fs.writeFileSync(file, JSON.stringify({ channels: {}, threads: {} }));
+  fs.writeFileSync(file, JSON.stringify({ channels: {}, threads: threadPreset ? { [channel.id]: threadPreset } : {} }));
   const config = loadConfig({ env: { DISCORD_BOT_TOKEN: "fixture", DISCORD_ALLOWED_USER_IDS: actor.id,
     DEFAULT_AGENT: "claude", DEFAULT_MODEL: "old", REPOS_ROOT: dir, DATA_DIR: dir, AGY_ENABLED: "false",
     CHANNEL_PRESETS_FILE: file, SEAM_CONFIG_MUTATION_TIER_C_ENABLED: "true" }, warn: () => {} });
@@ -98,8 +102,64 @@ async function fixture() {
 }
 
 const location = (runtime: any) => runtime.options.modelFallbacks("old", null).location;
+const namedRequest = (values: Partial<ConfigSetRequest["values"]>): ConfigSetRequest => ({
+  json: null, rebuild: false, supplied: Object.keys(values) as ConfigSetRequest["supplied"],
+  values: { agent: null, model: null, effort: null, repo: null, role: null, permissions: null, card: null, gif: null, ...values },
+});
+const pinned = { agent: { value: "claude" }, model: { value: "old" }, effort: { value: "low" }, location: "remote" };
+
+async function applyNamed(h: Awaited<ReturnType<typeof fixture>>, request: ConfigSetRequest) {
+  const prepared = await h.plan.prepareConfigSet(h.record(), channel, request);
+  if (!prepared.ok) throw new Error(prepared.message);
+  return h.plan.applyPreparedConfigSet(h.record(), channel, request, prepared.prepared, actor, { retireRuntime: true, applyName: false });
+}
 
 describe("committed agent and location selection follows a warm runtime", () => {
+  it.each(["agent", "model", "effort", "repo", "all"] as const)("identical named config-set (%s) keeps the runtime, slot and ACP", async field => {
+    const h = await fixture(pinned);
+    const values = { agent: "claude@remote", model: "old", effort: "low", repo: h.dir };
+    const request = namedRequest(field === "all" ? values : { [field]: values[field] });
+    const before = h.router.describeConfig(h.record());
+    const slot = h.warm.getSlot();
+    const applied = await applyNamed(h, request);
+    expect(applied.ok).toBe(true);
+    expect((h.warm as any).disposed).toBe(false);
+    expect(await h.next()).toBe(h.warm);
+    expect((await h.next()).getSlot()).toBe(slot);
+    expect(h.record().acpSessionId).toBe("retained-acp");
+    expect(applied.ok && applied.restartRequested).toBe(false);
+    if (applied.ok) for (const key of ["agent", "model", "effort", "cwd", "location"] as const) {
+      expect(applied.effective[key].value).toBe(before[key].value);
+    }
+  });
+
+  it.each(["agent", "model", "effort", "repo", "location"] as const)("a real named config-set %s change still replaces the runtime", async field => {
+    const h = await fixture(pinned);
+    const repo = path.join(h.dir, "other"); fs.mkdirSync(repo);
+    const values = { agent: "codex@remote", model: "new", effort: "high", repo, location: "claude@elsewhere" };
+    const request = namedRequest(field === "location" ? { agent: values.location } : { [field]: values[field] });
+    const applied = await applyNamed(h, request);
+    expect(applied.ok).toBe(true);
+    expect(applied.ok && applied.restartRequested).toBe(true);
+    const next = await h.next();
+    expect(next).not.toBe(h.warm); expect(next.getSlot()).not.toBe(h.warm.getSlot());
+    expect((h.warm as any).disposed).toBe(true);
+    expect(h.record().acpSessionId).toBe(field === "agent" ? "fresh-codex" : field === "location" ? "fresh-claude" : "retained-acp");
+  });
+
+  it("compares the live effective selection rather than a stale config-set preparation", async () => {
+    const h = await fixture(pinned);
+    const request = namedRequest({ model: "old" });
+    const prepared = await h.plan.prepareConfigSet(h.record(), channel, request);
+    if (!prepared.ok) throw new Error(prepared.message);
+    expect((await applyNamed(h, namedRequest({ model: "new" }))).ok).toBe(true);
+    const changed = await h.next();
+    const applied = await h.plan.applyPreparedConfigSet(h.record(), channel, request, prepared.prepared, actor, { retireRuntime: true, applyName: false });
+    expect(applied.ok && applied.restartRequested).toBe(true);
+    expect((changed as any).disposed).toBe(true); expect(await h.next()).not.toBe(changed);
+    expect(h.record().acpSessionId).toBe("retained-acp");
+  });
+
   it("reports a location-only proposal as a reset without changing anything before Apply", async () => {
     const h = await fixture();
     const built = h.plan.prepare(h.record(), { threadPreset: { location: "remote" } }, actor);

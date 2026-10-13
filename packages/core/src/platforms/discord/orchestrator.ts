@@ -2933,7 +2933,12 @@ export class Orchestrator {
       }
     };
     return (queueFence ? run(queueFence) : this.queueOnChannel(row.channelRef, run, undefined, undefined, row.messageId)).catch((err) => {
-      if (!(err instanceof ChannelQueueFencedError)) {
+      if (err instanceof DispatchSuspendedError && err.suspension === "shutdown") {
+        this.logger.info(
+          { err, channelRef: row.channelRef, messageId: row.messageId, suspension: err.suspension, reason: err.reason },
+          "recovered inbound turn suspended"
+        );
+      } else if (!(err instanceof ChannelQueueFencedError)) {
         this.logger.error(
           { err, channelRef: row.channelRef, messageId: row.messageId },
           "recovered inbound turn failed"

@@ -127,6 +127,62 @@ function channelsUsed(adapter: ReturnType<typeof setup>["adapter"]) {
 }
 
 describe("a second chat platform runs a normal turn", () => {
+  it.each([
+    { platform: "google-chat", id: "AAA" },
+    { platform: "google-chat", id: "AAA.TTT", parentId: "AAA" },
+    { platform: "discord", id: "1300000000000000002" },
+  ])("does not replay $platform/$id while the normal final writer owns its receipt", async channel => {
+    const h = setup(channel.platform), messageId = "inflight-final", id = "inbound-" + messageId;
+    let enter!: () => void, release!: () => void;
+    const entered = new Promise<void>(resolve => { enter = resolve; });
+    const held = new Promise<void>(resolve => { release = resolve; });
+    const prompt = h.runtime.prompt.getMockImplementation()!;
+    h.runtime.prompt.mockImplementation(async (...args) => {
+      const attempt = h.store.turnAttempts.get(id)!;
+      expect(h.store.turnAttempts.recordRemoteRecovery(attempt, { version: 1, location: "local", slot: 1,
+        submissionId: "first-prompt", acpSessionId: "acp-1", delegatedUtc: new Date().toISOString() })).toBe(true);
+      return prompt(...args);
+    });
+    let finalCreates = 0;
+    h.adapter.sendMessage.mockImplementation(async (target, text) => {
+      if (text === "SECOND_PLATFORM_REPLY" && ++finalCreates === 1) { enter(); await held; }
+      return { channel: target, id: "final" };
+    });
+    const run = h.run({ messageId, channel, authorId: "42", authorIsBot: false, text: "Finish", raw: {} });
+    await entered;
+    try {
+      expect(h.store.turnAttempts.get(id)).toMatchObject({ state: "completed", deliveryDone: false,
+        deliveryPayload: { stream: { delivered: 0 } } });
+      await (h.orch as any).retryAdoptedDeliveries();
+      expect(h.adapter.findMessageByNonce).not.toHaveBeenCalled();
+      expect(finalCreates).toBe(1);
+      expect(h.store.turnAttempts.get(id)?.deliveryDone).toBe(false);
+      expect((h.orch as any).adoptedDeliveryRetryAfter.has(id)).toBe(false);
+    } finally { release(); await run; }
+    expect(h.store.turnAttempts.get(id)).toMatchObject({ deliveryDone: true,
+      deliveryPayload: { stream: { delivered: 1 } } });
+    await (h.orch as any).retryAdoptedDeliveries();
+    expect(finalCreates).toBe(1);
+  });
+
+  it("recovery waits for the exact live dispatch writer, then resumes immediately when ownership is released", async () => {
+    const h = setup("google-chat"), spec = { id: "live-dispatch-final", target: "AAA", prompt: "Finish", session: "live" as const };
+    h.store.upsert(sessionRow("google-chat", spec.target, ""));
+    const attempt = h.store.turnAttempts.claim(spec, "fixture", "fixture-boot", "dispatch");
+    h.store.turnAttempts.recordRemoteRecovery(attempt, { version: 1, location: "local", slot: 1,
+      submissionId: "dispatch-prompt", acpSessionId: "acp-1", delegatedUtc: new Date().toISOString() });
+    h.store.turnAttempts.complete(attempt, { id: spec.id, target: spec.target, status: "completed", output: "DISPATCH_FINAL", finishedUtc: new Date().toISOString() });
+    h.store.turnAttempts.prepareDelivery(spec.id, spec.target, { kind: "message", text: "DISPATCH_FINAL" });
+    (h.orch as any).activeLiveDispatch.set(spec.target, spec.id);
+    await (h.orch as any).retryAdoptedDeliveries();
+    expect(h.adapter.findMessageByNonce).not.toHaveBeenCalled();
+    expect(h.store.turnAttempts.get(spec.id)?.deliveryDone).toBe(false);
+    (h.orch as any).activeLiveDispatch.delete(spec.target);
+    await (h.orch as any).retryAdoptedDeliveries();
+    expect(h.adapter.sendMessage).toHaveBeenCalledWith({ platform: "google-chat", id: "AAA" }, "DISPATCH_FINAL", expect.objectContaining({ enforceNonce: true }));
+    expect(h.store.turnAttempts.get(spec.id)?.deliveryDone).toBe(true);
+  });
+
   it("retains an uncertain Chat receipt without replay or API calls until history lookup is configured", async () => {
     const { GoogleChatAdapter } = await import("../packages/core/src/platforms/google-chat/adapter.js");
     const { multiplexChatAdapters } = await import("../packages/core/src/platforms/google-chat/multiplex.js");

@@ -2040,8 +2040,8 @@ export class Orchestrator {
   }
 
   /** Session for a bare channel ref on any platform. */
-  private recordForChannel(channelRef: string): SessionRecord | null {
-    return this.store.getByChannelRef(channelRef);
+  private recordForChannel(channelRef: string, platform?: string): SessionRecord | null {
+    return platform ? this.store.getByChannel(platform, channelRef) : this.store.getByChannelRef(channelRef);
   }
 
   /** A moved Chat home still owns the original runtime's turn FIFO and fences. */
@@ -2053,6 +2053,11 @@ export class Orchestrator {
   /** Platform that owns a bare channel ref; Discord when no session exists yet. */
   private platformForChannel(channelRef: string): string {
     return this.recordForChannel(channelRef)?.platform ?? PLATFORM;
+  }
+
+  private platformForAttempt(attempt: TurnAttempt): string {
+    return (attempt.source === "schedule" ? this.store.scheduledOccurrences.get(attempt.id)?.row.platform : undefined)
+      ?? this.platformForChannel(attempt.spec.target);
   }
 
   /** Read-only truth used by MCP status, cancel copy, and admin recovery. */
@@ -2824,7 +2829,7 @@ export class Orchestrator {
   }
 
   private attemptTurnStatus(attempt: TurnAttempt): TurnStatus {
-    const record = this.recordForChannel(attempt.spec.target);
+    const record = this.recordForChannel(attempt.spec.target, this.platformForAttempt(attempt));
     const described = record ? this.router.describeConfig(record) : undefined;
     const identity = parseExecutionIdentity(attempt.identity);
     const agentId = identity?.agent ?? described?.agent.value ?? record?.agentId ?? "";
@@ -2857,7 +2862,7 @@ export class Orchestrator {
   private attemptStatusPanel(attempt: TurnAttempt): DispatchStatusPanel<MessageRef> | undefined {
     if (!attempt.statusCard) return undefined;
     // The attempt's root owns the platform, not its native card destination.
-    const ref: MessageRef = { channel: { platform: this.platformForChannel(attempt.spec.target),
+    const ref: MessageRef = { channel: { platform: this.platformForAttempt(attempt),
       id: attempt.statusCard.channelId }, id: attempt.statusCard.messageId };
     const status = this.attemptTurnStatus(attempt);
     status.setState("Working");
@@ -15352,7 +15357,7 @@ export class Orchestrator {
     let recoveryRecord: SessionRecord | undefined;
     try {
       if (attempt.spec.session === "live") {
-        recoveryRecord = this.recordForChannel(attempt.spec.target) ?? undefined;
+        recoveryRecord = this.recordForChannel(attempt.spec.target, this.platformForAttempt(attempt)) ?? undefined;
         if (!recoveryRecord) throw new Error("the recovered thread session no longer exists");
         const cached = this.router.getRuntime(recoveryRecord.id);
         if (cached?.getSlot() === binding.slot && cached.getSessionInfo()?.sessionId === binding.acpSessionId) {
@@ -15376,10 +15381,11 @@ export class Orchestrator {
       } else {
         const identity = parseExecutionIdentity(attempt.identity)!;
         const profile = this.router.getProfile(identity.agent, binding.location)!;
-        const source = this.recordForChannel(attempt.spec.target);
+        const platform = this.platformForAttempt(attempt);
+        const source = this.recordForChannel(attempt.spec.target, platform);
         const record: SessionRecord = {
-          id: source?.id ?? makeSessionId(this.platformForChannel(attempt.spec.target), attempt.spec.target),
-          platform: source?.platform ?? this.platformForChannel(attempt.spec.target),
+          id: source?.id ?? makeSessionId(platform, attempt.spec.target),
+          platform,
           channelRef: attempt.spec.target, parentRef: source?.parentRef ?? null,
           agentId: identity.agent, acpSessionId: binding.acpSessionId, repoPath: identity.cwd,
           configJson: identity.config, createdUtc: attempt.spec.createdUtc ?? binding.delegatedUtc,
@@ -15399,7 +15405,7 @@ export class Orchestrator {
       return true;
     }
 
-    const target: ChannelRef = { platform: this.platformForChannel(attempt.spec.target), id: attempt.spec.target };
+    const target: ChannelRef = { platform: this.platformForAttempt(attempt), id: attempt.spec.target };
     const recordedStream = attempt.deliveryPayload?.kind === "messages" && attempt.deliveryPayload.stream
       ? attempt.deliveryPayload : undefined;
     const adoptedChunks: string[] = [...(recordedStream?.texts ?? [])];
@@ -15838,7 +15844,7 @@ export class Orchestrator {
     // Live adoption supplies the nonce-backed chunks, not a replay of the full answer.
     if (prior.source !== "schedule"
       || (occurrence?.row.sessionMode === "live" && delivery !== undefined)) {
-      const target: ChannelRef = { platform: this.platformForChannel(prior.spec.target), id: prior.spec.target };
+      const target: ChannelRef = { platform: this.platformForAttempt(prior), id: prior.spec.target };
       const output = outcome.output ?? "";
       const body = outcome.status === "failed"
         ? `❌ ${outcome.error ?? "remote recovery failed"}${output.trim() ? `\n\n${output}` : ""}`
@@ -19999,7 +20005,7 @@ export class Orchestrator {
     body = [...this.parkedAttemptContext(attempt, channelRef), body].join("\n");
     const current = (await this.collectInterruptedRows(attempt.spec.target)).find(item => item.id === attempt.id);
     const actions = current ? interruptedRowActions(current) : [];
-    const platform = this.platformForChannel(channelRef);
+    const platform = channelRef === attempt.spec.target ? this.platformForAttempt(attempt) : this.platformForChannel(channelRef);
     const notices = this.store.listOpenChoiceCards(platform, channelRef).filter(card =>
       card.options.some(option => parkedTurnAction(option.payload)?.attemptId === attempt.id));
     if (actions.length === 1 && actions[0] === "cancel" && !isAwaitingReauth(attempt.stalledReason)) {
@@ -20083,9 +20089,9 @@ export class Orchestrator {
   /** Choice card for a parked re-auth. Not an elicitation row. */
   private async postReauthCard(channelRef: string, attemptId: string, park: ReauthPark, cause?: string): Promise<(MessageLink & { messageId: string }) | undefined> {
     try {
-      const platform = this.platformForChannel(channelRef);
-      const record = await this.bindThreadRecord({ platform, id: channelRef });
       const attempt = this.store.turnAttempts.get(attemptId);
+      const platform = attempt && channelRef === attempt.spec.target ? this.platformForAttempt(attempt) : this.platformForChannel(channelRef);
+      const record = await this.bindThreadRecord({ platform, id: channelRef });
       const resolved = this.router.describeConfig(record);
       const location = attempt?.spec.location ?? resolved.location.value;
       const context = {

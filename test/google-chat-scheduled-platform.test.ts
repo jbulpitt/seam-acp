@@ -10,6 +10,7 @@ import { GoogleChatAdapter } from "../packages/core/src/platforms/google-chat/ad
 import { multiplexChatAdapters } from "../packages/core/src/platforms/google-chat/multiplex.js";
 import { discordRenderer } from "../packages/core/src/platforms/discord/renderer.js";
 import type { ScheduledPrompt } from "../packages/core/src/core/scheduled-prompts/types.js";
+import { scheduledOccurrenceKey } from "../packages/core/src/core/scheduled-prompts/occurrence-store.js";
 import { fixtureModelCatalog } from "./model-catalog-fixture.js";
 
 const cleanups: Array<() => void> = [];
@@ -116,5 +117,36 @@ describe("Google Chat scheduled fire uses its durable platform", () => {
     await (h.orch as any).runScheduledPromptInner(row);
     expect(h.discord.getThreadLiveState).toHaveBeenCalledWith({ platform: "discord", id: "123", parentId: "12" });
     expect(h.discord.sendPanel).toHaveBeenCalledTimes(2); expect(h.chat.sendPanel).not.toHaveBeenCalled();
+  });
+  it("uses the saved schedule platform for adopted live output even when an old fire left a shadow Discord root", async () => {
+    const h = fixture("live");
+    h.store.upsert({ ...h.store.get(h.record.id)!, id: `discord:${h.row.channelRef}`, platform: "discord", acpSessionId: "" });
+    const key = scheduledOccurrenceKey(h.row.id);
+    h.store.scheduledOccurrences.prepare(key, h.row, row => h.orch.scheduleExecution(row));
+    h.store.turnAttempts.registerOwner("proof-boot");
+    const attempt = h.store.turnAttempts.claim({ id: key.id, target: h.row.channelRef, prompt: h.row.promptText,
+      session: "live", createdUtc: new Date().toISOString() }, "test", "proof-boot", "schedule");
+    h.store.turnAttempts.complete(attempt, { id: attempt.id, target: h.row.channelRef, status: "completed",
+      output: "RECOVERED_SCHEDULE_OK", finishedUtc: new Date().toISOString() });
+    await (h.orch as any).finishRemoteRecoveryCompletion(attempt, h.store.turnAttempts.get(attempt.id), { kind: "message", text: "RECOVERED_SCHEDULE_OK" });
+    expect(h.chat.sendMessage).toHaveBeenCalledWith(chatChannel, "RECOVERED_SCHEDULE_OK", expect.anything());
+    expect(h.discord.sendMessage).not.toHaveBeenCalled();
+    expect(h.store.scheduledOccurrences.get(key.id)?.settled).toBe(true);
+  });
+  it.each(["AAQA-test", "AAQA-test.native"])("updates a recovered scheduled status card at %s on Chat despite the shadow row", async destination => {
+    const h = fixture("live");
+    h.store.upsert({ ...h.store.get(h.record.id)!, id: `discord:${h.row.channelRef}`, platform: "discord", acpSessionId: "" });
+    const edit = vi.fn(async () => {}), wrongEdit = vi.fn(async () => {});
+    Object.assign(h.chat, { editPanel: edit }); Object.assign(h.discord, { editPanel: wrongEdit });
+    const key = scheduledOccurrenceKey(h.row.id);
+    h.store.scheduledOccurrences.prepare(key, h.row, row => h.orch.scheduleExecution(row));
+    h.store.turnAttempts.registerOwner("proof-boot");
+    const attempt = h.store.turnAttempts.claim({ id: key.id, target: h.row.channelRef, prompt: h.row.promptText,
+      session: "live", createdUtc: new Date().toISOString() }, "test", "proof-boot", "schedule");
+    h.store.turnAttempts.bindStatusCard(attempt, { channelId: destination, messageId: "original-card" });
+    const panel = (h.orch as any).attemptStatusPanel(h.store.turnAttempts.get(attempt.id));
+    await panel.finalize("Done");
+    expect(edit).toHaveBeenCalledWith({ channel: { platform: "google-chat", id: destination }, id: "original-card" }, expect.anything());
+    expect(wrongEdit).not.toHaveBeenCalled();
   });
 });

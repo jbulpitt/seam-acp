@@ -135,7 +135,7 @@ describe("a live message supersedes only its own permission", () => {
     }
   }, 25_000);
 
-  it("still supersedes a live permission while leaving the scheduled permission open", async () => {
+  it.each([false, true])("supersedes only the live permission when its stored ACP is cleared: %s", async cleared => {
     const f = await pendingSchedule();
     let live: AgentRuntime | undefined;
     try {
@@ -153,6 +153,11 @@ describe("a live message supersedes only its own permission", () => {
       await vi.waitFor(() => expect(f.h.store.actionCards.permissions().filter(row => row.status === "open")).toHaveLength(2),
         { timeout: 10_000 });
       const liveCard = f.h.store.actionCards.permissions().find(row => row.attemptId === attempt.id)!;
+      if (cleared) {
+        const record = f.h.store.get(f.h.record.id)!;
+        f.h.store.upsert({ ...record, acpSessionId: "" },
+          { source: "permission scope fixture", cause: "clear the row while its recorded live owner survives" });
+      }
       vi.spyOn(f.orch as any, "handleIncomingMessageInner").mockResolvedValue(undefined);
       await (f.orch as any).handleIncomingMessage({ channel: f.card.channel, authorId: "fixture-user", authorIsBot: false,
         text: "Replace my live request", raw: {}, messageId: "replace-live-permission" });

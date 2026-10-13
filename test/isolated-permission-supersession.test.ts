@@ -135,6 +135,40 @@ describe("a live message supersedes only its own permission", () => {
     }
   }, 25_000);
 
+  it("still supersedes a live permission while leaving the scheduled permission open", async () => {
+    const f = await pendingSchedule();
+    let live: AgentRuntime | undefined;
+    try {
+      live = await f.router.getOrStartRuntime(f.h.store.get(f.h.record.id)!);
+      const now = new Date().toISOString();
+      f.h.store.turnAttempts.registerOwner("live-controller");
+      const attempt = f.h.store.turnAttempts.claim({ id: "live-permission", target: f.h.record.channelRef,
+        prompt: "live tool", session: "live", kind: "handoff", createdUtc: now }, "live-identity", "live-controller", "inbound");
+      f.h.store.turnAttempts.bind(attempt, live.getSessionInfo()!.sessionId);
+      f.h.store.turnAttempts.startPrompt(attempt);
+      const prompt = live.prompt("live tool", undefined, {
+        onRemoteRecovery: binding => f.h.store.turnAttempts.recordRemoteRecovery(attempt, { ...binding, location: "fixture" }),
+        onRemoteRecoveryReleased: () => {},
+      });
+      await vi.waitFor(() => expect(f.h.store.actionCards.permissions().filter(row => row.status === "open")).toHaveLength(2),
+        { timeout: 10_000 });
+      const liveCard = f.h.store.actionCards.permissions().find(row => row.attemptId === attempt.id)!;
+      vi.spyOn(f.orch as any, "handleIncomingMessageInner").mockResolvedValue(undefined);
+      await (f.orch as any).handleIncomingMessage({ channel: f.card.channel, authorId: "fixture-user", authorIsBot: false,
+        text: "Replace my live request", raw: {}, messageId: "replace-live-permission" });
+      expect(f.h.store.actionCards.getPermission(liveCard.id)?.status).toBe("cancelled");
+      expect(f.h.store.actionCards.getPermission(f.card.id)?.status).toBe("open");
+      await prompt;
+      await (f.orch as any).actionCards.handlePermission(f.click());
+      await vi.waitFor(() => expect(f.h.store.scheduledOccurrences.get(f.attempt.id)?.settled).toBe(true), { timeout: 10_000 });
+      const requests = await f.h.requests();
+      expect(requests.filter(row => row.id === "isolated-permission" && row.result)).toEqual([
+        expect.objectContaining({ result: { outcome: { outcome: "cancelled" } } }),
+        expect.objectContaining({ result: { outcome: { outcome: "selected", optionId: "allow" } } }),
+      ]);
+    } finally { await live?.detach(); await f.close(); }
+  }, 25_000);
+
   it("answers cancellation to the isolated runtime that was actually targeted", async () => {
     const f = await pendingSchedule();
     try {

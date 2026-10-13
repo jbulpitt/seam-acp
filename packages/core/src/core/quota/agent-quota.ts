@@ -36,7 +36,7 @@ export interface AgentQuota {
   weekly: QuotaWindow;
   /** Independent provider pools; top-level windows remain the worst reported. */
   pools?: QuotaPool[];
-  credits?: { balance: string; unlimited: boolean } | null;
+  credits?: { balance: string; unlimited: boolean; onDemand?: { used: string; cap: string } } | null;
   /** Unix seconds of the observation; null when its timestamp is unknown. */
   fetchedAt: number | null;
   source?: CodexUsageData["source"];
@@ -224,7 +224,11 @@ export function mapGrokQuota(
   fetchedAt = Math.floor(Date.now() / 1000)
 ): AgentQuota {
   const noSubscription = data.subscriptionTier === "Free" && data.creditUsagePercent === null;
-  const ok = data.creditUsagePercent !== null || noSubscription;
+  const paidTier = Boolean(data.subscriptionTier && data.subscriptionTier !== "Free");
+  // ProtoJSON can omit the zero scalar; a paid period still supplies its reset.
+  const usedPercent = data.creditUsagePercent ?? (paidTier && data.periodType && unixSeconds(data.periodEnd) !== null ? 0 : null);
+  const ok = usedPercent !== null || noSubscription;
+  const hasAmounts = data.prepaidBalance != null || data.onDemandCap != null || data.onDemandUsed != null;
   return {
     ...identity,
     ok,
@@ -234,13 +238,20 @@ export function mapGrokQuota(
     ...normalizeQuotaWindows(
       {
         weekly:
-          data.creditUsagePercent !== null
-            ? quotaWindow("weekly", data.creditUsagePercent, data.periodEnd)
+          usedPercent !== null
+            ? quotaWindow("weekly", usedPercent, data.periodEnd)
             : null,
       },
       fetchedAt
     ),
-    credits: null,
+    credits: paidTier && hasAmounts ? {
+      balance: data.prepaidBalance != null ? String(data.prepaidBalance) : "unknown",
+      unlimited: false,
+      ...(data.onDemandCap != null || data.onDemandUsed != null ? { onDemand: {
+        used: data.onDemandUsed != null ? String(data.onDemandUsed) : "unknown",
+        cap: data.onDemandCap != null ? String(data.onDemandCap) : "unknown",
+      } } : {}),
+    } : null,
     fetchedAt,
   };
 }

@@ -57,6 +57,7 @@ export function renderAgentQuotaRow(quota: AgentQuota): string {
         ? "credits unlimited"
         : `credits ${quota.credits.balance}`
       : "",
+    quota.credits?.onDemand ? `on-demand ${quota.credits.onDemand.used} / ${quota.credits.onDemand.cap}` : "",
   ].filter(Boolean);
   const warning = quota.ok ? "" : ` ⚠️ ${quota.error ?? "quota unavailable"}`;
   // Per-agent freshness: quota reads are polled on an activity-scaled cadence

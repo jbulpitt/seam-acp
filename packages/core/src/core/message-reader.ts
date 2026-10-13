@@ -17,6 +17,8 @@ export interface MessagePageItem extends MessageLink {
   authorId: string;
   authorName: string;
   authorType: MessageAuthorType;
+  /** Output posted on Seam's behalf through a human-authenticated platform API. */
+  isOwnOutput?: boolean;
   content: string;
   attachmentNames: string[];
   hasEmbeds: boolean;

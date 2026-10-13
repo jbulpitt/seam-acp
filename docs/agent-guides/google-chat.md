@@ -103,8 +103,8 @@ that snapshot and Google's create requestId.
 
 The adapter uses this foundation for `/new` and automatic launches. Redelivered
 commands reuse the setup receipt rather than creating another Space. Launcher
-sessions and per-person settings never replace the org snapshot. Media, naming
-polish, archive and migration are separate slices.
+sessions and per-person settings never replace the org snapshot. Naming polish,
+archive and migration are separate slices.
 
 ### Session repo and effort
 
@@ -136,8 +136,41 @@ session. Durable receipts prevent redelivery from applying a command twice.
 The standalone Shared Drive uploader also defines
 `GOOGLE_CHAT_DRIVE_FOLDER_ID` and `GOOGLE_CHAT_DRIVE_SHARING_POLICY`
 (`members-only` or `domain-readable`). The latter additionally requires
-`GOOGLE_CHAT_DRIVE_DOMAIN`. These names configure the uploader; they do not
-enable file-output wiring in the current adapter.
+`GOOGLE_CHAT_DRIVE_DOMAIN`. The adapter uses these settings for Drive output.
+
+### Native images
+
+Set `GOOGLE_CHAT_MEDIA_TOKEN_FILE` to an OAuth `authorized_user` JSON file
+containing `type`, `client_id`, `client_secret` and `refresh_token`. Obtain offline
+user consent for only `https://www.googleapis.com/auth/chat.messages.create`;
+this is separate from the bot service-account key. Set `GOOGLE_CHAT_MEDIA_USER`
+to that user's canonical `users/<id>` resource. Using the canonical id lets Space
+creation recognize when the requester and upload user are the same person.
+
+With both settings, images upload as native Chat attachments in named Spaces
+where the upload user is a joined member. They follow the triggering prompt's
+thread or top-level target, sharing the app's per-space write queue and reply-cap
+continuation. New session Spaces add the upload user as a member; when they are
+the requester, their existing manager membership is reused. A creation receipt
+retains that setup effect across restart.
+
+DMs, Spaces without that member, non-images and deployments without native media
+configuration retain Drive-link delivery under the configured sharing policy.
+A configured native upload or create failure reports Google's real cause; it
+does not silently switch delivery methods. Google's
+[attachment upload guide](https://developers.google.com/workspace/chat/upload-media-attachments)
+describes the user-auth upload and message-create operations.
+
+Messages appear as the OAuth user, not the bot. Before create, Seam durably
+reserves a `client-seam-…` alias, then records Google's canonical message name.
+Only those exact recorded identities are dropped on both inbound event paths;
+the user's other messages remain prompts. History and reconstruction mark the
+recorded posts as Seam output without changing their real sender identity.
+The readonly app history scope still handles uncertain-delivery lookup.
+
+Images remain in Chat's native Space storage and use its membership access;
+there is no public image URL, proxy route, or new public origin configuration.
+The chosen upload user can access every new session Space they are added to.
 
 ## Google-side setup
 
@@ -178,8 +211,9 @@ asset paths and operator commands in `docs/local/`.
 
 The live adapter supports formatted text turns, cardsV2 status and interaction
 cards, threaded replies, inbound attachment downloads and `/new`, `/cancel`,
-`/agent`, `/model`, `/repo`, `/effort`. Configured Shared Drive output uploads files and posts a
-link; without that configuration, file output uses text or a binary placeholder.
+`/agent`, `/model`, `/repo`, `/effort`. Configured native images post as Chat
+attachments in named Spaces. Other files and image fallback use Shared Drive
+links; without Drive configuration, fallback uses text or a binary placeholder.
 
 Named-space history reads, reconstruction, search and restart-safe output
 delivery deduplication use the administrator-approved readonly scope. DM
@@ -200,5 +234,6 @@ retain their own session data. Replies return to the triggering prompt's native
 thread or to the session Space root for top-level prompts.
 Deployments choose their providers, hosts and retention practices. When Drive
 output is enabled, uploaded files remain in the configured Shared Drive under
-its selected sharing policy. This guide describes the integration, not a
+its selected sharing policy. Native images instead remain in Chat under the
+Space's membership and retention policies. This guide describes the integration, not a
 deployment's terms of service or privacy policy.

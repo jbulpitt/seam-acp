@@ -18,7 +18,7 @@ function setup(allowedSpaceIds?: ReadonlySet<string>) {
   const config: any = { DEFAULT_AGENT: "codex", REPOS_ROOT: "/built-in", GOOGLE_CHAT_DEFAULT_LOCATION: "fallback",
     GOOGLE_CHAT_DEFAULT_AGENT: "codex@remote", GOOGLE_CHAT_DEFAULT_MODEL: "org-model",
     GOOGLE_CHAT_DEFAULT_EFFORT: "medium", GOOGLE_CHAT_DEFAULT_CWD: "/org/repo" };
-  const requestIds = new Set<string>(); let membershipPresent = false;
+  const requestIds = new Set<string>(), members = new Set<string>();
   const request = vi.fn(async (_scope: string, r: any): Promise<any> => {
     if (r.method === "POST" && r.url.endsWith("/spaces")) {
       if (requestIds.has(r.params.requestId)) return { name: space.name };
@@ -26,8 +26,9 @@ function setup(allowedSpaceIds?: ReadonlySet<string>) {
     }
     if (r.method === "GET" && r.url.endsWith("/spaces/created")) return { ...space };
     if (r.method === "POST" && r.url.endsWith("/members")) {
-      if (membershipPresent) throw Object.assign(new Error("Member already exists"), { response: { status: 409 } });
-      membershipPresent = true; return { ...membership };
+      const user = r.data.member.name;
+      if (members.has(user)) throw Object.assign(new Error("Member already exists"), { response: { status: 409 } });
+      members.add(user); return { ...membership, name: `spaces/created/members/${user.slice("users/".length)}` };
     }
     if (r.method === "GET" && r.url.includes("/members/")) return { ...membership };
     return {};
@@ -58,6 +59,44 @@ function setup(allowedSpaceIds?: ReadonlySet<string>) {
 }
 
 describe("durable Google Chat session Space creation", () => {
+  it("adds the upload user to a clinician's Space and does not repeat that effect on command redelivery", async () => {
+    const h = setup(); h.config.GOOGLE_CHAT_MEDIA_USER = "users/poster";
+    await h.make().create(h.input);
+    await h.make().create(h.input);
+    const creates = h.request.mock.calls.filter(([, r]) => r.method === "POST" && r.url.endsWith("/members"));
+    expect(creates.map(([, r]) => r.data.member.name)).toEqual(["users/person", "users/poster"]);
+    expect(h.request.mock.calls.filter(([, r]) => r.method === "PATCH" && r.url.includes("/members/")))
+      .toEqual([["memberships", expect.objectContaining({ url: "https://chat.googleapis.com/v1/spaces/created/members/person", data: { role: "ROLE_MANAGER" } })]]);
+  });
+
+  it("adds the requester only once when they are the upload user, and promotes them to manager", async () => {
+    const h = setup(); h.config.GOOGLE_CHAT_MEDIA_USER = "users/person";
+    await h.make().create(h.input);
+    const creates = h.request.mock.calls.filter(([, r]) => r.method === "POST" && r.url.endsWith("/members"));
+    expect(creates).toHaveLength(1);
+    expect(h.request).toHaveBeenCalledWith("memberships", expect.objectContaining({ method: "PATCH", data: { role: "ROLE_MANAGER" } }));
+  });
+
+  it("retains the real media membership failure and resumes its checkpoint without another Space or requester membership", async () => {
+    const h = setup(); h.config.GOOGLE_CHAT_MEDIA_USER = "users/poster";
+    const message = "Permission denied to perform the requested action on the specified resource, or the resource doesn't exist.";
+    const cause = Object.assign(new Error(message), { name: "GaxiosError", response: { status: 403,
+      data: { error: { code: 403, status: "PERMISSION_DENIED", message,
+        errors: [{ domain: "global", reason: "forbidden", message }] } } } });
+    const original = h.request.getMockImplementation()!;
+    let failed = false;
+    h.request.mockImplementation(async (scope, r) => {
+      if (!failed && r.method === "POST" && r.data?.member?.name === "users/poster") { failed = true; throw cause; }
+      return original(scope, r);
+    });
+    await expect(h.make().create(h.input)).rejects.toBe(cause);
+    expect(h.store.getInbound(h.input.messageId)?.state).toBe("running");
+    await h.make().create(h.input);
+    expect(h.request.mock.calls.filter(([, r]) => r.method === "POST" && r.url.endsWith("/spaces"))).toHaveLength(1);
+    expect(h.request.mock.calls.filter(([, r]) => r.method === "POST" && r.data?.member?.name === "users/person")).toHaveLength(1);
+    expect(h.client.create).toHaveBeenCalledOnce();
+  });
+
   it("creates a private Space, adds/promotes the requester, locks app removal and registers its subscription", async () => {
     const h = setup();
     const result = await h.make().create(h.input);

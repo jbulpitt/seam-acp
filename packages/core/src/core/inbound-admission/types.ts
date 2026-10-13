@@ -16,6 +16,8 @@ export interface GoogleChatSpaceCreationReceipt {
   customer: string;
   displayName: string;
   requester: { id: string; name: string };
+  mediaUser?: string;
+  mediaMemberJoined?: boolean;
   snapshot: GoogleChatSpaceSelection;
   prepared?: boolean;
   space?: { name: string; spaceType?: string; displayName?: string;

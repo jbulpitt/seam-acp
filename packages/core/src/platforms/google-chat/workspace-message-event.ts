@@ -10,6 +10,7 @@ export interface WorkspacePubSubMessage {
 
 export interface WorkspaceChatMessageResource {
   name: string;
+  clientAssignedMessageId?: string;
   text?: string;
   annotations?: GoogleChatAnnotation[];
   slashCommand?: { commandId?: string | number };

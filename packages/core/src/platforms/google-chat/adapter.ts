@@ -18,6 +18,7 @@ import type { ComponentAcknowledgement } from "../interaction-response.js";
 import type { GoogleApi } from "./api.js";
 import { googleErrorStatus, isGoogleChatThreadReplyLimit } from "./api.js";
 import { googleChatClientMessageId } from "./message-id.js";
+import { imageMimeType, uploadChatImage } from "./media-upload.js";
 import { PubSubPullTransport } from "./transport.js";
 import { SpaceWriteQueue } from "./write-queue.js";
 import { formatGoogleChatText, GOOGLE_CHAT_TEXT_MARKUP_SYNTAX } from "./text-format.js";
@@ -38,6 +39,7 @@ export const GOOGLE_CHAT_PLATFORM = "google-chat";
 const root = "https://chat.googleapis.com/v1";
 const continuationNote = "Continued from the previous thread (reply limit reached)";
 type ChatMessage = { name?: string; text?: string; thread?: { name?: string }; threadReply?: boolean;
+  clientAssignedMessageId?: string;
   createTime?: string;
   annotations?: GoogleChatAnnotation[];
   sender?: { name?: string; type?: string; displayName?: string };
@@ -96,7 +98,8 @@ export class GoogleChatAdapter implements ChatAdapter {
     allowedSpaceIds?: ReadonlySet<string>; defaultCwd: string; defaultLocation?: string; logger: Logger;
     spaceEvents?: Pick<GoogleChatSpaceEvents, "start" | "stop" | "handle" | "space" | "appUser" | "recordAppUser"> & Partial<Pick<GoogleChatSpaceEvents, "register">>;
     writeIntervalMs?: number; driveUploader?: Pick<GoogleDriveUploader, "upload">;
-    historyReader?: Pick<GoogleChatHistoryReader, "readRawPage" | "getMessage"> }) {
+    mediaUser?: string; nativeImages?: boolean;
+    historyReader?: Pick<GoogleChatHistoryReader, "readRawPage" | "getMessage"> & Partial<Pick<GoogleChatHistoryReader, "normalizeMessage">> }) {
     this.writes = new SpaceWriteQueue({ logger: opts.logger, intervalMs: opts.writeIntervalMs });
     this.transport = new PubSubPullTransport({ ...opts,
       receive: (event, signal, id) => this.receiveEvent(event, signal, id),
@@ -167,6 +170,7 @@ export class GoogleChatAdapter implements ChatAdapter {
   async receiveWorkspaceMessage(parsed: ParsedWorkspaceChatMessage, signal?: AbortSignal): Promise<void> {
     if (!this.isAllowedSpace({ name: parsed.space, spaceType: "SPACE" })) return;
     let message = parsed.resource;
+    if (this.commandDeps?.store.googleChatSpaces.isOwnMessage(message)) return;
     if (message.sender?.type === "BOT" || (message.sender?.name && !this.isAllowedUser(this.platform, message.sender.name))) return;
     if (parsed.kind === "message-reference") {
       try {
@@ -191,6 +195,7 @@ export class GoogleChatAdapter implements ChatAdapter {
     this.opts.logger.info({ type: event.type, space: event.space?.name, message: message?.name,
       thread: message?.thread?.name, threadReply: message?.threadReply,
       spaceThreadingState: event.space?.spaceThreadingState }, "Google Chat event");
+    if (message && this.commandDeps?.store.googleChatSpaces.isOwnMessage(message)) return;
     const space = { ...this.space(event.space?.name ?? ""), ...event.space };
     if (event.type === "REMOVED_FROM_SPACE") {
       if (!space.name) throw new Error("Google Chat REMOVED_FROM_SPACE has no space name");
@@ -412,7 +417,8 @@ export class GoogleChatAdapter implements ChatAdapter {
     return ref!;
   }
 
-  private async postMessage(channel: ChannelRef, body: Record<string, unknown>, delivery?: DeliveryNonceOptions, contextText?: string): Promise<MessageRef> {
+  private async postMessage(channel: ChannelRef, body: Record<string, unknown>, delivery?: DeliveryNonceOptions, contextText?: string,
+    mediaClientId?: string): Promise<MessageRef> {
     const route = body.privateMessageViewer ? undefined : this.commandDeps?.deliveryForChannel?.(channel, delivery?.inboundMessageId);
     channel = route?.channel ?? channel;
     const { space } = names(channel);
@@ -420,6 +426,8 @@ export class GoogleChatAdapter implements ChatAdapter {
     const store = this.commandDeps?.store;
     const bound = store?.getByChannel(this.platform, channel.id) ?? store?.get?.(makeSessionId(this.platform, channel.id));
     const requestId = randomUUID();
+    const clientId = mediaClientId ?? (delivery ? googleChatClientMessageId(delivery.nonce) : undefined);
+    if (mediaClientId) store!.googleChatSpaces.recordOwnMessage(`${space}/messages/${mediaClientId}`);
     let continued = false, deduplicated = false, continuationThread = false, thread: string | undefined;
     let content = body;
     const message = await this.writes.enqueue(space, async nextWrite => {
@@ -427,14 +435,14 @@ export class GoogleChatAdapter implements ChatAdapter {
       thread = continued ? undefined : names(current && !home ? { ...channel, id: current.channelRef } : channel).thread;
       const create = async () => {
         try {
-          return await this.opts.api.request<ChatMessage>("chat", { method: "POST", url: `${root}/${space}/messages`,
+          return await this.opts.api.request<ChatMessage>(mediaClientId ? "media" : "chat", { method: "POST", url: `${root}/${space}/messages`,
             params: { requestId, ...(thread ? { messageReplyOption: "REPLY_MESSAGE_OR_FAIL" } : {}),
-              ...(delivery ? { messageId: googleChatClientMessageId(delivery.nonce) } : {}) },
+              ...(clientId ? { messageId: clientId } : {}) },
             data: { ...content, ...(thread ? { thread: { name: thread } } : {}) } });
         } catch (err) {
-          if (!delivery || googleErrorStatus(err) !== 409) throw err;
+          if (!clientId || googleErrorStatus(err) !== 409) throw err;
           deduplicated = true;
-          return this.opts.api.request<ChatMessage>("chat", { method: "GET", url: `${root}/${space}/messages/${googleChatClientMessageId(delivery.nonce)}` });
+          return this.opts.api.request<ChatMessage>(mediaClientId ? "messages" : "chat", { method: "GET", url: `${root}/${space}/messages/${clientId}` });
         }
       };
       let result: ChatMessage;
@@ -450,6 +458,7 @@ export class GoogleChatAdapter implements ChatAdapter {
         result = await create();
       }
       if (!result.name) throw new Error("Google Chat create returned no message name");
+      if (mediaClientId) store!.googleChatSpaces.recordOwnMessage(result.name);
       if (result.thread?.name && (continued || (deduplicated && result.thread.name !== thread))) {
         continuationThread = true;
         const destination = channelForThread(result.thread.name);
@@ -470,7 +479,7 @@ export class GoogleChatAdapter implements ChatAdapter {
     });
     if (!message.name) throw new Error("Google Chat create returned no message name");
     // The sender of our own app-auth write is the canonical app user, without a membership lookup.
-    if (message.sender?.name) {
+    if (!mediaClientId && message.sender?.name) {
       this.botUserId = message.sender.name;
       this.opts.spaceEvents?.recordAppUser(space, message.sender.name);
     }
@@ -547,6 +556,29 @@ export class GoogleChatAdapter implements ChatAdapter {
 
   async sendFile(channel: ChannelRef, file: { data: Buffer; filename: string; mimeType: string; caption?: string },
     delivery?: DeliveryNonceOptions): Promise<MessageRef> {
+    const mimeType = imageMimeType(file);
+    if (mimeType && this.opts.nativeImages && this.opts.mediaUser) {
+      try {
+        const target = this.commandDeps?.deliveryForChannel?.(channel, delivery?.inboundMessageId)?.channel ?? channel;
+        const { space, spaceType } = await this.historyTarget(target);
+        if (spaceType !== "DIRECT_MESSAGE") {
+          let member: { state?: string } | undefined;
+          try {
+            member = await this.opts.api.request("memberships", { method: "GET",
+              url: `${root}/${space}/members/${encodeURIComponent(this.opts.mediaUser.replace(/^users\//, ""))}` });
+          } catch (err) { if (googleErrorStatus(err) !== 404) throw err; }
+          if (member?.state === "JOINED") {
+            if (!this.commandDeps) throw new Error("Google Chat native images require durable session storage");
+            const attachment = await this.writes.enqueue(space, () => uploadChatImage(this.opts.api, space, file, mimeType));
+            return await this.postMessage(channel, { text: file.caption ?? file.filename, attachment: [attachment] }, delivery,
+              undefined, googleChatClientMessageId(delivery?.nonce ?? randomUUID(), "client-seam-"));
+          }
+        }
+      } catch (err) {
+        this.opts.logger.error({ err, channel, filename: file.filename }, "Google Chat native image delivery failed");
+        throw err;
+      }
+    }
     if (this.opts.driveUploader) {
       const link = await this.opts.driveUploader.upload(file);
       return this.sendMessage(channel, [file.caption, `[${file.filename}](${link})`].filter(Boolean).join("\n\n"), delivery);
@@ -620,8 +652,11 @@ export class GoogleChatAdapter implements ChatAdapter {
   async findMessageByNonce(channel: ChannelRef, nonce: string, sinceMs: number): Promise<DeliveryNonceLookup> {
     if (!this.opts.historyReader) return { status: "indeterminate",
       reason: "Google Chat nonce lookup is unsupported until history access is configured with admin-approved chat.app.messages.readonly" };
+    const mediaId = googleChatClientMessageId(nonce, "client-seam-");
+    const ownMedia = this.commandDeps?.store.googleChatSpaces.isOwnMessage({ name: `${names(channel).space}/messages/${mediaId}` });
     const result = await findSpaceMessageByNonce(this.opts.historyReader,
-      await this.historyTarget(this.sessionRoot(names(channel).space) ? channel : await this.resolveChannel(channel)), nonce, sinceMs);
+      await this.historyTarget(this.sessionRoot(names(channel).space) ? channel : await this.resolveChannel(channel)), nonce, sinceMs,
+      ownMedia ? mediaId : undefined);
     if (result.status === "unsupported") return { status: "indeterminate", reason: result.cause };
     if (result.status === "absent") return result;
     const { message } = result;

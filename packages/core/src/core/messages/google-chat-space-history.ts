@@ -27,7 +27,9 @@ export type GoogleChatNonceResult =
   | { status: "absent" }
   | GoogleChatHistoryUnsupported;
 
-type HistoryApi = Pick<GoogleChatHistoryReader, "readRawPage" | "getMessage">;
+type HistoryApi = Pick<GoogleChatHistoryReader, "readRawPage" | "getMessage"> & Partial<Pick<GoogleChatHistoryReader, "normalizeMessage">>;
+const normalize = (reader: HistoryApi, message: GoogleChatHistoryMessage) =>
+  reader.normalizeMessage?.(message) ?? normalizeGoogleChatMessage(message);
 
 /** Bridge native tokens to the existing message-id page contract without cursor state. */
 export async function fetchMessagePage(
@@ -84,7 +86,7 @@ export async function fetchMessagePage(
   return {
     status: "supported",
     page: {
-      messages: selected.filter((message) => !message.deleteTime).map(normalizeGoogleChatMessage),
+      messages: selected.filter((message) => !message.deleteTime).map(message => normalize(reader, message)),
       rawCount: selected.length,
       oldestRawId: oldest?.name ?? null,
       oldestRawTimestampMs: oldest ? Date.parse(oldest.createTime) : null,
@@ -115,14 +117,14 @@ export async function findMessageByNonce(
   target: GoogleChatHistoryTarget,
   nonce: string,
   sinceMs: number,
+  clientId = googleChatClientMessageId(nonce),
 ): Promise<GoogleChatNonceResult> {
   if (target.spaceType === "DIRECT_MESSAGE") {
     return { status: "unsupported", cause: GOOGLE_CHAT_DM_HISTORY_CAUSE };
   }
-  const clientId = googleChatClientMessageId(nonce);
   try {
     const message = await reader.getMessage(`${target.space}/messages/${clientId}`);
-    return { status: "found", message: normalizeGoogleChatMessage(message) };
+    return { status: "found", message: normalize(reader, message) };
   } catch (error) {
     const response = (error as { response?: { status?: number; data?: { error?: {
       code?: number; status?: string; message?: string; errors?: Array<{ domain?: string; reason?: string }>;
@@ -137,7 +139,7 @@ export async function findMessageByNonce(
   // a denial or interrupted page propagates, never authorizes replay.
   for await (const message of rawMessages(reader, target, 100, "newest", { after: new Date(sinceMs).toISOString() })) {
     if (message.clientAssignedMessageId === clientId) {
-      return { status: "found", message: normalizeGoogleChatMessage(message) };
+      return { status: "found", message: normalize(reader, message) };
     }
   }
   return { status: "absent" };

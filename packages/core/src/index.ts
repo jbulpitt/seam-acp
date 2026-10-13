@@ -479,11 +479,14 @@ async function main(): Promise<void> {
     },
   });
   const googleChatApi = config.GOOGLE_CHAT_PROJECT_ID && config.GOOGLE_CHAT_CREDENTIALS_FILE
-    ? new GoogleRestApi(config.GOOGLE_CHAT_CREDENTIALS_FILE, config.GOOGLE_CHAT_PROJECT_ID) : undefined;
+    ? new GoogleRestApi(config.GOOGLE_CHAT_CREDENTIALS_FILE, config.GOOGLE_CHAT_PROJECT_ID, config.GOOGLE_CHAT_MEDIA_TOKEN_FILE) : undefined;
   const googleChat = googleChatApi && config.GOOGLE_CHAT_SUBSCRIPTION
     ? new GoogleChatAdapter({
       api: googleChatApi,
-      historyReader: new GoogleChatHistoryReader({ credentialsFile: config.GOOGLE_CHAT_CREDENTIALS_FILE! }),
+      historyReader: new GoogleChatHistoryReader({ credentialsFile: config.GOOGLE_CHAT_CREDENTIALS_FILE!,
+        isOwnMessage: message => store.googleChatSpaces.isOwnMessage(message) }),
+      mediaUser: config.GOOGLE_CHAT_MEDIA_USER,
+      nativeImages: Boolean(config.GOOGLE_CHAT_MEDIA_TOKEN_FILE && config.GOOGLE_CHAT_MEDIA_USER),
       subscription: config.GOOGLE_CHAT_SUBSCRIPTION,
       allowedUserIds: config.GOOGLE_CHAT_ALLOWED_USER_IDS,
       allowedSpaceIds: config.GOOGLE_CHAT_ALLOWED_SPACE_IDS,

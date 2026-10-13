@@ -5,6 +5,7 @@ export const GOOGLE_CHAT_HISTORY_SCOPE = "https://www.googleapis.com/auth/chat.a
 
 export interface GoogleChatHistoryConfig {
   credentialsFile: string;
+  isOwnMessage?: (message: GoogleChatHistoryMessage) => boolean;
 }
 
 /** Standalone config; this does not change controller boot or enable an adapter. */
@@ -75,7 +76,7 @@ export interface GoogleChatRawHistoryPage {
 export class GoogleChatHistoryReader {
   private readonly client: ChatHistoryRequestor;
 
-  constructor(config: GoogleChatHistoryConfig, client?: ChatHistoryRequestor) {
+  constructor(private readonly config: GoogleChatHistoryConfig, client?: ChatHistoryRequestor) {
     this.client = client ?? new GoogleAuth({
       keyFilename: config.credentialsFile,
       scopes: [GOOGLE_CHAT_HISTORY_SCOPE],
@@ -87,12 +88,16 @@ export class GoogleChatHistoryReader {
     const raw = page.messages;
     const oldest = request.order === "oldest" ? raw[0] : raw.at(-1);
     return {
-      messages: raw.filter((message) => !message.deleteTime).map(normalizeGoogleChatMessage),
+      messages: raw.filter((message) => !message.deleteTime).map(message => this.normalizeMessage(message)),
       rawCount: raw.length,
       oldestRawId: oldest?.name ?? null,
       oldestRawTimestampMs: oldest ? Date.parse(oldest.createTime) : null,
       nextPageToken: page.nextPageToken,
     };
+  }
+
+  normalizeMessage(message: GoogleChatHistoryMessage): GoogleChatHistoryItem {
+    return normalizeGoogleChatMessage(message, this.config.isOwnMessage?.(message));
   }
 
   async readRawPage(request: GoogleChatHistoryRequest): Promise<GoogleChatRawHistoryPage> {
@@ -139,13 +144,14 @@ export class GoogleChatHistoryReader {
   }
 }
 
-export function normalizeGoogleChatMessage(message: GoogleChatHistoryMessage): GoogleChatHistoryItem {
+export function normalizeGoogleChatMessage(message: GoogleChatHistoryMessage, ownOutput = false): GoogleChatHistoryItem {
   return {
     messageId: message.name,
     timestampMs: Date.parse(message.createTime),
     authorId: message.sender?.name ?? "",
     authorName: message.sender?.displayName ?? message.sender?.name ?? "",
-    authorType: message.sender?.type === "BOT" ? "bot" : "human",
+    authorType: ownOutput || message.sender?.type === "BOT" ? "bot" : "human",
+    ...(ownOutput ? { isOwnOutput: true } : {}),
     content: message.text ?? "",
     attachmentNames: (message.attachment ?? []).flatMap((attachment) =>
       attachment.contentName === undefined ? [] : [attachment.contentName]),

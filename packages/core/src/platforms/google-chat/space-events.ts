@@ -134,6 +134,7 @@ export class GoogleChatSpaceEvents {
   private saveAndArm(state: StoredGoogleChatSpace, subscription: GoogleChatSpaceSubscription): void {
     const latest = this.opts.store.get(state.space.name);
     this.opts.store.put({ ...state, messageRoots: latest?.messageRoots ?? state.messageRoots,
+      ownMessages: latest?.ownMessages ?? state.ownMessages,
       appUser: latest?.appUser ?? state.appUser, subscription });
     if (this.controller.signal.aborted) return;
     const renewAt = nextGoogleChatSubscriptionRenewalTime(subscription, this.opts.renewalLeadMs ?? 5 * 60_000);

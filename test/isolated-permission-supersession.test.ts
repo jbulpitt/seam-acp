@@ -174,9 +174,11 @@ describe("a live message supersedes only its own permission", () => {
     try {
       await f.adopted.cancel();
       await vi.waitFor(() => expect(f.h.store.actionCards.getPermission(f.card.id)?.status).toBe("cancelled"), { timeout: 10_000 });
-      expect((await f.h.requests()).filter(row => row.id === "isolated-permission" && row.result)).toEqual([
-        expect.objectContaining({ result: { outcome: { outcome: "cancelled" } } }),
-      ]);
+      await vi.waitFor(async () => {
+        expect((await f.h.requests()).filter(row => row.id === "isolated-permission" && row.result)).toEqual([
+          expect.objectContaining({ result: { outcome: { outcome: "cancelled" } } }),
+        ]);
+      }, { timeout: 10_000 });
     } finally { await f.close(); }
   }, 25_000);
 });

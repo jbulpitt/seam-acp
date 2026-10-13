@@ -10,7 +10,7 @@ import { ChannelQueueFencedError, Orchestrator } from "../packages/core/src/plat
 import type { IncomingMessage } from "../packages/core/src/platforms/chat-adapter.js";
 import { fixtureModelCatalog } from "./model-catalog-fixture.js";
 
-async function receive(error: Error) {
+async function receive(error: Error, recovered = false) {
   const dir = await mkdtemp(path.join(tmpdir(), "seam-inbound-log-"));
   const store = new SessionStore(path.join(dir, "sessions.db"));
   const lines: string[] = [];
@@ -53,8 +53,17 @@ async function receive(error: Error) {
     handleIncomingMessageInner: inner,
   });
   try {
-    await (host as unknown as { handleIncomingMessage(msg: IncomingMessage): Promise<void> })
-      .handleIncomingMessage(message);
+    if (recovered) {
+      store.admitInbound({ messageId: message.messageId!, platform: message.channel.platform,
+        channelRef: message.channel.id, parentRef: null, sessionRecordId: record.id,
+        authorId: message.authorId, authorName: null, text: message.text, attachments: [], createdUtc: now });
+      const row = store.getInbound(message.messageId!)!;
+      await (host as unknown as { startRecoveredInbound(admission: typeof row): Promise<void> })
+        .startRecoveredInbound(row);
+    } else {
+      await (host as unknown as { handleIncomingMessage(msg: IncomingMessage): Promise<void> })
+        .handleIncomingMessage(message);
+    }
     expect(inner).toHaveBeenCalledTimes(1);
     expect(store.turnAttempts.get(inboundAttemptId(message.messageId!))).toEqual(suspended!);
     expect(store.getInbound(message.messageId!)?.state).toBe("running");
@@ -100,5 +109,52 @@ describe("inbound suspension logging", () => {
   it("keeps an obsolete channel queue fence silent", async () => {
     const logs = await receive(new ChannelQueueFencedError("worker", 0));
     expect(logs.filter(log => log.channelId === "worker" && log.level >= 30)).toEqual([]);
+  });
+});
+
+describe("recovered inbound suspension logging", () => {
+  it("logs only shutdown at info with its reason, leaving the attempt suspended", async () => {
+    const reason = "restart cutoff reached before this turn finished";
+    const logs = await receive(DispatchSuspendedError.shutdown("inbound-901", reason), true);
+    expect(logs.filter(log => log.level >= 50)).toEqual([]);
+    expect(logs.find(log => log.suspension === "shutdown")).toMatchObject({
+      level: 30, channelRef: "worker", messageId: "901", reason,
+      err: { type: "DispatchSuspendedError", reason, suspension: "shutdown" },
+    });
+  });
+
+  it.each([
+    ["superseded", "a newer attempt generation owns this turn"],
+    ["retryable", "provider acquisition failed before the prompt"],
+    ["defect", "recorded provider identity is corrupt"],
+  ] as const)("keeps %s at error with its reason", async (kind, reason) => {
+    const logs = await receive(DispatchSuspendedError[kind]("inbound-901", reason), true);
+    expect(logs.filter(log => log.level >= 50)).toEqual([
+      expect.objectContaining({ level: 50, channelRef: "worker", messageId: "901",
+        msg: "recovered inbound turn failed",
+        err: expect.objectContaining({ type: "DispatchSuspendedError", reason, suspension: kind }) }),
+    ]);
+  });
+
+  it("keeps a retryable suspension's transport cause at error", async () => {
+    const reason = "provider acquisition failed before the prompt";
+    const cause = new Error("connect ECONNREFUSED 127.0.0.1:4444");
+    const logs = await receive(DispatchSuspendedError.retryable("inbound-901", reason, cause), true);
+    const entry = logs.find(log => log.msg === "recovered inbound turn failed");
+    expect(entry).toMatchObject({ level: 50,
+      err: { reason, suspension: "retryable", message: expect.stringContaining(cause.message) } });
+  });
+
+  it("keeps an ordinary error at error with its cause", async () => {
+    const logs = await receive(new Error("SQLITE_BUSY"), true);
+    expect(logs.filter(log => log.level >= 50)).toEqual([
+      expect.objectContaining({ level: 50, msg: "recovered inbound turn failed",
+        err: expect.objectContaining({ message: "SQLITE_BUSY" }) }),
+    ]);
+  });
+
+  it("keeps an obsolete channel queue fence silent", async () => {
+    const logs = await receive(new ChannelQueueFencedError("worker", 0), true);
+    expect(logs.filter(log => log.channelRef === "worker" && log.level >= 30)).toEqual([]);
   });
 });

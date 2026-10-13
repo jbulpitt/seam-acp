@@ -20,7 +20,7 @@ import {
 
 const cleanups: (() => void)[] = [];
 afterEach(() => { for (const f of cleanups.splice(0).reverse()) f(); vi.restoreAllMocks(); });
-function setup() {
+function setup(logger = pino({ level: "silent" })) {
   const dir = mkdtempSync(path.join(tmpdir(), "seam-250-inbound-"));
   cleanups.push(() => rmSync(dir, { force: true, recursive: true }));
   const store = new SessionStore(path.join(dir, "test.db"));
@@ -55,6 +55,7 @@ function setup() {
   };
   const router = testSessionRouter({ listProfiles: () => [],
     describeConfig: () => ({ agent: { value: "codex" }, model: { value: "test" },
+      role: { value: null }, disableThreadPrefix: { value: false },
       effort: { value: null }, cwd: { value: "/synthetic" }, location: { value: "local" }, fastMode: { value: false } }),
     ensureSessionRecord: () => ({ ...record }), getProfile: () => undefined,
     getOrStartRuntime: vi.fn(async (_record: unknown, _recovery?: unknown) => runtime),
@@ -70,7 +71,7 @@ function setup() {
     DEFAULT_MODEL: "test", REPO_EMOJIS: new Map(), SEAM_TURN_RESUME_ENABLED: true,
     channelPresets: new Map(), threadPresets: new Map() };
   const make = (bridgeHub?: unknown) => {
-    const orch = new Orchestrator({ logger: pino({ level: "silent" }) as any,
+    const orch = new Orchestrator({ logger: logger as any,
       modelCatalog: fixtureModelCatalog([]), store, router: router as any,
       adapter: adapter as any, renderer: discordRenderer as any, config: config as any });
     if (bridgeHub) orch.setBridgeHub(bridgeHub as any);
@@ -90,6 +91,46 @@ function setup() {
 }
 
 describe("#250 human turn production pipeline, synthetic transport only", () => {
+  it("logs the shutdown cause below error, then reattaches and completes the recovered turn", async () => {
+    const lines: string[] = [];
+    const logger = pino({ level: "debug" }, { write(line: string) { lines.push(line); } });
+    const h = setup(logger);
+    simulateRetiredOwnerProcess();
+    const row = h.store.recoverInboundChannel("worker", new Date().toISOString());
+    const recovered = (h.orch as any).startRecoveredInbound(row) as Promise<void>;
+    await h.started;
+    h.orch.suspendForRestart();
+    h.release();
+    await recovered;
+    const logs = lines.map(line => JSON.parse(line));
+    expect(logs.filter(log => log.level >= 50 && log.err?.suspension === "shutdown")).toEqual([]);
+    expect(logs.find(log => log.suspension === "shutdown")).toMatchObject({
+      level: 30, channelRef: "worker", messageId: "1",
+      reason: "restart cutoff reached before this turn finished",
+      err: { type: "DispatchSuspendedError", suspension: "shutdown",
+        reason: "restart cutoff reached before this turn finished" },
+    });
+    expect(h.store.turnAttempts.get("inbound-1")).toMatchObject({ state: "suspended", promptStarted: true,
+      acpSessionId: "recorded-acp", outcome: null });
+    h.runtime.prompt.mockImplementationOnce(async () => {
+      await h.emit("RECOVERED_INBOUND_975");
+      return { stopReason: "end_turn" };
+    });
+    const restarted = h.make();
+    await restarted.recoverInterruptedTurns();
+    expect(h.router.getOrStartRuntime.mock.calls.at(-1)?.[1]).toEqual({ resumeSessionId: "recorded-acp" });
+    expect(h.runtime.prompt).toHaveBeenCalledTimes(2);
+    expect(h.runtime.prompt.mock.calls[1]?.[0]).toMatch(/^continue\n/);
+    expect(h.runtime.prompt.mock.calls[1]?.[0]).not.toContain("ORIGINAL DISPOSABLE WORK");
+    expect(h.store.turnAttempts.get("inbound-1")).toMatchObject({ state: "completed",
+      acpSessionId: "recorded-acp", deliveryDone: true,
+      outcome: { status: "completed", output: "RECOVERED_INBOUND_975" } });
+    expect(h.store.getInbound("1")?.state).toBe("completed");
+    expect(h.adapter.sendMessage.mock.calls.filter(([, text]) => text === "RECOVERED_INBOUND_975")).toHaveLength(1);
+    expect(lines.map(line => JSON.parse(line))
+      .filter(log => log.level >= 50 && log.err?.suspension === "shutdown")).toEqual([]);
+  });
+
   it.each(["inventory", "exit", "error", "connection result"].flatMap(loss =>
     ["before loss", "during retirement"].map(arrival => ({ loss, arrival }))))(
     "lost owner FIFO ($loss) continues before a successor queued $arrival", async ({ loss, arrival }) => {

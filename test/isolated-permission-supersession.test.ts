@@ -149,7 +149,7 @@ describe("a live message supersedes only its own permission", () => {
       const prompt = live.prompt("live tool", undefined, {
         onRemoteRecovery: binding => f.h.store.turnAttempts.recordRemoteRecovery(attempt, { ...binding, location: "fixture" }),
         onRemoteRecoveryReleased: () => {},
-      });
+      }).catch(() => undefined);
       await vi.waitFor(() => expect(f.h.store.actionCards.permissions().filter(row => row.status === "open")).toHaveLength(2),
         { timeout: 10_000 });
       const liveCard = f.h.store.actionCards.permissions().find(row => row.attemptId === attempt.id)!;

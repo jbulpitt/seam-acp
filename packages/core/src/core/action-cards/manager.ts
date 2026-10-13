@@ -137,8 +137,9 @@ export class ActionCardManager {
     }
   }
 
-  async cancelForSession(sessionId: string, detail: string): Promise<number> {
-    const rows = this.deps.store.permissions(sessionId).filter(row => row.status === "open");
+  async cancelForSession(session: Pick<SessionRecord, "id" | "acpSessionId">, detail: string): Promise<number> {
+    const rows = this.deps.store.permissions(session.id)
+      .filter(row => row.status === "open" && row.acpSessionId === session.acpSessionId);
     for (const row of rows) await this.resolvePermission(row, "cancelled", denied, detail);
     return rows.length;
   }

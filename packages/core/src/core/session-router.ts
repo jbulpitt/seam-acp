@@ -1022,7 +1022,7 @@ export class SessionRouter {
       const record = this.store.get(sessionId);
       if (record) {
         await this.cancelElicitations?.(
-          record,
+          { ...record, acpSessionId: rt.getSessionInfo()?.sessionId ?? "" },
           "interrupted",
           "The agent session was replaced before this request completed."
         ).catch(() => {});
@@ -1535,9 +1535,9 @@ export class SessionRouter {
       completeElicitationHandler: async (notification) => {
         await this.completeElicitation?.(this.store.get(record.id) ?? record, notification);
       },
-      cancelElicitations: async () => {
+      cancelElicitations: async (acpSessionId) => {
         await this.cancelElicitations?.(
-          this.store.get(record.id) ?? record,
+          { ...(this.store.get(record.id) ?? record), acpSessionId: acpSessionId ?? "" },
           "cancelled",
           "The running turn was cancelled before this request completed."
         );

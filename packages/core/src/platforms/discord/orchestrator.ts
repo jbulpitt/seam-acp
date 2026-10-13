@@ -1093,7 +1093,7 @@ export class Orchestrator {
       },
       cancel: async (record, reason, detail) => {
         await this.elicitations.cancelForSession(record.id, reason, detail);
-        await this.actionCards.cancelForSession(record.id, detail ?? "This permission request was interrupted.");
+        await this.actionCards.cancelForSession(record, detail ?? "This permission request was interrupted.");
       },
     });
 
@@ -2435,9 +2435,8 @@ export class Orchestrator {
     // Must run before abort / park so the upload is not treated as a new turn.
     if (await this.tryConsumeConfigEditorRiderUpload(msg)) return;
 
-    // A normal user turn supersedes an outstanding ACP elicitation before the
-    // new prompt is admitted. This also precedes mid-turn inbox routing: a user
-    // answer typed as a message is a competing turn, never a hidden form reply.
+    // Supersede the live ACP's request before admission; isolated permissions
+    // keep their own owner. A typed answer is a new turn, not a form reply.
     let supersededElicitation = 0;
     if (msg.raw && preemptive) {
       const existing = this.store.getByChannel(msg.channel.platform, channelId);
@@ -2447,7 +2446,7 @@ export class Orchestrator {
           "superseded",
           "A newer user message superseded this request."
         );
-        supersededElicitation += await this.actionCards.cancelForSession(existing.id, "A newer user message superseded this request.");
+        supersededElicitation += await this.actionCards.cancelForSession(existing, "A newer user message superseded this request.");
       }
     }
 

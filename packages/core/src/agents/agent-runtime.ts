@@ -445,7 +445,7 @@ export class AgentRuntime {
   private readonly completeElicitationHandler?: (
     notification: CompleteElicitationNotification
   ) => Promise<void>;
-  private readonly cancelElicitations?: () => Promise<void>;
+  private readonly cancelElicitations?: (acpSessionId: string | undefined) => Promise<void>;
   /** Bridge spawn. There is deliberately no profile.spawn fallback: local is
    * a separate bridge process and a second child owner would defeat restart
    * adoption (#575). */
@@ -620,7 +620,7 @@ export class AgentRuntime {
     completeElicitationHandler?: (
       notification: CompleteElicitationNotification
     ) => Promise<void>;
-    cancelElicitations?: () => Promise<void>;
+    cancelElicitations?: (acpSessionId: string | undefined) => Promise<void>;
     /** Called when the agent process exits after a successful initialize. */
     onDead?: () => void;
     /** Refresh this runtime's exact host binding after adapter-owned metadata changes. */
@@ -2135,7 +2135,7 @@ export class AgentRuntime {
 
   async cancel(): Promise<void> {
     this.recoveryAbort?.abort();
-    await this.cancelElicitations?.().catch((err) => {
+    await this.cancelElicitations?.(this.sessionId).catch((err) => {
       this.logger.warn({ err }, "elicitation cancellation failed");
     });
     if (!this.connection || !this.sessionId) return;

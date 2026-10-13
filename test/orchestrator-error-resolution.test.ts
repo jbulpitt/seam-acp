@@ -3,7 +3,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { pino } from "pino";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { classifyClaudeError, type AgentProfile } from "@seam/adapters";
 import { RequestError } from "@agentclientprotocol/sdk";
 import { AgentRuntime } from "../packages/core/src/agents/agent-runtime.js";
@@ -11,7 +11,9 @@ import { Orchestrator } from "../packages/core/src/platforms/discord/orchestrato
 import { SessionStore } from "../packages/core/src/core/session-store.js";
 import { discordRenderer } from "../packages/core/src/platforms/discord/renderer.js";
 import { fixtureModelCatalog } from "./model-catalog-fixture.js";
+import { fastProviderRetryClock } from "./helpers/provider-retry-clock.js";
 
+beforeEach(fastProviderRetryClock);
 afterEach(() => vi.restoreAllMocks());
 
 describe("#441 real orchestrator consumer with fake ACP", () => {
@@ -35,7 +37,7 @@ describe("#441 real orchestrator consumer with fake ACP", () => {
         await (runtime as any).handleSessionUpdate({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: "partial answer" } });
       }
       if (calls === 1 || mode === "exhausted") throw first;
-      if (calls === 2) throw second;
+      if (calls === 2 || mode === "changed-kind" && calls === 3) throw second;
       return { stopReason: "end_turn" };
     });
     Object.assign(runtime, { connection: { prompt }, sessionId: "fixture-acp", promptCapabilities: {},
@@ -68,16 +70,12 @@ describe("#441 real orchestrator consumer with fake ACP", () => {
         async editMessage() {}, async sendFile() {},
       } as never,
     });
-    // Shorten only existing backoff/idle guards, not the code deciding to retry.
-    const originalTimeout = globalThis.setTimeout;
-    vi.spyOn(globalThis, "setTimeout").mockImplementation(((fn: (...args: unknown[]) => void, ms?: number, ...args: unknown[]) =>
-      originalTimeout(fn, [2_000, 5_000, 10_000].includes(ms ?? 0) ? 0 : ms, ...args)) as typeof setTimeout);
     try {
       await (orch as unknown as { executeIncomingMessage(message: unknown): Promise<void> }).executeIncomingMessage({
         channel: { platform: "discord", id: record.channelRef }, authorId: "fixture-user", authorIsBot: false, text: "fixture",
         ...(mode === "owned-output" ? { messageId: "owned-message" } : {}),
       });
-      expect(prompt, lines.join("\n")).toHaveBeenCalledTimes(mode === "changed-kind" ? 2 : mode === "exhausted" ? 4 : 3);
+      expect(prompt, lines.join("\n")).toHaveBeenCalledTimes(mode === "exhausted" ? 8 : 3);
       expect(messages.some(text => text.startsWith("Recovery:"))).toBe(true);
       if (mode.endsWith("output")) {
         const continued = (prompt.mock.calls[1]![0] as { prompt: Array<{ text: string }> }).prompt[0]!.text;
@@ -91,6 +89,10 @@ describe("#441 real orchestrator consumer with fake ACP", () => {
         startRung: 1, action: "recover", surface: true });
       const failures = lines.map((line) => JSON.parse(line)).filter((line) => line.msg === "turn failed");
       expect(failures).toHaveLength(mode === "changed-kind" || mode === "exhausted" ? 1 : 0);
+      if (mode === "changed-kind") {
+        expect(lines.map(line => JSON.parse(line))).toContainEqual(expect.objectContaining({ retry: 2, delayMs: 300_000 }));
+        expect(JSON.stringify(panels)).toContain("Paused — quota or balance exhausted");
+      }
       expect(panels.length).toBeGreaterThan(0); // not a classifier-only test.
     } finally {
       store.close();

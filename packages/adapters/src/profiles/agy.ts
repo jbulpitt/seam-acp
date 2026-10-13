@@ -337,12 +337,30 @@ export async function prepareAgyMcpHome(
       /* optional userSettings */
     }
     await fs.writeFile(path.join(cfgDir, "mcp_config.json"), `${buildAgyMcpConfigJson(servers)}\n`, { mode: 0o600 });
-    return home;
   } catch {
     // A failed MCP config write must not leave a credential-bearing temp HOME.
     await fs.rm(home, { recursive: true, force: true });
     throw agyFailure("spawn_failed");
   }
+  if (process.platform === "darwin") {
+    // macOS resolves the login keychain under HOME; MCP config stays private.
+    const keychains = path.join(path.dirname(realGemini), "Library", "Keychains");
+    try {
+      const existing = await fs.stat(keychains).catch((error: NodeJS.ErrnoException) => {
+        if (error.code === "ENOENT") return undefined;
+        throw error;
+      });
+      if (existing?.isDirectory()) {
+        const library = path.join(home, "Library");
+        await fs.mkdir(library);
+        await fs.symlink(keychains, path.join(library, "Keychains"));
+      }
+    } catch (error) {
+      await fs.rm(home, { recursive: true, force: true });
+      throw error;
+    }
+  }
+  return home;
 }
 
 export interface AgyMcpHomeSweepResult {

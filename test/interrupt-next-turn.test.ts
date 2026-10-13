@@ -162,6 +162,9 @@ describe("send interrupt next-turn ordering", () => {
         expect(store.turnAttempts.get(id)?.state).toBe("completed");
         expect(h.events).toContain(`report:${id}`);
       }
+      const completed = store.turnAttempts.list("completed");
+      expect(completed).toHaveLength(active === "dispatch" ? 4 : 3);
+      for (const attempt of completed) expect(h.events.filter(event => event === `report:${attempt.id}`)).toHaveLength(1);
     });
   }
 

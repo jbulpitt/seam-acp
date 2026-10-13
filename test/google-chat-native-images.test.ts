@@ -8,6 +8,7 @@ import { GoogleChatHistoryReader } from "../packages/core/src/core/messages/goog
 import { projectDiscordConversation } from "../packages/core/src/core/reconstruction/project.js";
 import { SessionStore } from "../packages/core/src/core/session-store.js";
 import { parseGoogleChatWorkspaceMessages } from "../packages/core/src/platforms/google-chat/workspace-message-event.js";
+import { GoogleChatSpaceEvents } from "../packages/core/src/platforms/google-chat/space-events.js";
 
 const user = "users/poster", bot = "users/app", space = "spaces/test", thread = `${space}/threads/native`;
 const channel = { platform: "google-chat", id: "test" };
@@ -120,8 +121,74 @@ describe("Google Chat native images", () => {
   it("finds a native image receipt by the sender's media client id after restart", async () => {
     const h = fixture();
     const ref = await h.adapter.sendFile(channel, image, { nonce: "receipt-test" });
+    const get = vi.spyOn(h.reader, "getMessage");
     const found = await h.make().findMessageByNonce(channel, "receipt-test", 0);
     expect(found).toMatchObject({ status: "found", message: { id: ref.id } });
+    expect(get).toHaveBeenCalledWith(expect.stringContaining("/messages/client-seam-"));
+  });
+
+  it("preserves an image identity recorded while subscription registration is awaiting Google", async () => {
+    const h = fixture();
+    let release!: () => void, started!: () => void;
+    const held = new Promise<void>(resolve => { release = resolve; });
+    const startup = new Promise<void>(resolve => { started = resolve; });
+    const subscription: any = { name: "subscriptions/test", expireTime: new Date(Date.now() + 3_600_000).toISOString() };
+    const events = new GoogleChatSpaceEvents({ api: { request: h.request }, store: h.store.googleChatSpaces,
+      logger: h.logger, pubsubTopic: "projects/test/topics/events", subscriptions: {
+        list: async () => [], create: async () => { started(); await held; return subscription; },
+        renew: async () => subscription, delete: async () => {},
+      } as any });
+    const registered = events.register({ name: space, spaceType: "SPACE" });
+    await startup;
+    const name = `${space}/messages/client-seam-test`;
+    h.store.googleChatSpaces.put({ ...h.store.googleChatSpaces.get(space)!, ownMessages: { [name]: true } } as any);
+    release();
+    try {
+      await registered;
+      expect((h.store.googleChatSpaces.get(space) as any)?.ownMessages?.[name]).toBe(true);
+    } finally { await events.stop(); }
+  });
+
+  it("reuses a native create after a crash without requiring user-auth read permissions", async () => {
+    const h = fixture(), original = h.request.getMockImplementation()!;
+    const ref = await h.adapter.sendFile(channel, image, { nonce: "duplicate-image" });
+    h.request.mockImplementation(async (scope, r) => {
+      if (scope === "media" && r.url.endsWith("/messages")) throw Object.assign(new Error("Already exists"), { response: { status: 409 } });
+      return original(scope, r);
+    });
+    const duplicate = await h.make().sendFile(channel, image, { nonce: "duplicate-image" });
+    expect(duplicate.id).toBe(ref.id);
+    expect(h.request).toHaveBeenCalledWith("messages", expect.objectContaining({ method: "GET", url: expect.stringContaining("/messages/client-seam-") }));
+    expect(h.request.mock.calls.some(([scope, r]) => scope === "media" && r.method === "GET")).toBe(false);
+  });
+
+  it.each(["png", "jpeg", "gif", "webp"])("infers %s image MIME when the attachment fence supplies octet-stream", async extension => {
+    const h = fixture();
+    await h.adapter.sendFile(channel, { ...image, filename: `image.${extension}`, mimeType: "application/octet-stream" });
+    const upload = h.request.mock.calls.find(([, r]) => r.url.includes("/attachments:upload"));
+    expect(upload?.[1].data.toString()).toContain(`Content-Type: image/${extension}`);
+    expect(h.drive.upload).not.toHaveBeenCalled();
+  });
+
+  it("does not let an app write bypass an in-flight native upload's per-space lane", async () => {
+    const h = fixture(), original = h.request.getMockImplementation()!;
+    let release!: () => void, started!: () => void;
+    const held = new Promise<void>(resolve => { release = resolve; });
+    const startup = new Promise<void>(resolve => { started = resolve; });
+    h.request.mockImplementation(async (scope, r) => {
+      if (r.url.includes("/attachments:upload")) { started(); await held; }
+      return original(scope, r);
+    });
+    const result = h.adapter.sendFile(channel, image);
+    // On the old implementation Drive delivery finishes without starting an upload.
+    const outcome = await Promise.race([startup.then(() => "upload"), result.then(() => "drive")]);
+    expect(outcome).toBe("upload");
+    const other = h.adapter.sendMessage(channel, "Queued app write");
+    await Promise.resolve();
+    expect(h.request.mock.calls.some(([, r]) => r.url.endsWith("/messages"))).toBe(false);
+    release();
+    await Promise.all([result, other]);
+    expect(h.request.mock.calls.filter(([, r]) => r.url.endsWith("/messages"))).toHaveLength(2);
   });
 
   it("keeps Drive delivery in a DM and for an upload user who is not a Space member", async () => {

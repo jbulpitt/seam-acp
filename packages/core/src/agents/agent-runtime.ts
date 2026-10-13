@@ -42,8 +42,8 @@ import {
   sessionFailureError,
   supportsSessionFailures,
   CodexReplyGate,
-  providerRetryBackoff,
-  PROVIDER_RETRY_WINDOW_MS,
+  isSessionRecoveryProgress,
+  providerRetryWindow,
   readErrorClassification,
   resolveError,
   unclassified,
@@ -491,6 +491,7 @@ export class AgentRuntime {
   private delegatedTurn = false;
   private detached = false;
   private receivingSubmission?: SubmissionEvidence;
+  private recoveryProgress?: () => void;
   private readonly submissionSinks = new WeakMap<SubmissionEvidence, AgentEventHandler>();
   private readonly submissionRequests = new WeakMap<object, SubmissionEvidence>();
 
@@ -1515,9 +1516,12 @@ export class AgentRuntime {
       } else {
         res = await runBoundedRecovery({
         run,
+        onProgress: reset => {
+          this.recoveryProgress = reset;
+          return () => { this.recoveryProgress = undefined; };
+        },
         signal: recoveryAbort.signal,
-        windowMs: error => providerRetryBackoff(readErrorClassification(error)?.errorKind ?? "unclassified")
-          ? PROVIDER_RETRY_WINDOW_MS : undefined,
+        windowMs: error => providerRetryWindow(readErrorClassification(error)?.errorKind ?? "unclassified"),
         delays: error => {
           const resolution = resolveError(readErrorClassification(error) ?? unclassified(this.profile.id), DEFAULT_ERROR_RULES);
           const directive = buildRecoveryDirective(resolution,
@@ -1536,6 +1540,7 @@ export class AgentRuntime {
           return schedule;
         },
         onRetry: async (error, retry, delayMs) => {
+          retryBudget = Math.max(retryBudget, retry);
           // #536/#467: unknown acceptance makes RESEND unsafe, not continue.
           // Only positive rpc_never_invoked evidence permits original replay.
           continuing = receipt.submission.acceptance.state !== "not_accepted";
@@ -1586,7 +1591,7 @@ export class AgentRuntime {
     } catch (error) {
       if (readErrorClassification(error)?.errorKind === "quota_exhausted") {
         await this.emit({ kind: "notice", agent: this.profile.id, severity: "warning",
-          title: "Paused — quota or balance exhausted", description: `${errorMessage(error)}\nRetry after the reset or top-up; no automatic retries.` });
+          title: "Paused — quota or balance exhausted", description: `${errorMessage(error)}\nRetry after the reset or top-up; no further automatic retries.` });
       }
       const parked = this.reauthPark(error, lastErrorKind, promptRejectedBeforeOutput(receipt.submission, error));
       if (parked) throw parked;
@@ -2387,6 +2392,7 @@ export class AgentRuntime {
         const content = update.content.type === "text" && this.providerReplyGate
           ? { ...update.content, text: this.providerReplyGate.push(update.content.text) } : update.content;
         if (content.type === "text" && !content.text) return;
+        if (isSessionRecoveryProgress({ ...update, content })) this.recoveryProgress?.();
         await this.handleContentBlock(content, "message", {
           messageId: update.messageId ?? undefined,
         });
@@ -2394,10 +2400,12 @@ export class AgentRuntime {
       }
       case "agent_thought_chunk": {
         const text = textFromContent(update.content);
+        if (isSessionRecoveryProgress(update)) this.recoveryProgress?.();
         if (text) await this.emit({ kind: "agent-thought", text });
         return;
       }
       case "tool_call": {
+        if (isSessionRecoveryProgress(update)) this.recoveryProgress?.();
         await this.emit({
           kind: "tool-start",
           toolCallId: update.toolCallId,
@@ -2410,6 +2418,7 @@ export class AgentRuntime {
         return;
       }
       case "tool_call_update": {
+        if (isSessionRecoveryProgress(update)) this.recoveryProgress?.();
         await this.emit({
           kind: "tool-update",
           toolCallId: update.toolCallId,

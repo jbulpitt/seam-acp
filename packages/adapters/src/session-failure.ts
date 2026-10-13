@@ -69,6 +69,17 @@ export function classifySessionFailure(ctx: ClassifyContext): AdapterErrorKind |
   }
 }
 
+/** Actual continuation output, not user echoes, failure notices or usage meters. */
+export function isSessionRecoveryProgress(value: unknown): boolean {
+  const update = record(value);
+  if (!update || readSessionFailure(value)?.severity === "error") return false;
+  if (update.sessionUpdate === "tool_call") return update.status !== "failed";
+  if (update.sessionUpdate === "tool_call_update") return update.status === "completed";
+  if (update.sessionUpdate !== "agent_message_chunk" && update.sessionUpdate !== "agent_thought_chunk") return false;
+  const content = record(update.content);
+  return content?.type === "text" && typeof content.text === "string" && content.text.trim().length > 0;
+}
+
 const CODEX_CAPACITY = "Selected model is at capacity. Please try a different model.";
 const CODEX_ERROR_PREFIX = '{"type":"error"';
 

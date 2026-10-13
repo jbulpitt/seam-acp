@@ -1,5 +1,5 @@
 import type { ErrorVerdict, RecoveryRung } from "@seam/adapters";
-import { providerRetryBackoff } from "@seam/adapters";
+import { providerRetryBackoff, readErrorClassification } from "@seam/adapters";
 
 /** Versioned wire DATA, not closures, Error objects, or provider wording. #467
  * will attach this to a daemon slot; until then execution is process-local.
@@ -42,8 +42,8 @@ export function buildRecoveryDirective(
   };
 }
 
-/** One mechanical owner. A changed error may shorten/stop the first schedule,
- * never replenish it. Policy is supplied by the caller, not inferred here.
+/** One mechanical owner, with per-kind schedules inside each failure episode.
+ * Policy is supplied by the caller, not inferred here.
  * Only settled operations enter backoff: this introduces no silence timer and
  * cannot race #460's deadline or turnHealth's later staleness threshold. */
 export async function runBoundedRecovery<T>(opts: {
@@ -54,42 +54,55 @@ export async function runBoundedRecovery<T>(opts: {
   signal?: AbortSignal;
   windowMs?: (error: unknown) => number | undefined;
   now?: () => number;
+  onProgress?: (reset: () => void) => () => void;
 }): Promise<T> {
-  let budget: number | undefined;
+  let retry = 0;
+  const kindRetries = new Map<string, number>();
   let started: number | undefined;
-  let windowMs: number | undefined;
+  let continuing = false;
   const now = opts.now ?? Date.now;
-  for (let retry = 0; ; retry++) {
-    try { return await opts.run(); }
-    catch (error) {
-      const delays = opts.delays(error);
-      budget ??= delays.length;
-      started ??= now();
-      windowMs ??= opts.windowMs?.(error);
-      // Cancellation refuses only further recovery, never destroys the session.
-      // Cancel during backoff is reachable via /seam cancel and must not fire a
-      // surprise paid prompt after the operator has stopped the work.
-      if (retry >= budget || retry >= delays.length || opts.signal?.aborted) throw error;
-      let delay = delays[retry]!;
-      if (windowMs !== undefined) {
-        const remaining = windowMs - (now() - started);
-        if (remaining <= 0) throw error;
-        delay = Math.min(delay, remaining - 1);
+  const off = opts.onProgress?.(() => {
+    if (!continuing) return;
+    retry = 0;
+    kindRetries.clear();
+    started = undefined;
+    continuing = false;
+  });
+  try {
+    for (;;) {
+      try { continuing = retry > 0; return await opts.run(); }
+      catch (error) {
+        continuing = false;
+        const delays = opts.delays(error);
+        const kind = readErrorClassification(error)?.errorKind ?? "unclassified";
+        const kindRetry = kindRetries.get(kind) ?? 0;
+        const windowMs = opts.windowMs?.(error);
+        if (windowMs !== undefined) started ??= now();
+        // Cancel stops recovery, not the retained session or its completed work.
+        if (!delays.length || (windowMs === undefined && kindRetry >= delays.length) || opts.signal?.aborted) throw error;
+        let delay = delays[Math.min(kindRetry, delays.length - 1)]!;
+        if (windowMs !== undefined) {
+          const remaining = windowMs - (now() - started!);
+          if (remaining <= 0) throw error;
+          delay = Math.min(delay, remaining);
+        }
+        retry += 1;
+        kindRetries.set(kind, kindRetry + 1);
+        await opts.onRetry?.(error, retry, delay);
+        if (opts.sleep) await opts.sleep(delay);
+        else await new Promise<void>(resolve => {
+          const finish = () => {
+            clearTimeout(timer);
+            opts.signal?.removeEventListener("abort", finish);
+            resolve();
+          };
+          const timer = setTimeout(finish, delay);
+          opts.signal?.addEventListener("abort", finish, { once: true });
+          if (opts.signal?.aborted) finish();
+        });
+        if (opts.signal?.aborted) throw error;
+        if (windowMs !== undefined && now() - started! >= windowMs) throw error;
       }
-      await opts.onRetry?.(error, retry + 1, delay);
-      if (opts.sleep) await opts.sleep(delay);
-      else await new Promise<void>(resolve => {
-        const finish = () => {
-          clearTimeout(timer);
-          opts.signal?.removeEventListener("abort", finish);
-          resolve();
-        };
-        const timer = setTimeout(finish, delay);
-        opts.signal?.addEventListener("abort", finish, { once: true });
-        if (opts.signal?.aborted) finish();
-      });
-      if (opts.signal?.aborted) throw error;
-      if (windowMs !== undefined && now() - started >= windowMs) throw error;
     }
-  }
+  } finally { off?.(); }
 }

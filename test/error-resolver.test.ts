@@ -13,7 +13,7 @@ const options = [
 
 describe("#441 frozen resolver and variable data", () => {
   it.each([
-    ["rate_limit", "transient", 1], ["quota_exhausted", "terminal", 2],
+    ["rate_limit", "transient", 1], ["quota_exhausted", "terminal", 1],
     ["auth_expired", "terminal", 2], ["auth_contention", "transient", 1],
     ["auth_required", "terminal", 2], ["permission_denied", "terminal", 2],
     ["session_gone", "terminal", 4], ["connection_closed", "transient", 3],
@@ -142,6 +142,6 @@ describe("#441 sanitized journal corpus through adapter then resolver", () => {
     const error = Object.assign(new Error("Internal error"), { name: "DispatchTurnError",
       output: "You've hit your usage limit. Visit https://chatgpt.com/codex/settings/usage to purchase more credits or try again at Sep 19th, 2026 6:00 AM.\n" });
     expect(resolveError(classifyCodexError(error), DEFAULT_ERROR_RULES))
-      .toMatchObject({ errorKind: "quota_exhausted", transience: "terminal", startRung: 2, action: "recover" });
+      .toMatchObject({ errorKind: "quota_exhausted", transience: "terminal", startRung: 1, action: "recover" });
   });
 });

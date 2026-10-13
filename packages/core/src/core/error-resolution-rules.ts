@@ -7,7 +7,7 @@ import type { AdapterErrorKind, ErrorRule } from "@seam/adapters";
 const POLICY: Record<Exclude<AdapterErrorKind, "unclassified">,
   Pick<ErrorRule["then"], "transience" | "startRung" | "needsHuman">> = {
   rate_limit: { transience: "transient", startRung: 1, needsHuman: "no" },
-  quota_exhausted: { transience: "terminal", startRung: 2, needsHuman: "unknown" },
+  quota_exhausted: { transience: "terminal", startRung: 1, needsHuman: "unknown" },
   auth_expired: { transience: "terminal", startRung: 2, needsHuman: "yes" },
   auth_contention: { transience: "transient", startRung: 1, needsHuman: "no" },
   auth_required: { transience: "terminal", startRung: 2, needsHuman: "yes" },

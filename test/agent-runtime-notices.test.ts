@@ -2,7 +2,7 @@ import { testSessionRouter, testSessionStore } from "./helpers/session-fixture.j
 import { EventEmitter } from "node:events";
 import { PassThrough, Readable, Writable } from "node:stream";
 import { agent, methods, ndJsonStream, PROTOCOL_VERSION, type ClientCapabilities, type SessionUpdate, type PromptResponse } from "@agentclientprotocol/sdk";
-import { classifyCodexError, classifyClaudeError, providerRetryBackoff, type AgentProfile } from "@seam/adapters";
+import { classifyCodexError, classifyClaudeError, type AgentProfile } from "@seam/adapters";
 import { pino } from "pino";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { AgentRuntime, type AgentEvent } from "../packages/core/src/agents/agent-runtime.js";
@@ -13,14 +13,10 @@ import { Orchestrator } from "../packages/core/src/platforms/discord/orchestrato
 import { PluginHost } from "../packages/core/src/plugins/host.js";
 import { discordRenderer } from "../packages/core/src/platforms/discord/renderer.js";
 import type { Logger } from "../packages/core/src/lib/logger.js";
+import { fastProviderRetryClock } from "./helpers/provider-retry-clock.js";
 
 const cleanups: Array<() => Promise<void>> = [];
-beforeEach(() => {
-  const timeout = globalThis.setTimeout;
-  const backoff = providerRetryBackoff("overloaded")!;
-  vi.spyOn(globalThis, "setTimeout").mockImplementation(((fn: () => void, ms?: number) =>
-    timeout(fn, backoff.includes(ms ?? 0) ? 0 : ms)) as typeof setTimeout);
-});
+beforeEach(fastProviderRetryClock);
 afterEach(async () => { for (const cleanup of cleanups.splice(0).reverse()) await cleanup(); vi.restoreAllMocks(); });
 
 async function runtime(agentId: string, updates: SessionUpdate[], response: PromptResponse = { stopReason: "end_turn" }, typed = false) {
@@ -97,7 +93,6 @@ describe("ACP session notices", () => {
   }
 
   it("exhausts pre-update AIR retries through the actual SDK exchange, preserving the provider cause", async () => {
-    const backoff = providerRetryBackoff("overloaded")!;
     const { rt, logs, prompts } = await runtime("codex", [], failedResponse(rollout), true);
     const events: AgentEvent[] = [];
     rt.onEvent(event => { events.push(event); });
@@ -105,7 +100,7 @@ describe("ACP session notices", () => {
       message: rollout, data: { status: 400, errorKind: "overloaded" },
     });
     expect(events.filter(event => event.kind === "agent-text")).toEqual([]);
-    expect(prompts).toHaveLength(1 + backoff.length);
+    expect(prompts).toHaveLength(8);
     expect(logs.find(log => log.msg === "adapter error classified")).toMatchObject({ errorKind: "overloaded",
       errorMessage: rollout, errorStatus: 400 });
   });
@@ -121,7 +116,7 @@ describe("ACP session notices", () => {
     await expect(rt.prompt("go", undefined, { recoveryScope: "ephemeral" })).rejects.toMatchObject({ message: title,
       data: { errorKind: "overloaded" } });
     expect(events.filter(event => event.kind === "agent-text")).toEqual([]);
-    expect(prompts).toHaveLength(1 + providerRetryBackoff("overloaded")!.length);
+    expect(prompts).toHaveLength(8);
   });
 
   it("pauses quota with its exact notice and keeps typed auth on the existing reauth path", async () => {
@@ -133,6 +128,7 @@ describe("ACP session notices", () => {
       data: { errorKind: "quota_exhausted" } });
     expect(events.find(event => event.kind === "notice")).toMatchObject({ title: "Paused — quota or balance exhausted",
       description: expect.stringContaining(title) });
+    expect(quota.prompts).toHaveLength(2);
     const auth = await runtime("codex", [], failedResponse("Please sign in", "access", ["login"]));
     await expect(auth.rt.prompt("go", undefined, { recoveryScope: "ephemeral" })).rejects.toMatchObject({ name: "ReauthParked",
       message: "Please sign in" });

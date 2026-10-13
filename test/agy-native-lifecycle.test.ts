@@ -18,16 +18,12 @@ const alive = (pid: number): boolean => { try { process.kill(pid, 0); return tru
 
 vi.mock("../packages/core/src/core/recovery-directive.js", async importOriginal => {
   const actual = await importOriginal<typeof import("../packages/core/src/core/recovery-directive.js")>();
-  return { ...actual, runBoundedRecovery: (opts: Parameters<typeof actual.runBoundedRecovery>[0]) =>
-    actual.runBoundedRecovery({ ...opts, sleep: async ms => {
-      // Advance only backoff; native process deadlines and IO stay real.
-      vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
-      try {
-        const sleep = new Promise<void>(resolve => setTimeout(resolve, ms));
-        await vi.advanceTimersByTimeAsync(ms);
-        await sleep;
-      } finally { vi.useRealTimers(); }
-    } }) };
+  return { ...actual, runBoundedRecovery: (opts: Parameters<typeof actual.runBoundedRecovery>[0]) => {
+    let elapsed = 0;
+    // Advance recovery's clock only; native process deadlines and I/O stay real.
+    return actual.runBoundedRecovery({ ...opts, now: () => Date.now() + elapsed,
+      sleep: async ms => { elapsed += ms; } });
+  } };
 });
 
 async function fixture(timeoutSeconds = 10, fixtureLogger: Logger = logger, terminalFailures = false) {

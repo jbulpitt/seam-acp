@@ -7162,7 +7162,7 @@ export class Orchestrator {
         if (this.restartCutoff) throw DispatchSuspendedError.shutdown(attemptId, "shutdown interrupted the bridge wait");
         await onWaiting?.();
         assertCurrent?.();
-        const result = await waitUntilBridgeReady(hub, location, { deadlineMs: PROVIDER_RETRY_WINDOW_MS, signal });
+        const result = await waitUntilBridgeReady(hub, location, { deadlineMs: 15 * 60_000, signal });
         if (result === "timeout") {
           throw DispatchSuspendedError.defect(attemptId, `bridge "${location}" did not reconnect within 15 minutes`);
         }

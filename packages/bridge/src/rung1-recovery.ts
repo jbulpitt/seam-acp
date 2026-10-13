@@ -2,12 +2,12 @@ import { randomUUID } from "node:crypto";
 import {
   remoteRung1KindBackoff,
   remoteRung1Budget,
-  providerRetryBackoff,
-  PROVIDER_RETRY_WINDOW_MS,
+  providerRetryWindow,
   errorData,
   sessionFailureError,
   supportsSessionFailures,
   CodexReplyGate,
+  isSessionRecoveryProgress,
   type AdapterErrorKind,
   type RemoteRecoveryResult,
   type RemoteRecoverySnapshot,
@@ -128,14 +128,34 @@ export function createRung1Recovery(hooks: Rung1RecoveryHooks) {
       update: { sessionUpdate: "notice", severity: "warning", title, description } } })}\n`);
 
   const publish = (slot: number, state: ArmedRecovery, patch: Partial<RemoteRecoverySnapshot>): void => {
+    const kind = patch.errorKind ?? state.snapshot.errorKind;
+    const schedule = kind ? remoteRung1KindBackoff(state.policy, kind) ?? state.policy.backoffMs : undefined;
+    const window = kind && remoteRung1KindBackoff(state.policy, kind) ? providerRetryWindow(kind) : undefined;
+    const remaining = patch.phase === "exhausted" ? 0 : schedule
+      ? Math.max(window !== undefined ? 1 : 0, schedule.length - (state.kindRetries.get(kind!) ?? 0))
+      : Math.max(0, remoteRung1Budget(state.policy) - state.retry);
     state.snapshot = {
       ...state.snapshot,
       ...patch,
       retry: state.retry,
-      remaining: Math.max(0, state.snapshot.budget - state.retry),
+      budget: state.retry + remaining,
+      remaining,
       updatedUtc: new Date(now()).toISOString(),
     };
     hooks.publishSnapshot(slot, { ...state.snapshot });
+  };
+
+  const resetEpisode = (state: ArmedRecovery): void => {
+    state.retry = 0;
+    state.kindRetries.clear();
+    state.failureStartedMs = undefined;
+    state.snapshot.errorKind = undefined;
+  };
+
+  const progress = (slot: number, state: ArmedRecovery, update: unknown): void => {
+    if (state.snapshot.phase !== "retrying" || !isSessionRecoveryProgress(update)) return;
+    resetEpisode(state);
+    publish(slot, state, { phase: "executing", disposition: "none" });
   };
 
   const finish = (
@@ -148,6 +168,7 @@ export function createRung1Recovery(hooks: Rung1RecoveryHooks) {
     error?: string,
   ): void => {
     if (state.timer) clearTimeout(state.timer);
+    if (status === "completed") resetEpisode(state);
     publish(slot, state, { ...patch, disposition: "none" });
     state.result = {
       version: 1,
@@ -164,9 +185,7 @@ export function createRung1Recovery(hooks: Rung1RecoveryHooks) {
     hooks.publishResult(slot, { ...state.result });
   };
 
-  /** False when no retry is left for this kind; the caller then finishes the
-   * recovery AND forwards the error. A per-kind schedule can end before the
-   * overall budget (#626), and swallowing that error would hang the turn. */
+  /** False when this episode or finite schedule is exhausted; forward its cause. */
   const scheduleContinuation = (
     slot: number,
     state: ArmedRecovery,
@@ -174,15 +193,17 @@ export function createRung1Recovery(hooks: Rung1RecoveryHooks) {
     error: Error,
     terminal: JsonRpcRecord,
   ): boolean => {
-    const kindSchedule = remoteRung1KindBackoff(state.policy, kind);
+    const override = remoteRung1KindBackoff(state.policy, kind);
+    const kindSchedule = override ?? state.policy.backoffMs;
+    const window = override ? providerRetryWindow(kind) : undefined;
     const kindRetry = state.kindRetries.get(kind) ?? 0;
-    let delay = kindSchedule ? kindSchedule[kindRetry] : state.policy.backoffMs[state.retry];
+    let delay = kindSchedule[window === undefined ? kindRetry : Math.min(kindRetry, kindSchedule.length - 1)];
     if (delay === undefined || !state.policy.retryableErrorKinds.includes(kind)) return false;
-    state.failureStartedMs ??= now();
-    if (providerRetryBackoff(kind)) {
-      const remaining = PROVIDER_RETRY_WINDOW_MS - (now() - state.failureStartedMs);
+    if (window !== undefined) {
+      state.failureStartedMs ??= now();
+      const remaining = window - (now() - state.failureStartedMs);
       if (remaining <= 0) return false;
-      delay = Math.min(delay, remaining - 1);
+      delay = Math.min(delay, remaining);
     }
     state.retry += 1;
     state.kindRetries.set(kind, kindRetry + 1);
@@ -195,7 +216,7 @@ export function createRung1Recovery(hooks: Rung1RecoveryHooks) {
     notice(slot, state.acpSessionId, `Retrying provider failure — attempt ${state.retry} in ${delay / 1000}s`, error.message);
     state.timer = setTimeout(() => {
       state.timer = undefined;
-      if (providerRetryBackoff(kind) && now() - state.failureStartedMs! >= PROVIDER_RETRY_WINDOW_MS) {
+      if (window !== undefined && now() - state.failureStartedMs! >= window) {
         finish(slot, state, "failed", { phase: "exhausted", terminalReason: "budget_exhausted", errorKind: kind }, undefined, error.message);
         hooks.publishOutput?.(slot, `${JSON.stringify({ ...terminal, id: state.originalRequestId })}\n`);
         return;
@@ -327,10 +348,17 @@ export function createRung1Recovery(hooks: Rung1RecoveryHooks) {
           if (!text) return { forward: null };
           const params = record(message.params)!;
           const update = record(params.update)!;
+          progress(slot, state, { ...update, content: { ...record(update.content), text } });
           return { forward: `${JSON.stringify({ ...message, params: { ...params,
             update: { ...update, content: { ...record(update.content), text } } } })}\n` };
         }
+        progress(slot, state, record(message.params)?.update);
         return { forward: line };
+      }
+
+      const params = record(message.params);
+      if (message.method === "session/update" && params?.sessionId === state.acpSessionId) {
+        progress(slot, state, params.update);
       }
 
       if (!terminalFor(message, state.activeRequestId)) return { forward: line };
@@ -370,12 +398,11 @@ export function createRung1Recovery(hooks: Rung1RecoveryHooks) {
 
       const error = errorForClassification(message);
       const kind = hooks.classify(slot, error);
-      const shouldRetry = state.retry < state.snapshot.budget
-        && state.policy.retryableErrorKinds.includes(kind)
+      const shouldRetry = state.policy.retryableErrorKinds.includes(kind)
         && !errorData(error)?.continuationUnavailable;
       if (shouldRetry && scheduleContinuation(slot, state, kind, error, message)) return { forward: null };
       if (kind === "quota_exhausted") notice(slot, state.acpSessionId,
-        "Paused — quota or balance exhausted", `${error.message}\nRetry after the reset or top-up; no automatic retries.`);
+        "Paused — quota or balance exhausted", `${error.message}\nRetry after the reset or top-up; no further automatic retries.`);
       finish(slot, state, "failed", {
         phase: "exhausted",
         terminalReason: "budget_exhausted",

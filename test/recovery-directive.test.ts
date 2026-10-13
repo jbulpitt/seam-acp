@@ -4,7 +4,7 @@ import { DEFAULT_ERROR_RULES } from "../packages/core/src/core/error-resolution-
 import { buildRecoveryDirective, runBoundedRecovery } from "../packages/core/src/core/recovery-directive.js";
 
 describe("#448 wire directive and mechanical bounded owner", () => {
-  it.each(["overloaded", "server_error"] as const)("extends only %s using the existing rung-1 directive", kind => {
+  it.each(["overloaded", "server_error", "rate_limit", "timeout", "protocol_error", "unclassified"] as const)("uses the provider schedule for %s in the existing rung-1 directive", kind => {
     const directive = buildRecoveryDirective(resolveError({ errorKind: kind, agentId: "codex" }, DEFAULT_ERROR_RULES), "conversation");
     expect(directive.steps[0]).toMatchObject({ rung: 1, retryCount: 5, backoffMs: providerRetryBackoff(kind) });
   });
@@ -29,7 +29,7 @@ describe("#448 wire directive and mechanical bounded owner", () => {
     expect(JSON.parse(JSON.stringify(directive))).toEqual(directive);
     expect(directive).toMatchObject({ version: 1, startRung: 1, surface: true, tier: verdict.tier, optionCount: 2 });
     expect(directive.steps).toEqual([
-      { rung: 1, retryCount: 3, backoffMs: [2000, 5000, 10000], optionIds: [] },
+      { rung: 1, retryCount: 5, backoffMs: [10000, 30000, 120000, 300000, 420000], optionIds: [] },
       { rung: 2, retryCount: 1, backoffMs: [0], optionIds: ["model:precomputed-fallback"] },
       { rung: 3, retryCount: 1, backoffMs: [0], optionIds: ["session:reattach"] },
       { rung: 4, retryCount: 1, backoffMs: [0], optionIds: [] },
@@ -58,13 +58,16 @@ describe("#448 wire directive and mechanical bounded owner", () => {
     expect(directive.steps).toEqual(buildRecoveryDirective(verdict, "conversation").steps);
   });
 
-  it("a changed failure cannot replenish the first budget", async () => {
-    const run = vi.fn().mockRejectedValue(new Error("still failed"));
+  it("a changed kind gets its own plan instead of the first kind's count cap", async () => {
+    const cause = Object.assign(new Error("still failed"), { data: { agentId: "codex", errorKind: "protocol_error" } });
+    const run = vi.fn().mockRejectedValueOnce(Object.assign(new Error("overloaded"), {
+      data: { agentId: "codex", errorKind: "overloaded" },
+    })).mockRejectedValue(cause);
     const sleep = vi.fn().mockResolvedValue(undefined);
     const delays = vi.fn().mockReturnValueOnce([1]).mockReturnValue([1, 2, 3]);
     await expect(runBoundedRecovery({ run, delays, sleep })).rejects.toThrow("still failed");
-    expect(run).toHaveBeenCalledTimes(2);
-    expect(sleep).toHaveBeenCalledExactlyOnceWith(1);
+    expect(run).toHaveBeenCalledTimes(5);
+    expect(sleep.mock.calls).toEqual([[1], [1], [2], [3]]);
   });
 
   it("a changed failure can stop recovery immediately", async () => {

@@ -5,7 +5,7 @@ import type {
   RemoteRecoverySnapshot,
   RemoteRung1Policy,
 } from "@seam/adapters";
-import { isRemoteRung1Policy, classifyClaudeError, classifyCodexError, providerRetryBackoff, PROVIDER_RETRY_WINDOW_MS } from "@seam/adapters";
+import { isRemoteRung1Policy, classifyClaudeError, classifyCodexError, PROVIDER_RETRY_WINDOW_MS } from "@seam/adapters";
 import { createRung1Recovery } from "../packages/bridge/src/rung1-recovery.js";
 import { DEFAULT_REMOTE_RUNG1_POLICY } from "../packages/core/src/core/remote-spawn.js";
 
@@ -110,18 +110,20 @@ describe("#467 bridge-owned rung 1", () => {
     const h = harness({ codex: true, policy: DEFAULT_REMOTE_RUNG1_POLICY, clock: Date.now });
     sendCodex(h);
     let id: string | number = 17;
-    for (const delay of providerRetryBackoff("overloaded")!) {
+    for (const delay of [10_000, 30_000, 120_000, 300_000, 420_000, 420_000, 420_000]) {
       expect(h.recovery.observeOutput(4, typedFailure(id))).toEqual({ forward: null });
       await vi.advanceTimersByTimeAsync(delay);
       id = JSON.parse(h.writes.at(-1)!).id;
     }
-    const forwarded = JSON.parse(h.recovery.observeOutput(4, typedFailure(id)).forward!);
+    expect(h.recovery.observeOutput(4, typedFailure(id)).forward).toBeNull();
+    await vi.advanceTimersByTimeAsync(80_000);
+    const forwarded = JSON.parse(h.output.at(-1)!);
     expect(forwarded).toMatchObject({ id: 17, error: { message: rollout, data: { status: 400 } } });
     expect(h.results).toEqual([expect.objectContaining({ status: "failed", error: rollout, errorKind: "overloaded", text: "" })]);
     expect(h.recovery.terminalResult(4)).toEqual(h.results[0]);
-    expect(h.recovery.snapshot(4)).toMatchObject({ phase: "exhausted", retry: 5, budget: 5, remaining: 0 });
+    expect(h.recovery.snapshot(4)).toMatchObject({ phase: "exhausted", retry: 8, budget: 8, remaining: 0 });
     await vi.advanceTimersByTimeAsync(PROVIDER_RETRY_WINDOW_MS);
-    expect(h.writes).toHaveLength(5);
+    expect(h.writes).toHaveLength(7);
   });
 
   it("counts time spent failing, not just sleeps, against the provider horizon", async () => {
@@ -179,7 +181,6 @@ describe("#467 bridge-owned rung 1", () => {
   });
 
   it.each([
-    ["quota_exhausted", "limit", [], "You've hit your usage limit"],
     ["auth_required", "access", ["login"], "provider authentication expired"],
   ] as const)("does not retry typed %s", (kind, category, actions, title) => {
     const h = harness({ codex: true, policy: DEFAULT_REMOTE_RUNG1_POLICY });
@@ -312,7 +313,7 @@ describe("#467 bridge-owned rung 1", () => {
 
     // A fresh controller can still prove and adopt this exact terminal result
     // after live socket delivery or an output-log acknowledgement.
-    expect(h.recovery.snapshot(4)).toMatchObject({ phase: "succeeded", retry: 1 });
+    expect(h.recovery.snapshot(4)).toMatchObject({ phase: "succeeded", retry: 0 });
     expect(h.recovery.terminalResult(4)).toEqual(h.results[0]);
     const publicRecord = JSON.stringify({ snapshots: h.snapshots, results: h.results, writes: h.writes });
     expect(publicRecord).not.toContain(secret);
@@ -406,7 +407,7 @@ describe("#626 auth_contention waits out Claude's stale refresh lock", () => {
       params: { sessionId: `session-${slot}`, prompt: [{ type: "text", text: "wake prompt" }] } }));
   }
 
-  it("retries once, only after the 60s stale window, under the production policy", async () => {
+  it("retries three times at 60s under the production auth-contention policy", async () => {
     vi.useFakeTimers();
     const h = harness({ kind: "auth_contention", policy: DEFAULT_REMOTE_RUNG1_POLICY });
     armAndSend(h, 5);
@@ -418,21 +419,21 @@ describe("#626 auth_contention waits out Claude's stale refresh lock", () => {
     expect(h.writes).toEqual([]);
     await vi.advanceTimersByTimeAsync(1);
     expect(h.writes).toHaveLength(1);
-    const retry = JSON.parse(h.writes[0]!) as { id: string };
-
-    // Once: a second contention is surfaced, not retried again.
-    expect(JSON.parse(failPrompt(h, 5, retry.id).forward!)).toMatchObject({ id: 17 });
-    await vi.advanceTimersByTimeAsync(120_000);
-    expect(h.writes).toHaveLength(1);
-    expect(h.recovery.snapshot(5)).toMatchObject({ phase: "exhausted", errorKind: "auth_contention", retry: 1 });
+    for (let index = 0; index < 2; index++) {
+      expect(failPrompt(h, 5, JSON.parse(h.writes.at(-1)!).id).forward).toBeNull();
+      await vi.advanceTimersByTimeAsync(60_000);
+    }
+    expect(JSON.parse(failPrompt(h, 5, JSON.parse(h.writes.at(-1)!).id).forward!)).toMatchObject({ id: 17 });
+    expect(h.writes).toHaveLength(3);
+    expect(h.recovery.snapshot(5)).toMatchObject({ phase: "exhausted", errorKind: "auth_contention", retry: 3 });
   });
 
-  it("leaves unrelated kinds on the existing 2s/5s/10s schedule", async () => {
+  it("uses the provider schedule for protocol failures", async () => {
     vi.useFakeTimers();
     const h = harness({ kind: "protocol_error", policy: DEFAULT_REMOTE_RUNG1_POLICY });
     armAndSend(h, 6);
     expect(failPrompt(h, 6, 17)).toEqual({ forward: null });
-    await vi.advanceTimersByTimeAsync(2_000);
+    await vi.advanceTimersByTimeAsync(10_000);
     expect(h.writes).toHaveLength(1);
   });
 

@@ -7,12 +7,9 @@ import type { ClaudeCredentialFacts } from "../packages/core/src/core/claude-oau
 import { DEFAULT_ERROR_RULES } from "../packages/core/src/core/error-resolution-rules.js";
 import { isRetryableBootAcquisitionError } from "../packages/core/src/core/dispatch/acquisition-phase.js";
 import type { Logger } from "../packages/core/src/lib/logger.js";
+import { fastProviderRetryClock } from "./helpers/provider-retry-clock.js";
 
-beforeEach(() => {
-  const timeout = globalThis.setTimeout;
-  vi.spyOn(globalThis, "setTimeout").mockImplementation(((fn: () => void, ms?: number) =>
-    timeout(fn, [2000, 5000, 10000].includes(ms ?? 0) ? 0 : ms)) as typeof setTimeout);
-});
+beforeEach(fastProviderRetryClock);
 afterEach(() => vi.restoreAllMocks());
 
 function fixture(error: unknown, classifyError?: AgentProfile["classifyError"], agentId = "claude",
@@ -70,7 +67,7 @@ describe("#441 real runtime boundary to pure resolver (no providers)", () => {
       expect.objectContaining({ agentId: "claude", errorKind: "rate_limit", operation: "session/prompt",
         errorMessage: original.message, errorCode: -32603, errorStatus: null, errorData: { trace: "retained" } }),
       "adapter error classified");
-    expect(prompt).toHaveBeenCalledTimes(4);
+    expect(prompt).toHaveBeenCalledTimes(8);
   });
 
   it.each(["missing", "unrecognized", "throws"] as const)("%s classifier is attributable unclassified, not invisible", async (mode) => {
@@ -211,7 +208,7 @@ describe("#487 child-owner health precedes the recovery verdict", () => {
     expect(thrown.data.details).toContain("bridge slot 7 is alive");
     expect(resolveError(readErrorClassification(thrown)!, DEFAULT_ERROR_RULES).errorKind).toBe("protocol_error");
     expect(h.sendCmd).toHaveBeenCalledExactlyOnceWith("listSlots", {});
-    expect(h.prompt).toHaveBeenCalledTimes(4);
+    expect(h.prompt).toHaveBeenCalledTimes(8);
     expect(h.logger.warn).toHaveBeenCalledWith(expect.objectContaining({ errorKind: "protocol_error", operation: "session/prompt" }), "adapter error classified");
     expect(h.logger.warn).not.toHaveBeenCalledWith(expect.objectContaining({ errorKind: "agent_exit" }), "adapter error classified");
   });

@@ -1,4 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
+import { fastProviderRetryClock } from "./helpers/provider-retry-clock.js";
 import { AgentRuntime, type AgentEvent } from "../packages/core/src/agents/agent-runtime.js";
 import type { AgentProfile } from "@seam/adapters";
 import { logger } from "../packages/core/src/lib/logger.js";
@@ -256,15 +257,13 @@ describe("AgentRuntime resume-replay suppression", () => {
   });
 
   it("cold resume whose turn ERRORS (RPC rejects) also drops the held buffer (#64/#67)", async () => {
-    const timeout = globalThis.setTimeout;
-    vi.spyOn(globalThis, "setTimeout").mockImplementation(((fn: () => void, ms?: number) =>
-      timeout(fn, [2000, 5000, 10000].includes(ms ?? 0) ? 0 : ms)) as typeof setTimeout);
+    fastProviderRetryClock();
     const prompt = vi.spyOn(h.conn, "prompt");
     await h.rt.loadSession({ sessionId: "s9", cwd: "/tmp" });
     h.conn.promptShouldReject = true;
     h.conn.promptUpdates = [agentChunk("STALE held content before the crash.")];
     await expect(h.rt.prompt(PROMPT, undefined, { recoveryScope: "ephemeral" })).rejects.toBeTruthy();
-    expect(prompt).toHaveBeenCalledTimes(4);
+    expect(prompt).toHaveBeenCalledTimes(8);
     // No stopReason ever resolved ⇒ treated as abnormal ⇒ buffer dropped.
     expect(h.agentText()).toEqual([]);
   });

@@ -2714,7 +2714,7 @@ describe("SeamMcpServer", () => {
     // The receipt describes next-turn priority, not cancellation or completion.
     const text = body.result.content[0].text as string;
     expect(text).toContain("next-turn directive disp-int-1 for thread thread-caller");
-    expect(text).toContain("session KEPT");
+    expect(text).toContain("Session KEPT");
     expect(text).toContain("Running work is not cancelled");
   });
 

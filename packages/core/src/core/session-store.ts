@@ -1190,6 +1190,29 @@ export class SessionStore {
     for (const listener of this.sessionWrites) listener({ ...committed });
   }
 
+  async backup(file: string): Promise<void> {
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    await this.db.backup(file);
+  }
+
+  /** Replace an empty launcher root and rebind the retained conversation in one transaction. */
+  moveChannel(source: SessionRecord, destination: SessionRecord, actor: { id: string | null; name: string | null },
+    selection?: Pick<SessionRecord, "agentId" | "repoPath" | "configJson">): void {
+    this.db.transaction(() => {
+      if (JSON.stringify(this.get(source.id)) !== JSON.stringify(source)) throw new Error(`Source ${source.id} changed before move.`);
+      if (JSON.stringify(this.get(destination.id)) !== JSON.stringify(destination) || destination.acpSessionId) {
+        throw new Error(`Destination ${destination.id} changed or is not empty.`);
+      }
+      this.removeMisfiledSession(destination.id, {
+        id: randomUUID(), tier: "session", scope: source.id, actorId: actor.id, actorName: actor.name,
+        summary: "Operator move to Google Chat session Space", beforeJson: JSON.stringify({ source, destination }),
+        afterJson: JSON.stringify({ ...source, ...selection, channelRef: destination.channelRef, parentRef: null }),
+      });
+      if (selection) this.upsert({ ...source, ...selection });
+      this.rebindChannel(source.id, destination.channelRef, null);
+    })();
+  }
+
   /** Atomically supersede every conflicting open request and publish a new one. */
   replaceOpenElicitation(row: NewElicitationRow): ElicitationRow[] {
     return this.db.transaction((input: NewElicitationRow) => {

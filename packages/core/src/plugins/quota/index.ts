@@ -23,7 +23,7 @@ export interface QuotaPorts {
 }
 const schema = z.object({ DISCORD_AGENT_QUOTA_THREAD_ID: z.string().optional(), QUOTA_STALE_RETENTION_MS: z.number().nonnegative(), OLLAMA_CLOUD_ENABLED: z.boolean() });
 
-export function createQuotaPlugin(ports: QuotaPorts): Plugin {
+export function createQuotaPlugin(ports: QuotaPorts): Plugin & { refreshBindings(): Promise<void> } {
   const registry = new QuotaRegistry();
   let poller: AgentQuotaPoller;
   let card: AgentQuotaCard | undefined;
@@ -48,20 +48,25 @@ export function createQuotaPlugin(ports: QuotaPorts): Plugin {
     lastClick = Date.now();
     const result = await poller.refreshAll(true);
     const timedOut = result.sources.filter(source => source.outcome === "timed_out");
-    const unavailable = result.sources.filter(source => source.outcome === "unavailable");
+    const unavailable = result.sources.filter(source => source.outcome === "unavailable" || source.quota.stale);
     await event.followUpEphemeral(timedOut.length
       ? `Usage refresh timed out after ${result.timeoutMs / 1000}s for ${timedOut.map(source => source.displayName).join(", ")}. Other agents refreshed normally; any last-known-good values were retained.`
       : unavailable.length ? `Usage refreshed with ${unavailable.length} unavailable source${unavailable.length === 1 ? "" : "s"}; other agents and retained values remain available.`
       : `Usage refreshed (${result.sources.length} agents).`);
   };
   return {
+    refreshBindings: async () => {
+      if (!ready) return;
+      await poller.refreshAll(true);
+      await card?.tick();
+    },
     id: "quota", apiVersion: 1, builtin: true, internal: true,
     validateConfig: config => schema.parse(config),
     activate: context => {
       const config = schema.parse(context.config);
       threadId = config.DISCORD_AGENT_QUOTA_THREAD_ID;
       ollamaEnabled = config.OLLAMA_CLOUD_ENABLED;
-      poller = new AgentQuotaPoller({ logger: context.logger, registry, sources: createQuotaSources(ports.bindings(), ports.usage),
+      poller = new AgentQuotaPoller({ logger: context.logger, registry, sources: () => createQuotaSources(ports.bindings(), ports.usage),
         staleRetentionMs: config.QUOTA_STALE_RETENTION_MS, onUpdate: () => { if (ready) card?.poke(); } });
       if (threadId) {
         if (!context.storage) throw new Error("Quota card requires plugin storage.");
@@ -77,7 +82,7 @@ export function createQuotaPlugin(ports: QuotaPorts): Plugin {
       mcp: quotaMcp(registry, ports.agents),
       components: [{ namespace: "seam-quota:", types: ["button"], lifetime: "persistent", access: "read-only", authorization: "user", acknowledgement: "update", handle: component }],
       turnActivity: [
-        { event: "turn-started", handle: event => { poller.recordTurnStart(event.binding.agentId, event.timestampMs); } },
+        { event: "turn-started", handle: event => { poller.recordTurnStart(event.binding.agentId, event.timestampMs, event.binding.location); } },
         { event: "turn-completed", handle: async event => { if (ready) await poller.turnCompleted(event.binding.agentId, event.binding); } },
       ],
       jobs: [{ name: "poll", phase: "after-admission", intervalMs: quotaPollIntervalMs(0),

@@ -1,29 +1,26 @@
 import {
   fetchAgyUserStatus, fetchClaudeUsage, fetchCodexUsage, fetchCopilotUsage,
   fetchGrokUsage, fetchGrokUsageFromConnection, fetchOllamaCloudUsage,
-  type AgentProfile, type AgyLaunchRuntime,
+  readAccountUsage, accountUsageProvider,
+  type AccountUsageProfile, type ProviderUsage, type AgyLaunchRuntime,
 } from "@seam/adapters";
 import type { TurnBinding } from "../../plugins/turn-activity-registry.js";
 import { isOllamaCloudAgentId } from "../parked-agents.js";
 
-export type ProviderUsage =
-  | { provider: "agy"; data: Awaited<ReturnType<typeof fetchAgyUserStatus>> }
-  | { provider: "claude"; data: Awaited<ReturnType<typeof fetchClaudeUsage>> }
-  | { provider: "codex"; data: Awaited<ReturnType<typeof fetchCodexUsage>> }
-  | { provider: "copilot"; data: Awaited<ReturnType<typeof fetchCopilotUsage>> }
-  | { provider: "grok"; data: Awaited<ReturnType<typeof fetchGrokUsage>> }
-  | { provider: "ollama-cloud"; data: Awaited<ReturnType<typeof fetchOllamaCloudUsage>> };
+export type { ProviderUsage } from "@seam/adapters";
 export interface UsageBinding extends TurnBinding {
   displayName: string;
   provider: ProviderUsage["provider"] | null;
   quotaAvailable: boolean;
+  quotaLocation?: string;
+  host?: string;
+  trackingUnavailable?: string;
 }
 export interface UsageProviderPort {
   readUsage(binding: Readonly<TurnBinding>, signal?: AbortSignal): Promise<ProviderUsage>;
 }
 
-export type QuotaProfile = Pick<AgentProfile, "id" | "displayName"> &
-  Pick<Partial<AgentProfile>, "configDir" | "runtime" | "accountUsage" | "brand">;
+export type QuotaProfile = AccountUsageProfile;
 
 /** Internal tier: account readers and live quota connections, never turn launchers. */
 export function createUsageProviderPort(options: {
@@ -33,40 +30,46 @@ export function createUsageProviderPort(options: {
   ollamaUsageCliPath?: string;
   ollamaCloudEnabled?: boolean;
   liveRequest?: (sessionId: string) => ((method: string, params?: unknown) => Promise<unknown>) | undefined;
+  controllerHost?: string;
+  separateBindings?: () => Iterable<{ agentId: string; location: string }>;
+  hostUsage?: { supports(location: string): boolean | undefined; read(location: string, agentId: string): Promise<ProviderUsage> };
 }): UsageProviderPort & { bindings(): readonly Readonly<UsageBinding>[]; binding(agentId: string, sessionId?: string, location?: string): Readonly<UsageBinding> } {
   const profiles = new Map(options.profiles.map(profile => [profile.id, profile]));
   const binding = (agentId: string, sessionId?: string, location = "local"): Readonly<UsageBinding> => {
     const profile = profiles.get(agentId);
-    const provider = agentId === "agy" ? "agy"
-      : isOllamaCloudAgentId(agentId) ? "ollama-cloud"
-      : (["claude", "codex", "copilot", "grok"] as const).find(id => agentId === id || agentId.startsWith(`${id}-`)) ?? null;
+    const provider = accountUsageProvider(agentId);
+    const separate = [...(options.separateBindings?.() ?? [])].some(b => b.agentId === agentId && b.location === location);
+    const unsupported = options.hostUsage?.supports(location) === false;
     return Object.freeze({ agentId, displayName: profile?.displayName ?? agentId, location,
       account: profile?.runtime?.credentialScope ?? agentId, ...(sessionId ? { sessionId } : {}), provider,
       quotaAvailable: provider !== null && !(provider === "claude" && profile?.brand),
+      ...(separate && !unsupported ? { quotaLocation: location, host: location } : options.controllerHost ? { host: options.controllerHost } : {}),
     });
   };
   return {
     binding,
-    bindings: () => [...profiles.keys()].filter(id => options.ollamaCloudEnabled !== false || !isOllamaCloudAgentId(id)).map(id => binding(id)),
+    bindings: () => {
+      const separate = [...(options.separateBindings?.() ?? [])];
+      const globals = [...profiles.keys()].filter(id => options.ollamaCloudEnabled !== false || !isOllamaCloudAgentId(id)).map(id => {
+        const unavailable = separate.filter(b => b.agentId === id && options.hostUsage?.supports(b.location) === false);
+        // Global rows remain global even when local is explicitly separated.
+        return { ...binding(id), quotaLocation: undefined, host: options.controllerHost,
+          ...(unavailable.length ? { trackingUnavailable: `Separate tracking unavailable for ${unavailable.map(b => b.location).join(", ")}: bridge does not support account usage RPC; global tracking applies` } : {}) };
+      });
+      return [...globals, ...separate.filter(b => options.hostUsage?.supports(b.location) !== false).map(b => binding(b.agentId, undefined, b.location))];
+    },
     readUsage: async (target, signal) => {
-      const selected = binding(target.agentId, target.sessionId, target.location);
-      const profile = profiles.get(target.agentId);
-      switch (selected.provider) {
-        case "agy":
-          if (!options.agyRuntime) throw new Error("native agy quota requires the configured verified runtime");
-          return { provider: "agy", data: await fetchAgyUserStatus(options.agyRuntime, signal) };
-        case "ollama-cloud":
-          return { provider: "ollama-cloud", data: await fetchOllamaCloudUsage(options.ollamaUsageCliPath, signal) };
-        case "claude": return { provider: "claude", data: await fetchClaudeUsage(profile?.configDir) };
-        case "codex": return { provider: "codex", data: await (profile?.accountUsage
-          ? profile.accountUsage(signal) : fetchCodexUsage({ signal })) };
-        case "copilot": return { provider: "copilot", data: await fetchCopilotUsage(profile?.configDir, signal) };
-        case "grok": {
-          const request = target.sessionId ? options.liveRequest?.(target.sessionId) : undefined;
-          return { provider: "grok", data: request ? await fetchGrokUsageFromConnection(request, signal) : await fetchGrokUsage(options.grokCliPath, signal) };
-        }
-        default: throw new Error(`Agent '${target.agentId}' does not expose usage data`);
+      const selected = "quotaLocation" in target ? target as UsageBinding : binding(target.agentId, target.sessionId, target.location);
+      if (selected.quotaLocation) {
+        if (!options.hostUsage) throw new Error(`Host usage reader unavailable for ${target.agentId}@${selected.quotaLocation}`);
+        return options.hostUsage.read(selected.quotaLocation, target.agentId);
       }
+      const request = accountUsageProvider(target.agentId) === "grok" && target.sessionId ? options.liveRequest?.(target.sessionId) : undefined;
+      const result = await readAccountUsage({ agentId: target.agentId, profile: profiles.get(target.agentId), signal,
+        agyRuntime: options.agyRuntime, grokCliPath: options.grokCliPath, ollamaUsageCliPath: options.ollamaUsageCliPath,
+        request },
+        { fetchAgyUserStatus, fetchClaudeUsage, fetchCodexUsage, fetchCopilotUsage, fetchGrokUsage, fetchGrokUsageFromConnection, fetchOllamaCloudUsage });
+      return options.controllerHost ? { ...result, host: request ? target.location : options.controllerHost } : result;
     },
   };
 }

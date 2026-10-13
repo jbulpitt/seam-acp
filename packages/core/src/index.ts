@@ -1,4 +1,5 @@
 import path from "node:path";
+import { hostname } from "node:os";
 import {
   makeTestDispatchHandler,
   makeTestInteractionHandler,
@@ -530,13 +531,26 @@ async function main(): Promise<void> {
     } }], { "service-status": config });
   }
 
+  let refreshQuotaBindings: (() => Promise<void>) | undefined;
   await plugins.loadBuiltins([{ id: "quota", load: async () => {
     const { createUsageProviderPort } = await import("./core/quota/usage-provider.js");
     const { createQuotaPlugin } = await import("./plugins/quota/index.js");
+    const { QUOTA_SOURCE_TIMEOUT_MS } = await import("./core/quota/quota-registry.js");
     const usage = createUsageProviderPort({ profiles: quotaProfiles.profiles, agyRuntime: quotaProfiles.agyRuntime, grokCliPath: config.GROK_CLI_PATH,
       ollamaUsageCliPath: config.OLLAMA_USAGE_CLI_PATH, ollamaCloudEnabled: config.OLLAMA_CLOUD_ENABLED,
-      liveRequest: id => { const runtime = router.getRuntime(id); return runtime ? (method, params) => runtime.request(method, params) : undefined; } });
-    return createQuotaPlugin({ usage, bindings: usage.bindings,
+      liveRequest: id => { const runtime = router.getRuntime(id); return runtime ? (method, params) => runtime.request(method, params) : undefined; },
+      controllerHost: hostname(),
+      separateBindings: () => [...(config.quotaTracking ?? [])].map(([key]) => {
+        const at = key.lastIndexOf("@"); return { agentId: key.slice(0, at), location: key.slice(at + 1) };
+      }),
+      hostUsage: {
+        supports: location => { const bridge = bridgeHub?.get(location); return bridge ? bridge.capabilities?.accountUsage === true : undefined; },
+        read: (location, agentId) => {
+          if (!bridgeHub) throw new Error(`bridge "${location}" is not connected`);
+          return bridgeHub.rpc(location, "readAccountUsage", { agentId }, undefined, { timeoutMs: QUOTA_SOURCE_TIMEOUT_MS }) as Promise<import("@seam/adapters").ProviderUsage>;
+        },
+      } });
+    const plugin = createQuotaPlugin({ usage, bindings: usage.bindings,
       agents: () => (bridgeHub?.listConnected() ?? []).flatMap(bridge => [...bridge.agents].map(([id, info]) => ({
         id, displayName: info.metadata?.displayName ?? id, brand: info.metadata?.brand,
       }))),
@@ -550,6 +564,8 @@ async function main(): Promise<void> {
     }, card: { sendLayout: adapter.sendLayout.bind(adapter), editLayout: adapter.editLayout.bind(adapter),
       sendPanel: adapter.sendPanel.bind(adapter), editPanel: adapter.editPanel.bind(adapter),
       pinMessage: adapter.pinMessage.bind(adapter), deleteMessage: adapter.deleteMessage.bind(adapter), bumpThread: adapter.bumpThread.bind(adapter) } });
+    refreshQuotaBindings = plugin.refreshBindings;
+    return plugin;
   } }], { quota: config });
 
   const orchestrator = new Orchestrator({
@@ -563,6 +579,7 @@ async function main(): Promise<void> {
     renderer,
     modelCatalog,
     refreshModelIntelligence: (forceSources) => modelIntelligenceManager.refresh({ forceSources }),
+    refreshQuotaBindings: () => refreshQuotaBindings?.() ?? Promise.resolve(),
   });
 
   googleChat?.setCommandDeps({ store, router, mutation: orchestrator.getConfigMutation(), runtimeTransition: orchestrator.getRuntimeTransition(),

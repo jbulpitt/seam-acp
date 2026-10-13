@@ -17,6 +17,9 @@ import {
   makeCodexProfile,
   makeCopilotProfile,
   makeGrokProfile,
+  readAccountUsage,
+  type AgyLaunchRuntime,
+  type ProviderUsage,
   type AgentAdapter,
   type CopilotCatalogLaunch,
   type CopilotCatalogProbe,
@@ -43,6 +46,7 @@ function commandExists(cmd: string): boolean {
 }
 
 export interface HostAdapterRuntimeOptions {
+  onAgyRuntime?: (runtime: AgyLaunchRuntime) => void;
   cwd?: string;
   turnTimeoutSeconds?: number;
   env?: NodeJS.ProcessEnv;
@@ -66,6 +70,7 @@ export interface HostAdapterRefusal {
 export interface HostAdapterInventory {
   adapters: Map<string, AgentAdapter>;
   adapterRefusals: HostAdapterRefusal[];
+  readAccountUsage(agentId: string): Promise<ProviderUsage>;
 }
 
 const AGY_NATIVE_REQUIREMENTS = [
@@ -287,8 +292,8 @@ export function loadHostAdapters(
       id: "agy",
       bin: agyUnpinned ? "agy" : agyNativeBin!,
       strict: true,
-      make: () => makeAgyProfile({
-        runtime: agyUnpinned
+      make: () => {
+        const runtime = agyUnpinned
           ? makeAgyUnpinnedRuntime({
               credentialScope: env.AGY_CREDENTIAL_SCOPE ?? "antigravity-oauth:default",
               cwd: options.cwd ?? process.cwd(),
@@ -302,11 +307,12 @@ export function loadHostAdapters(
               credentialScope: env.AGY_CREDENTIAL_SCOPE ?? "antigravity-oauth:default",
               cwd: options.cwd ?? process.cwd(),
               baseEnv: env,
-            }),
-        defaultModel: agyDefaultModel!,
-        staticModels: agyModels,
-        printTimeoutSeconds: options.turnTimeoutSeconds,
-      }),
+            });
+        const profile = makeAgyProfile({ runtime, defaultModel: agyDefaultModel!, staticModels: agyModels,
+          printTimeoutSeconds: options.turnTimeoutSeconds });
+        options.onAgyRuntime?.(runtime);
+        return profile;
+      },
     }] : []),
     {
       id: "codex",
@@ -388,14 +394,22 @@ export function loadHostAdapterInventory(
 ): HostAdapterInventory {
   const adapterRefusals: HostAdapterRefusal[] = [];
   const onAdapterUnavailable = options.onAdapterUnavailable;
+  let agyRuntime: AgyLaunchRuntime | undefined;
   const adapters = loadHostAdapters(copilotCmd, {
     ...options,
+    onAgyRuntime: runtime => { agyRuntime = runtime; options.onAgyRuntime?.(runtime); },
     onAdapterUnavailable: (refusal) => {
       adapterRefusals.push(refusal);
       onAdapterUnavailable?.(refusal);
     },
   });
-  return { adapters, adapterRefusals };
+  const env = options.env ?? process.env;
+  return { adapters, adapterRefusals, readAccountUsage: agentId => {
+    const profile = adapters.get(agentId);
+    if (!profile && agentId !== "ollama-cloud") throw new Error(`unknown agentId: ${agentId}`);
+    return readAccountUsage({ agentId, profile, agyRuntime, grokCliPath: env.GROK_CLI_PATH,
+      ollamaUsageCliPath: env.OLLAMA_USAGE_CLI_PATH });
+  } };
 }
 
 export function inventoryFromAdapters(

@@ -15,6 +15,7 @@ import {
   QUOTA_STALE_RETENTION_MS,
   QuotaRegistry,
   quotaPollIntervalMs,
+  quotaKey,
 } from "./quota-registry.js";
 
 export interface AgentQuotaSource extends QuotaAgentIdentity {
@@ -74,11 +75,12 @@ export class AgentQuotaPoller {
   private readonly sourceTimeoutMs: number;
   private onUpdate?: (quota: AgentQuota) => void;
   private started = false;
+  private readonly sourceFactory?: () => AgentQuotaSource[];
 
   constructor(opts: {
     logger: Pick<Logger, "child">;
     registry: QuotaRegistry;
-    sources: AgentQuotaSource[];
+    sources: AgentQuotaSource[] | (() => AgentQuotaSource[]);
     onUpdate?: (quota: AgentQuota) => void;
     /** Keep last-known-good this long when reads return unavailable. */
     staleRetentionMs?: number;
@@ -90,7 +92,33 @@ export class AgentQuotaPoller {
     this.onUpdate = opts.onUpdate;
     this.staleRetentionMs = opts.staleRetentionMs ?? QUOTA_STALE_RETENTION_MS;
     this.sourceTimeoutMs = opts.sourceTimeoutMs ?? QUOTA_SOURCE_TIMEOUT_MS;
-    for (const source of opts.sources) this.sources.set(source.agentId, source);
+    this.sourceFactory = typeof opts.sources === "function" ? opts.sources : undefined;
+    this.updateSources(typeof opts.sources === "function" ? opts.sources() : opts.sources);
+  }
+
+  updateSources(sources: AgentQuotaSource[]): void {
+    const keys = new Set(sources.map(s => quotaKey(s.agentId, s.location)));
+    for (const key of this.sources.keys()) {
+      if (keys.has(key)) continue;
+      clearTimeout(this.timers.get(key));
+      this.timers.delete(key); this.timerFireAt.delete(key);
+      this.sources.delete(key); this.registry.delete(key);
+      this.lastRefreshAt.delete(key); this.lastGoodAt.delete(key); this.consecutiveFailures.delete(key);
+    }
+    for (const source of sources) {
+      const key = quotaKey(source.agentId, source.location), added = !this.sources.has(key);
+      this.sources.set(key, source);
+      if (added && source.location) this.registry.set({
+        ...mapUnavailableQuota({ agentId: source.agentId, displayName: source.displayName, location: source.location, host: source.host }, "Quota has not been fetched yet"),
+        fetchedAt: null,
+      });
+      if (added && this.started) { void this.refresh(key, undefined, true); this.schedule(key); }
+    }
+  }
+
+  private sourceKey(agentId: string, location?: string): string {
+    const separate = quotaKey(agentId, location);
+    return this.sources.has(separate) ? separate : agentId;
   }
 
   async start(): Promise<void> {
@@ -116,7 +144,9 @@ export class AgentQuotaPoller {
     this.onUpdate = onUpdate;
   }
 
-  recordTurnStart(agentId: string, startedAtMs = Date.now()): void {
+  recordTurnStart(agentId: string, startedAtMs = Date.now(), location?: string): void {
+    if (this.sourceFactory) this.updateSources(this.sourceFactory());
+    agentId = this.sourceKey(agentId, location);
     this.activity.record(agentId, startedAtMs);
     if (!this.started || !this.sources.has(agentId)) return;
     // Picking an agent back up after a lull: if its snapshot is already older
@@ -131,14 +161,16 @@ export class AgentQuotaPoller {
     this.schedule(agentId);
   }
 
-  turnsInLast10Min(agentId: string, nowMs = Date.now()): number {
-    return this.activity.turnsInLast10Min(agentId, nowMs);
+  turnsInLast10Min(agentId: string, nowMs = Date.now(), location?: string): number {
+    return this.activity.turnsInLast10Min(this.sourceKey(agentId, location), nowMs);
   }
 
   async turnCompleted(
     agentId: string,
     binding?: Readonly<TurnBinding>
   ): Promise<AgentQuota | undefined> {
+    if (this.sourceFactory) this.updateSources(this.sourceFactory());
+    agentId = this.sourceKey(agentId, binding?.location);
     const source = this.sources.get(agentId);
     if (!source?.eventDriven) return undefined;
     const quota = await this.refresh(agentId, binding);
@@ -153,12 +185,13 @@ export class AgentQuotaPoller {
    * snapshot fires onUpdate so the card re-renders with new timestamps.
    */
   async refreshAll(force = false): Promise<AgentQuotaRefreshSummary> {
+    if (this.sourceFactory) this.updateSources(this.sourceFactory());
     const startedAt = Date.now();
     const sources = await Promise.all(
       [...this.sources.keys()].map((agentId) => this.refreshResult(agentId, undefined, force))
     );
     const failures = sources.filter((source) =>
-      source.outcome === "unavailable" || source.outcome === "timed_out"
+      source.outcome === "unavailable" || source.outcome === "timed_out" || source.quota.stale
     ).length;
     return {
       outcome: failures === 0 ? "succeeded" : failures === sources.length ? "failed" : "mixed",
@@ -173,7 +206,7 @@ export class AgentQuotaPoller {
     binding?: Readonly<TurnBinding>,
     force = false
   ): Promise<AgentQuota | undefined> {
-    return (await this.refreshResult(agentId, binding, force))?.quota;
+    return (await this.refreshResult(this.sourceKey(agentId, binding?.location), binding, force))?.quota;
   }
 
   private async refreshResult(
@@ -183,12 +216,14 @@ export class AgentQuotaPoller {
   ): Promise<AgentQuotaRefreshResult> {
     const source = this.sources.get(agentId);
     if (!source) throw new Error(`Unknown quota source '${agentId}'`);
+    const identity = { agentId: source.agentId, displayName: source.displayName, location: source.location,
+      host: source.host, trackingUnavailable: source.trackingUnavailable };
     const pending = this.inFlight.get(agentId);
     if (pending) return pending;
     const now = Date.now();
     const previousAt = this.lastRefreshAt.get(agentId) ?? 0;
     if (!force && now - previousAt < QUOTA_MIN_REFRESH_MS) {
-      const quota = this.registry.get(agentId) ?? mapUnavailableQuota({ agentId, displayName: source.displayName }, "Quota has not been fetched yet");
+      const quota = this.registry.get(agentId) ?? mapUnavailableQuota(identity, "Quota has not been fetched yet");
       return {
         agentId: source.agentId,
         displayName: source.displayName,
@@ -244,7 +279,7 @@ export class AgentQuotaPoller {
         const message = timedOut
           ? `Quota refresh timed out after ${this.sourceTimeoutMs / 1000}s`
           : diagnostic.message;
-        quota = mapUnavailableQuota({ agentId, displayName: source.displayName }, message);
+        quota = { ...mapUnavailableQuota(identity, message), ...(source.location ? { fetchedAt: null } : {}) };
         this.logger.warn(
           { agentId, error: diagnostic, timeoutMs: timedOut ? this.sourceTimeoutMs : undefined },
           timedOut ? "agent quota refresh timed out" : "agent quota refresh failed"
@@ -252,7 +287,7 @@ export class AgentQuotaPoller {
       } finally {
         if (timeout) clearTimeout(timeout);
       }
-      const { quota: effective, changed } = this.applyResult(quota);
+      const { quota: effective, changed } = this.sources.has(agentId) ? this.applyResult(quota) : { quota, changed: false };
       if (changed) this.onUpdate?.(effective);
       const retained = !quota.ok && effective.ok;
       return {
@@ -300,25 +335,31 @@ export class AgentQuotaPoller {
     changed: boolean;
   } {
     const now = Date.now();
+    const key = quotaKey(fetched.agentId, fetched.location);
     if (fetched.ok) {
-      this.lastGoodAt.set(fetched.agentId, now);
-      this.consecutiveFailures.set(fetched.agentId, 0);
+      this.lastGoodAt.set(key, now);
+      this.consecutiveFailures.set(key, 0);
       this.registry.set(fetched);
       return { quota: fetched, changed: true };
     }
-    const previous = this.registry.get(fetched.agentId);
-    const goodAt = this.lastGoodAt.get(fetched.agentId) ?? 0;
+    const previous = this.registry.get(key);
+    const goodAt = this.lastGoodAt.get(key) ?? 0;
     if (previous?.ok && now - goodAt < this.staleRetentionMs) {
       this.logger.debug(
         { agentId: fetched.agentId, error: fetched.error, ageMs: now - goodAt },
         "quota read unavailable; retaining last-known-good value"
       );
       // Effective value is still good — no surfaced failure to fast-retry.
+      if (fetched.location) {
+        const stale = { ...previous, stale: true, liveError: fetched.error };
+        this.registry.set(stale);
+        return { quota: stale, changed: true };
+      }
       return { quota: previous, changed: false };
     }
     this.consecutiveFailures.set(
-      fetched.agentId,
-      (this.consecutiveFailures.get(fetched.agentId) ?? 0) + 1
+      key,
+      (this.consecutiveFailures.get(key) ?? 0) + 1
     );
     this.registry.set(fetched);
     return { quota: fetched, changed: true };
@@ -340,6 +381,8 @@ export class AgentQuotaPoller {
     const timer = setTimeout(async () => {
       this.timers.delete(agentId);
       this.timerFireAt.delete(agentId);
+      if (this.sourceFactory) this.updateSources(this.sourceFactory());
+      if (!this.sources.has(agentId)) return;
       await this.refresh(agentId);
       this.schedule(agentId);
     }, interval);

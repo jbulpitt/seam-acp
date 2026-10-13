@@ -49,8 +49,8 @@ export function renderQuotaPools(pools: QuotaPool[]): string {
 }
 
 export function renderAgentQuotaRow(quota: AgentQuota): string {
-  if (quota.noSubscription) return `No subscription · updated <t:${quota.fetchedAt}:R>`;
   const details = [
+    quota.noSubscription ? "No subscription" : "",
     quota.plan ? `plan ${quota.plan}` : "",
     quota.credits
       ? quota.credits.unlimited
@@ -64,12 +64,13 @@ export function renderAgentQuotaRow(quota: AgentQuota): string {
   // (idle agents as slow as hourly), so each row stamps its own snapshot time —
   // the card-level header only reflects the last *render*, not each agent's fetch.
   const meta = [
+    quota.location ? `host ${quota.host ?? quota.location}` : `global${quota.host ? ` · host ${quota.host}` : ""}`,
     details.join(" · ") || "plan/credits unavailable",
-    quota.source ? formatUsageObservation(quota.source) : `updated <t:${quota.fetchedAt}:R>`,
+    quota.source ? formatUsageObservation(quota.source) : quota.fetchedAt === null ? "reading age unknown" : `updated <t:${quota.fetchedAt}:R>`,
   ].join(" · ");
   return [
-    ...(quota.pools ? [renderQuotaPools(quota.pools)] : [quotaLine("rolling", quota.rolling), quotaLine("weekly", quota.weekly)]),
-    `${meta}${warning}${quota.liveError ? `\nLive read unavailable: ${quota.liveError}` : ""}`,
+    ...(quota.noSubscription ? [] : quota.pools ? [renderQuotaPools(quota.pools)] : [quotaLine("rolling", quota.rolling), quotaLine("weekly", quota.weekly)]),
+    `${quota.stale ? "Stale · " : ""}${meta}${warning}${quota.liveError ? `\nLive read unavailable: ${quota.liveError}` : ""}${quota.trackingUnavailable ? `\n${quota.trackingUnavailable}` : ""}`,
   ].join("\n");
 }
 
@@ -130,7 +131,7 @@ export function renderAgentQuotaLayout(
       });
       blocks.push({
         kind: "text",
-        content: `**${quota.displayName}** · \`${quota.agentId}\`\n${renderAgentQuotaRow(quota)}`,
+        content: `**${quota.displayName}** · \`${quota.agentId}${quota.location ? ` @ ${quota.location}` : ""}\`\n${renderAgentQuotaRow(quota)}`,
       });
     });
   }
@@ -151,7 +152,7 @@ export function renderAgentQuotaPanel(
       visibleQuotas.length === 0
         ? [{ name: "Agents", value: "_No configured agents._" }]
         : visibleQuotas.slice(0, 25).map((quota) => ({
-            name: `${quota.displayName} · ${quota.agentId}`.slice(0, 256),
+            name: `${quota.displayName} · ${quota.agentId}${quota.location ? ` @ ${quota.location}` : ""}`.slice(0, 256),
             value: renderAgentQuotaRow(quota).slice(0, 1024),
             inline: false,
           })),

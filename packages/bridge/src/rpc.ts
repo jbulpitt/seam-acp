@@ -18,6 +18,7 @@ import {
   type ModelFallbackPlan,
   type RemoteRung1Policy,
   type ThreadIdentity,
+  type ProviderUsage,
 } from "@seam/adapters";
 
 const HOST_EXEC_DEFAULT_TIMEOUT_MS = 30_000;
@@ -54,6 +55,7 @@ export interface RpcContext {
   workspaceRoot: string;
   cwd: string;
   configureSlot?: (slot: number, cfg: SlotSpawnConfig) => void;
+  readAccountUsage?: (agentId: string) => Promise<ProviderUsage>;
 }
 
 function asRecord(params: unknown): Record<string, unknown> {
@@ -250,6 +252,12 @@ async function dispatchHost(
   ctx: RpcContext
 ): Promise<unknown> {
   switch (method) {
+    case "readAccountUsage": {
+      const agentId = str(params.agentId);
+      if (!agentId) throw new Error("readAccountUsage requires agentId");
+      if (!ctx.readAccountUsage) throw new Error("Bridge account usage reader is unavailable");
+      return ctx.readAccountUsage(agentId);
+    }
     case "shell": {
       const command = str(params.command);
       if (!command) throw new Error("shell requires command");

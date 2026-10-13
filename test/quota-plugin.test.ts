@@ -25,6 +25,19 @@ function fixture(read: (binding: Readonly<UsageBinding>, signal?: AbortSignal) =
 const invocation = { threadId: "thread", parentId: "parent", args: {} };
 
 describe("quota built-in", () => {
+  it("reconciles a durable binding change onto the existing card and MCP without restarting the plugin", async () => {
+    const bindings: UsageBinding[] = [binding];
+    const f = fixture(undefined, bindings); await f.load(); await f.host.jobs.startAfterAdmission(Promise.resolve());
+    bindings.push({ ...binding, location: "worker", quotaLocation: "worker", host: "worker" });
+    await f.plugin.refreshBindings();
+    const rows = JSON.parse((await f.host.mcp.dispatch("agent_quota", invocation)).content[0]!.text);
+    expect(rows).toHaveLength(2);
+    expect(rows.find(row => row.location === "worker")).toMatchObject({ host: "worker", ageSeconds: expect.any(Number) });
+    expect(JSON.stringify(f.card.editLayout.mock.calls.at(-1))).toContain("grok @ worker");
+    bindings.pop(); await f.plugin.refreshBindings();
+    expect(JSON.parse((await f.host.mcp.dispatch("agent_quota", invocation)).content[0]!.text)).toHaveLength(1);
+    expect(JSON.stringify(f.card.editLayout.mock.calls.at(-1))).not.toContain("grok @ worker");
+  });
   it("reports a late bridge-discovered Vertex agent's quota as unknown, not a subscription or synthetic number", async () => {
     const agents: Array<{ id: string; displayName: string; brand?: string }> = [];
     const f = fixture(undefined, [binding], () => agents);
@@ -53,7 +66,7 @@ describe("quota built-in", () => {
     const quota = await f.host.mcp.dispatch("agent_quota", invocation);
     const row = JSON.parse(quota.content[0]!.text)[0];
     expect(row).toMatchObject({ agentId: "grok", noSubscription: true });
-    expect(Object.keys(row).sort()).toEqual(["agentId", "credits", "displayName", "fetchedAt", "noSubscription", "ok", "plan", "rolling", "weekly"]);
+    expect(Object.keys(row).sort()).toEqual(["ageSeconds", "agentId", "credits", "displayName", "fetchedAt", "noSubscription", "ok", "plan", "rolling", "weekly"]);
     const edits: string[] = [];
     await f.host.slash.dispatch("seam", "info", "usage", { ...invocation, actor: { id: "user", name: "User" }, string: () => null, boolean: () => null, acknowledge: async () => {}, reply: async text => { edits.push(text); } });
     expect(edits[0]).toContain("**Grok usage**");

@@ -54,6 +54,7 @@ import {
   PROTOCOL_VERSION,
   sweepAgyMcpHomes,
   type AgentAdapter,
+  type ProviderUsage,
 } from "@seam/adapters";
 import { dispatchBridgeRpc } from "./rpc.js";
 import { collectHangEvidence, createProbeGate, readLiveProviderSocket } from "./hang-probe.js";
@@ -180,12 +181,13 @@ async function makeSlotManager(opts: {
   WebSocket: WsCtor;
   bridgeId: string;
   adapters: Map<string, AgentAdapter>;
+  readAccountUsage: (agentId: string) => Promise<ProviderUsage>;
   releaseReceipt?: ReleaseReceiptWriter | null;
   /** Standing release identity. Null when this process has no stage receipt. */
   releaseSha?: string | null;
   sessiond: SessiondClient;
 }): Promise<SlotManager> {
-  const { copilotCmd, localCwd, workspaceRoot, WebSocket, bridgeId, adapters, releaseReceipt, releaseSha, sessiond } = opts;
+  const { copilotCmd, localCwd, workspaceRoot, WebSocket, bridgeId, adapters, readAccountUsage, releaseReceipt, releaseSha, sessiond } = opts;
   let currentWs: WsSocket | null = null;
   let draining = false;
   /**
@@ -596,6 +598,7 @@ async function makeSlotManager(opts: {
         try {
           const result = await dispatchBridgeRpc(method, msg.params, msg.agentId, {
             adapters,
+            readAccountUsage,
             workspaceRoot,
             cwd: localCwd,
             configureSlot: (slot, cfg) => {
@@ -682,7 +685,7 @@ async function runClientMode(
 ) {
   const { WebSocket } = await loadWs();
   await sweepAgyHomesAtBridgeStartup();
-  const { adapters, adapterRefusals } = loadHostAdapterInventory(copilotCmd, { cwd: localCwd });
+  const { adapters, adapterRefusals, readAccountUsage } = loadHostAdapterInventory(copilotCmd, { cwd: localCwd });
   const releaseReceipt = await createReleaseReceiptWriter({ bridgeId: bridgeOpts.bridgeId, instanceId: BRIDGE_INSTANCE_ID, protocolVersion: PROTOCOL_VERSION, adapterRefusals });
   const releaseSha = await readRunningReleaseSha();
   const sessiond = await connectSessiond();
@@ -693,6 +696,7 @@ async function runClientMode(
     WebSocket,
     bridgeId: bridgeOpts.bridgeId,
     adapters,
+    readAccountUsage,
     releaseReceipt,
     releaseSha,
     sessiond,
@@ -772,7 +776,7 @@ async function runServerMode(
   const { WebSocket, WebSocketServer } = await loadWs();
   // Server mode is a separate bridge startup path and owns the same temp root.
   await sweepAgyHomesAtBridgeStartup();
-  const { adapters, adapterRefusals } = loadHostAdapterInventory(copilotCmd, { cwd: localCwd });
+  const { adapters, adapterRefusals, readAccountUsage } = loadHostAdapterInventory(copilotCmd, { cwd: localCwd });
   const releaseReceipt = await createReleaseReceiptWriter({ bridgeId: bridgeOpts.bridgeId, instanceId: BRIDGE_INSTANCE_ID, protocolVersion: PROTOCOL_VERSION, adapterRefusals });
   const releaseSha = await readRunningReleaseSha();
   const sessiond = await connectSessiond();
@@ -783,6 +787,7 @@ async function runServerMode(
     WebSocket,
     bridgeId: bridgeOpts.bridgeId,
     adapters,
+    readAccountUsage,
     releaseReceipt,
     releaseSha,
     sessiond,

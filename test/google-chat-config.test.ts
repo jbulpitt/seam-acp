@@ -5,6 +5,13 @@ import { loadConfig, PresetsFileSchema } from "../packages/core/src/config.js";
 const base = { DISCORD_BOT_TOKEN: "fixture-token", DISCORD_ALLOWED_USER_IDS: "123", REPOS_ROOT: tmpdir() };
 
 describe("optional Google Chat configuration", () => {
+  it("loads the native media user's identity and OAuth token path without changing bot auth", () => {
+    const config = loadConfig({ env: { ...base, GOOGLE_CHAT_CREDENTIALS_FILE: "/fixture/app.json",
+      GOOGLE_CHAT_MEDIA_USER: "users/poster", GOOGLE_CHAT_MEDIA_TOKEN_FILE: "/fixture/user.json" } }) as any;
+    expect(config.GOOGLE_CHAT_MEDIA_USER).toBe("users/poster");
+    expect(config.GOOGLE_CHAT_MEDIA_TOKEN_FILE).toBe("/fixture/user.json");
+    expect(config.GOOGLE_CHAT_CREDENTIALS_FILE).toBe("/fixture/app.json");
+  });
   it("is off by default and retains Discord configuration", () => {
     const config = loadConfig({ env: base }) as any;
     expect(config.GOOGLE_CHAT_PROJECT_ID).toBeUndefined();

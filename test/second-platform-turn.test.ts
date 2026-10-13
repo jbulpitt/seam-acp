@@ -316,6 +316,32 @@ describe("a second chat platform runs a normal turn", () => {
     expect(h.adapter.downloadAttachment).toHaveBeenCalledTimes(2);
   });
 
+  it("reports Google's binary image-download cause to the sender on the real turn path", async () => {
+    const { GoogleRestApi } = await import("../packages/core/src/platforms/google-chat/api.js");
+    const { GoogleChatAdapter } = await import("../packages/core/src/platforms/google-chat/adapter.js");
+    const h = setup("google-chat", new Map());
+    const body = { error: { code: 403, status: "PERMISSION_DENIED",
+      message: "Permission denied to perform the requested action on the specified resource, or the resource doesn't exist.",
+      errors: [{ domain: "global", reason: "forbidden" }] } };
+    const error = Object.assign(new Error("Request failed with status code 403"),
+      { response: { status: 403, data: Buffer.from(JSON.stringify([body])) } });
+    const api = new GoogleRestApi("/fixture/app.json", "project", "/fixture/user.json");
+    const auth = (api as any).auth;
+    vi.spyOn(auth.memberships, "getClient").mockResolvedValue({ request: async () => ({ data: { state: "JOINED" } }) });
+    for (const scope of ["chat", "media"]) vi.spyOn(auth[scope], "getClient").mockResolvedValue({ request: async () => { throw error; } });
+    const chat = new GoogleChatAdapter({ api, subscription: "unused", defaultCwd: "/synthetic",
+      allowedUserIds: new Set(["users/42"]), mediaUser: "users/media", nativeImages: true, logger: (h.orch as any).logger });
+    h.adapter.downloadAttachment = vi.fn((attachment: MessageAttachment) => chat.downloadAttachment(attachment));
+    await h.run({ messageId: "gchat_download_denied", channel: { platform: "google-chat", id: "AAA" },
+      authorId: "42", authorIsBot: false, text: "Describe the image", raw: { synthetic: true },
+      attachments: [{ platform: "google-chat", url: "opaque-ref", filename: "screenshot.png", contentType: "image/png", size: 0,
+        googleChat: { space: "spaces/AAA", source: "UPLOADED_CONTENT", appAuth: false } } as any] });
+    const notice = h.adapter.sendMessage.mock.calls.map(call => call[1]).find(text => text.includes("not sent to the agent"));
+    expect(notice).toContain(body.error.message);
+    expect(notice).toContain("screenshot.png");
+    expect(h.runtime.prompt.mock.calls[0]?.[1]).toEqual([]);
+  });
+
   it("leaves a Discord turn's ids, refs and attachment URLs unchanged", async () => {
     const h = setup("discord");
     // With Chat enabled the multiplexer has a downloader, but CDN handling stays Discord's.

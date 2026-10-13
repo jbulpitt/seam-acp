@@ -91,7 +91,7 @@ describe("durable action cards", () => {
       await until(() => cards.length === 2);
       expect(store.actionCards.permissions().filter(row => row.status === "open")).toHaveLength(1);
       expect(next.toolCall.toolCallId).not.toBe(request.toolCall.toolCallId);
-      await restarted.cancelForSession("discord:thread", "A newer prompt supersedes this request.");
+      await restarted.cancelForSession(session, "A newer prompt supersedes this request.");
       await input({ id: "original-request", result: await nextDecision });
       await until(() => frames.filter(frame => frame.data?.includes('"stopReason":"end_turn"')).length === 2);
     }

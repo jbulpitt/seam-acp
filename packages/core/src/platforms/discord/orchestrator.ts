@@ -1093,7 +1093,7 @@ export class Orchestrator {
       },
       cancel: async (record, reason, detail) => {
         await this.elicitations.cancelForSession(record.id, reason, detail);
-        await this.actionCards.cancelForSession(record.id, detail ?? "This permission request was interrupted.");
+        await this.actionCards.cancelForSession(record, detail ?? "This permission request was interrupted.");
       },
     });
 
@@ -1206,8 +1206,10 @@ export class Orchestrator {
       store: this.store.actionCards, adapter: this.adapter, logger: this.logger,
       binding: (record, acpSessionId) => {
         const attempt = [...this.store.turnAttempts.list("active"), ...this.store.turnAttempts.list("suspended")]
-          .find(row => row.spec.target === record.channelRef && row.remoteRecovery?.acpSessionId === acpSessionId);
-        if (!attempt?.remoteRecovery) throw new Error("The pending permission has no recorded bridge-owned turn.");
+          .find(row => row.spec.target === record.channelRef && row.remoteRecovery && (acpSessionId
+            ? row.remoteRecovery.acpSessionId === acpSessionId
+            : row.spec.session === "live"));
+        if (!attempt?.remoteRecovery) return undefined;
         return { attemptId: attempt.id, location: attempt.remoteRecovery.location, slot: attempt.remoteRecovery.slot };
       },
       owner: async (row, response) => {
@@ -2435,9 +2437,8 @@ export class Orchestrator {
     // Must run before abort / park so the upload is not treated as a new turn.
     if (await this.tryConsumeConfigEditorRiderUpload(msg)) return;
 
-    // A normal user turn supersedes an outstanding ACP elicitation before the
-    // new prompt is admitted. This also precedes mid-turn inbox routing: a user
-    // answer typed as a message is a competing turn, never a hidden form reply.
+    // Supersede the live ACP's request before admission; isolated permissions
+    // keep their own owner. A typed answer is a new turn, not a form reply.
     let supersededElicitation = 0;
     if (msg.raw && preemptive) {
       const existing = this.store.getByChannel(msg.channel.platform, channelId);
@@ -2447,7 +2448,7 @@ export class Orchestrator {
           "superseded",
           "A newer user message superseded this request."
         );
-        supersededElicitation += await this.actionCards.cancelForSession(existing.id, "A newer user message superseded this request.");
+        supersededElicitation += await this.actionCards.cancelForSession(existing, "A newer user message superseded this request.");
       }
     }
 

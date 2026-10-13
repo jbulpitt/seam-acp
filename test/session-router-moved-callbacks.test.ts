@@ -28,7 +28,7 @@ describe("retained runtime callbacks follow the durable channel binding", () => 
     expect(h.completeElicitation).toHaveBeenCalledWith(expect.objectContaining({ channelRef: "new" }), {});
   });
   it("cancels elicitation in the new home", async () => {
-    const h = fixture(); await h.callbacks.cancelElicitations();
-    expect(h.cancelElicitations).toHaveBeenCalledWith(expect.objectContaining({ channelRef: "new" }), "cancelled", expect.any(String));
+    const h = fixture(); await h.callbacks.cancelElicitations("runtime-acp");
+    expect(h.cancelElicitations).toHaveBeenCalledWith(expect.objectContaining({ channelRef: "new", acpSessionId: "runtime-acp" }), "cancelled", expect.any(String));
   });
 });

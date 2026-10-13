@@ -55,6 +55,7 @@ function setup(logger = pino({ level: "silent" })) {
   };
   const router = testSessionRouter({ listProfiles: () => [],
     describeConfig: () => ({ agent: { value: "codex" }, model: { value: "test" },
+      role: { value: null }, disableThreadPrefix: { value: false },
       effort: { value: null }, cwd: { value: "/synthetic" }, location: { value: "local" }, fastMode: { value: false } }),
     ensureSessionRecord: () => ({ ...record }), getProfile: () => undefined,
     getOrStartRuntime: vi.fn(async (_record: unknown, _recovery?: unknown) => runtime),

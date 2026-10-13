@@ -93,7 +93,6 @@ export type PreparedConfigSet =
       card?: string;
       gif?: string;
       resolvedRepo?: string;
-      restartRequested: boolean;
       inheritSelection: boolean;
     };
 
@@ -681,9 +680,6 @@ export class ConfigApplyPlan {
         ...(card !== undefined ? { card } : {}),
         ...(gif !== undefined ? { gif } : {}),
         ...(resolvedRepo !== undefined ? { resolvedRepo } : {}),
-        restartRequested: supplied.some((name) =>
-          name === "agent" || name === "model" || name === "effort" || name === "repo"
-        ),
       },
     };
   }
@@ -743,15 +739,9 @@ export class ConfigApplyPlan {
       return restored.ok ? "" : ` Overlay rollback also failed: ${restored.error}`;
     };
     try {
-      const restartRequested = prepared.kind === "json" || prepared.restartRequested;
-      if (opts.retireRuntime && restartRequested) {
-        if (prepared.kind === "named") {
-          await this.runtime.retire(record.id, { clearAcpSession: false });
-        } else {
-          await this.runtime.retire(record.id);
-        }
-      }
+      if (opts.retireRuntime && prepared.kind === "json") await this.runtime.retire(record.id);
       const live = this.store.get(record.id) ?? record;
+      const before = this.router.describeConfig(live);
       sessionBefore = { ...live };
       overlayBefore = this.configMutation.readThreadPresetEntry(threadPresetKey(channel.platform, channel.id));
 
@@ -831,6 +821,7 @@ export class ConfigApplyPlan {
         await this.runtime.applyPermissionMode(committed);
       }
       const effective = this.router.describeConfig(committed);
+      let restartRequested = prepared.kind === "json";
       if (prepared.kind === "named") {
         const mismatch =
           (request.values.agent !== null && effective.agent.value !== prepared.nextAgentId) ||
@@ -843,6 +834,11 @@ export class ConfigApplyPlan {
         }
         if (prepared.parsedAgent?.explicit) {
           bindSessionLocation(this.bridgeHub, committed.id, prepared.nextLocation);
+        }
+        restartRequested = (["agent", "model", "effort", "cwd", "location"] as const)
+          .some(field => before[field].value !== effective[field].value);
+        if (opts.retireRuntime && restartRequested) {
+          await this.runtime.retire(committed.id, { clearAcpSession: false });
         }
       }
       mutationStarted = false;

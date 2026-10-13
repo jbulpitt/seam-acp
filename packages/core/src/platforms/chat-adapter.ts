@@ -47,6 +47,8 @@ export type DeliveryNonceLookup =
 export interface MessageAttachment {
   /** Platform owning an authenticated media reference; absent means the primary adapter. */
   platform?: string;
+  /** Native download context retained through durable admission and recovery. */
+  googleChat?: { space: string; appAuth: boolean; source?: string; driveFileId?: string };
   /** Discord: a CDN URL. Other platforms: whatever `downloadAttachment` reads. */
   url: string;
   filename: string;

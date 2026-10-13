@@ -20,7 +20,8 @@ export interface WorkspaceChatMessageResource {
   space?: GoogleChatSpace;
   thread?: { name?: string; [key: string]: unknown };
   createTime?: string;
-  attachment?: Array<{ contentName?: string; contentType?: string; attachmentDataRef?: { resourceName?: string } }>;
+  attachment?: Array<{ contentName?: string; contentType?: string; source?: string;
+    attachmentDataRef?: { resourceName?: string }; driveDataRef?: { driveFileId?: string } }>;
   /** Retain annotations and other native fields for the adapter's addressed-to-Seam filter. */
   [key: string]: unknown;
 }

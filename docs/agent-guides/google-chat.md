@@ -142,7 +142,8 @@ The standalone Shared Drive uploader also defines
 
 Set `GOOGLE_CHAT_MEDIA_TOKEN_FILE` to an OAuth `authorized_user` JSON file
 containing `type`, `client_id`, `client_secret` and `refresh_token`. Obtain offline
-user consent for only `https://www.googleapis.com/auth/chat.messages.create`;
+user consent for `https://www.googleapis.com/auth/chat.messages.create` and
+`https://www.googleapis.com/auth/chat.messages.readonly`;
 this is separate from the bot service-account key. Set `GOOGLE_CHAT_MEDIA_USER`
 to that user's canonical `users/<id>` resource. Using the canonical id lets Space
 creation recognize when the requester and upload user are the same person.
@@ -171,6 +172,27 @@ The readonly app history scope still handles uncertain-delivery lookup.
 Images remain in Chat's native Space storage and use its membership access;
 there is no public image URL, proxy route, or new public origin configuration.
 The chosen upload user can access every new session Space they are added to.
+
+### Inbound attachments
+
+App-mentioned uploads and app DMs keep `chat.bot` downloads. Unmentioned
+`UPLOADED_CONTENT` in a Space uses the configured media user's token only when
+the membership lookup reports `JOINED`. That check uses the attachment's
+original Space, not the session's reply destination. The native download context
+stays in the existing admission JSON so queued/recovered prompts use the same
+route. Missing membership leaves the app-auth path; permission failures retain
+Google's cause rather than authorizing a user download.
+
+The user token needs the readonly scope for these downloads; the admin-approved
+`chat.app.messages.readonly` history scope is not a media-download scope. An
+existing create-only user token needs renewed user consent, not a new app
+Marketplace installation. Google's [download guide](https://developers.google.com/workspace/chat/download-media-attachments)
+describes the app and user scopes.
+
+`DRIVE_FILE` attachments keep their Drive file reference and download through the
+configured Drive identity, not through Chat media or the media user's token.
+Download failures are included in the sender's rejected-attachment notice with
+Google's real cause; the original error/response is retained.
 
 ## Google-side setup
 

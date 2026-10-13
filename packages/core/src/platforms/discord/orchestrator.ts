@@ -1206,8 +1206,10 @@ export class Orchestrator {
       store: this.store.actionCards, adapter: this.adapter, logger: this.logger,
       binding: (record, acpSessionId) => {
         const attempt = [...this.store.turnAttempts.list("active"), ...this.store.turnAttempts.list("suspended")]
-          .find(row => row.spec.target === record.channelRef && row.remoteRecovery?.acpSessionId === acpSessionId);
-        if (!attempt?.remoteRecovery) throw new Error("The pending permission has no recorded bridge-owned turn.");
+          .find(row => row.spec.target === record.channelRef && row.remoteRecovery && (acpSessionId
+            ? row.remoteRecovery.acpSessionId === acpSessionId
+            : row.spec.session === "live"));
+        if (!attempt?.remoteRecovery) return undefined;
         return { attemptId: attempt.id, location: attempt.remoteRecovery.location, slot: attempt.remoteRecovery.slot };
       },
       owner: async (row, response) => {

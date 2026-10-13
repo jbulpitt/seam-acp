@@ -15,7 +15,7 @@ export interface ActionCardDependencies {
   store: ActionCardStore;
   adapter: ChatAdapter;
   logger: Logger;
-  binding(session: SessionRecord, acpSessionId: string): PermissionBinding;
+  binding(session: SessionRecord, acpSessionId: string): PermissionBinding | undefined;
   owner(record: Pick<PermissionCardRecord, "location" | "slot" | "requestId" | "acpSessionId" | "ownerPid" | "request">,
     response?: RequestPermissionResponse): Promise<OwnerState>;
   isAttemptOpen(id: string): boolean;
@@ -32,6 +32,7 @@ export class ActionCardManager {
 
   async requestPermission(session: SessionRecord, request: RequestPermissionRequest, requestId: string | number | null): Promise<RequestPermissionResponse> {
     const binding = this.deps.binding(session, request.sessionId);
+    if (!binding) throw new Error("The pending permission has no recorded bridge-owned turn.");
     const probe = { ...binding, requestId, acpSessionId: request.sessionId, ownerPid: 0, request };
     const owner = await this.deps.owner(probe);
     if (owner.state !== "pending") return denied;
@@ -137,9 +138,12 @@ export class ActionCardManager {
     }
   }
 
-  async cancelForSession(session: Pick<SessionRecord, "id" | "acpSessionId">, detail: string): Promise<number> {
+  async cancelForSession(session: SessionRecord, detail: string): Promise<number> {
+    const binding = session.acpSessionId ? undefined : this.deps.binding(session, "");
     const rows = this.deps.store.permissions(session.id)
-      .filter(row => row.status === "open" && row.acpSessionId === session.acpSessionId);
+      .filter(row => row.status === "open" && (session.acpSessionId
+        ? row.acpSessionId === session.acpSessionId
+        : binding && row.attemptId === binding.attemptId && row.location === binding.location && row.slot === binding.slot));
     for (const row of rows) await this.resolvePermission(row, "cancelled", denied, detail);
     return rows.length;
   }

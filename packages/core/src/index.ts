@@ -574,6 +574,16 @@ async function main(): Promise<void> {
       configPlan: orchestrator.getConfigApplyPlan(), defaultCwd: config.REPOS_ROOT }),
     bind: (channel, snapshot, actor) => bindGoogleChatSessionSpace(channel, snapshot,
       { store, router, mutation: orchestrator.getConfigMutation() }, actor) });
+  if (googleChat) await plugins.loadBuiltins([{ id: "session-move", load: async () => {
+    const { GoogleChatSessionMove } = await import("./core/session-move.js");
+    const { createSessionMovePlugin } = await import("./plugins/session-move/index.js");
+    const move = new GoogleChatSessionMove({ store, router, runtime: orchestrator.getRuntimeTransition(), logger,
+      isChannelBusy: channel => orchestrator.isChannelBusy(channel),
+      sendMessage: (channel, text) => googleChat.sendChannelNotice(channel, text),
+      identityCommitted: session => orchestrator.flushIdentityEffects(session),
+    });
+    return createSessionMovePlugin(input => move.move(input));
+  } }]);
   await orchestrator.loadPlugins();
   orchestrator.install();
 

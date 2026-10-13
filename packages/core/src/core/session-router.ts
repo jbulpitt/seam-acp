@@ -1515,7 +1515,7 @@ export class SessionRouter {
         }
         if (mode === "ask" && this.askUser) {
           try {
-            return await this.askUser(record, req, context);
+            return await this.askUser(this.store.get(record.id) ?? record, req, context);
           } catch (err) {
             this.logger.warn({ err, sessionId: record.id }, "askUser failed; denying");
             return { outcome: { outcome: "cancelled" } };
@@ -1529,15 +1529,15 @@ export class SessionRouter {
           context,
           mode: permissionMode(),
           elicitUser: this.elicitUser,
-          record,
+          record: this.store.get(record.id) ?? record,
         });
       },
       completeElicitationHandler: async (notification) => {
-        await this.completeElicitation?.(record, notification);
+        await this.completeElicitation?.(this.store.get(record.id) ?? record, notification);
       },
       cancelElicitations: async () => {
         await this.cancelElicitations?.(
-          record,
+          this.store.get(record.id) ?? record,
           "cancelled",
           "The running turn was cancelled before this request completed."
         );

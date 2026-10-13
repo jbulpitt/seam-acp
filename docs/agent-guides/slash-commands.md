@@ -34,6 +34,16 @@ Discord has no aliases; old invocations simply disappear.
 
 ## `/seamadmin` — operator surface (12 slots)
 
+With Chat enabled, `/seamadmin move-session session:<record-id> space:<space-id>`
+moves an idle legacy Chat thread session into an existing empty session Space.
+It checks effective config and open work, writes a SQLite backup, then replaces
+only the empty destination row and rebinds the original record atomically.
+Matching config preserves the ACP session, warm runtime and MCP token without a
+restart. `adopt-destination-config:true` accepts differences and their normal
+runtime-transition/reset rules. The result names the backup and any reset;
+source/destination notes are sent after the move. A failed follow-up explicitly
+reports that the binding is already committed. Other sessions are untouched.
+
 Registered with `default_member_permissions = ManageGuild` and
 `contexts = [Guild]` (via `setContexts`, not the deprecated `setDMPermission`),
 so it does not appear in the command picker for non-admins and is unavailable

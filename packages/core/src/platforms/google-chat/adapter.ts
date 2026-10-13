@@ -406,6 +406,12 @@ export class GoogleChatAdapter implements ChatAdapter {
     return this.sendText(channel, text, delivery);
   }
 
+  /** Administrative notes address the historical channel, not its moved session. */
+  async sendChannelNotice(channel: ChannelRef, text: string): Promise<MessageRef> {
+    return this.postMessage(channel, { text: formatGoogleChatText(text), markupSyntax: GOOGLE_CHAT_TEXT_MARKUP_SYNTAX },
+      undefined, undefined, undefined, false);
+  }
+
   private async sendText(channel: ChannelRef, text: string, delivery?: DeliveryNonceOptions, privateUser?: string): Promise<MessageRef> {
     const target = privateUser ? channel : this.commandDeps?.deliveryForChannel?.(channel, delivery?.inboundMessageId)?.channel ?? channel;
     const { thread } = names(target);
@@ -423,13 +429,13 @@ export class GoogleChatAdapter implements ChatAdapter {
   }
 
   private async postMessage(channel: ChannelRef, body: Record<string, unknown>, delivery?: DeliveryNonceOptions, contextText?: string,
-    mediaClientId?: string): Promise<MessageRef> {
-    const route = body.privateMessageViewer ? undefined : this.commandDeps?.deliveryForChannel?.(channel, delivery?.inboundMessageId);
+    mediaClientId?: string, followBinding = true): Promise<MessageRef> {
+    const route = !followBinding || body.privateMessageViewer ? undefined : this.commandDeps?.deliveryForChannel?.(channel, delivery?.inboundMessageId);
     channel = route?.channel ?? channel;
     const { space } = names(channel);
     const home = this.sessionRoot(space);
     const store = this.commandDeps?.store;
-    const bound = store?.getByChannel(this.platform, channel.id) ?? store?.get?.(makeSessionId(this.platform, channel.id));
+    const bound = followBinding ? store?.getByChannel(this.platform, channel.id) ?? store?.get?.(makeSessionId(this.platform, channel.id)) : undefined;
     const requestId = randomUUID();
     const clientId = mediaClientId ?? (delivery ? googleChatClientMessageId(delivery.nonce) : undefined);
     if (mediaClientId) store!.googleChatSpaces.recordOwnMessage(`${space}/messages/${mediaClientId}`);

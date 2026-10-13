@@ -17,6 +17,7 @@ import type { SessionStore } from "./session-store.js";
 import type { RuntimeTransition } from "./runtime-transition.js";
 import type { MutationActor } from "./config-mutation.js";
 import { planSessionAttachment, type AttachIntent, type AttachOutcome } from "./session-attach.js";
+export { GoogleChatSessionMove } from "./session-move.js";
 
 interface BindingDeps {
   store: SessionStore;

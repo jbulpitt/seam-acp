@@ -1,5 +1,6 @@
 import { GoogleAuth } from "google-auth-library";
 import type { GoogleDriveUploadConfig } from "./google-drive-config.js";
+import { googleDownloadError } from "./google-download-error.js";
 
 export type DriveRequest = Parameters<GoogleAuth["request"]>[0];
 
@@ -31,6 +32,15 @@ export class GoogleDriveUploader {
       keyFilename: config.credentialsFile,
       scopes: ["https://www.googleapis.com/auth/drive"],
     });
+  }
+
+  async download(fileId: string): Promise<Buffer> {
+    try {
+      const { data } = await this.client.request<ArrayBuffer>({ method: "GET",
+        url: `https://www.googleapis.com/drive/v3/files/${encodeURIComponent(fileId)}`,
+        params: { alt: "media", supportsAllDrives: "true" }, responseType: "arraybuffer", retry: false });
+      return Buffer.from(data);
+    } catch (error) { throw googleDownloadError(error); }
   }
 
   async upload(file: DriveUploadFile): Promise<string> {

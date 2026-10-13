@@ -1,4 +1,5 @@
 import { GoogleAuth } from "google-auth-library";
+import { googleDownloadError } from "../../core/files/google-download-error.js";
 
 export interface GoogleRequest {
   url: string;
@@ -25,17 +26,19 @@ export class GoogleRestApi implements GoogleApi {
       spaces: new GoogleAuth({ keyFile, projectId, scopes: ["https://www.googleapis.com/auth/chat.app.spaces"] }),
       memberships: new GoogleAuth({ keyFile, projectId, scopes: ["https://www.googleapis.com/auth/chat.app.memberships"] }),
       media: mediaTokenFile ? new GoogleAuth({ keyFile: mediaTokenFile,
-        scopes: ["https://www.googleapis.com/auth/chat.messages.create"] }) : undefined,
+        scopes: ["https://www.googleapis.com/auth/chat.messages.create", "https://www.googleapis.com/auth/chat.messages.readonly"] }) : undefined,
     };
   }
 
   async request<T>(scope: GoogleScope, request: GoogleRequest): Promise<T> {
     const auth = this.auth[scope];
-    if (!auth) throw new Error("GOOGLE_CHAT_MEDIA_TOKEN_FILE is not configured for native uploads");
+    if (!auth) throw new Error("GOOGLE_CHAT_MEDIA_TOKEN_FILE is not configured for native media");
     const client = await auth.getClient();
     // Writes are retried by the space lane, never invisibly outside its budget.
-    const response = await client.request<T>({ ...request, retry: false });
-    return response.data;
+    try {
+      const response = await client.request<T>({ ...request, retry: false });
+      return response.data;
+    } catch (error) { throw googleDownloadError(error); }
   }
 }
 

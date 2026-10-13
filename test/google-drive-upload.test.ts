@@ -49,6 +49,27 @@ function fakeDrive() {
 beforeEach(() => vi.clearAllMocks());
 
 describe("Shared Drive file upload", () => {
+  it("downloads a Drive attachment's original bytes with the existing configured Drive identity", async () => {
+    const request = vi.fn(async (_r: DriveRequest) => ({ data: file.data, headers: new Headers() }));
+    const uploader = new GoogleDriveUploader(members, { request } as any);
+    await expect((uploader as any).download("file/id")).resolves.toEqual(file.data);
+    expect(request).toHaveBeenCalledExactlyOnceWith({ method: "GET",
+      url: "https://www.googleapis.com/drive/v3/files/file%2Fid", params: { alt: "media", supportsAllDrives: "true" },
+      responseType: "arraybuffer", retry: false });
+  });
+
+  it("passes the real Google Drive download cause through the original error object", async () => {
+    const body = { error: { code: 403, message: "The user does not have sufficient permissions for this file.",
+      errors: [{ domain: "global", reason: "insufficientFilePermissions" }] } };
+    const error = Object.assign(new Error("Request failed with status code 403"),
+      { response: { status: 403, data: Buffer.from(JSON.stringify(body)) } });
+    const uploader = new GoogleDriveUploader(members, { request: vi.fn(async () => { throw error; }) } as any);
+    const result = await (uploader as any).download("file-id").catch((e: unknown) => e);
+    expect(result).toBe(error);
+    expect(result.message).toBe(body.error.message);
+    expect(result.response.data).toEqual(body);
+  });
+
   it("creates in the configured parent with Shared Drive support, uploads exact bytes and returns the API link", async () => {
     const drive = fakeDrive();
     const uploader = new GoogleDriveUploader(members, drive.client);

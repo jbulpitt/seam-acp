@@ -44,6 +44,7 @@ type ChatMessage = { name?: string; text?: string; thread?: { name?: string }; t
   annotations?: GoogleChatAnnotation[];
   sender?: { name?: string; type?: string; displayName?: string };
   attachment?: Array<{ contentName?: string; contentType?: string;
+    source?: string; driveDataRef?: { driveFileId?: string };
     attachmentDataRef?: { resourceName?: string } }> };
 type ChatEvent = GoogleChatCommandEvent & { user?: ChatMessage["sender"]; space?: GoogleChatSpace;
   message?: ChatMessage; thread?: { name?: string }; action?: GoogleChatCardClickEvent["action"];
@@ -97,7 +98,7 @@ export class GoogleChatAdapter implements ChatAdapter {
   constructor(private readonly opts: { api: GoogleApi; subscription: string; allowedUserIds: ReadonlySet<string>;
     allowedSpaceIds?: ReadonlySet<string>; defaultCwd: string; defaultLocation?: string; logger: Logger;
     spaceEvents?: Pick<GoogleChatSpaceEvents, "start" | "stop" | "handle" | "space" | "appUser" | "recordAppUser"> & Partial<Pick<GoogleChatSpaceEvents, "register">>;
-    writeIntervalMs?: number; driveUploader?: Pick<GoogleDriveUploader, "upload">;
+    writeIntervalMs?: number; driveUploader?: Pick<GoogleDriveUploader, "upload"> & Partial<Pick<GoogleDriveUploader, "download">>;
     mediaUser?: string; nativeImages?: boolean;
     historyReader?: Pick<GoogleChatHistoryReader, "readRawPage" | "getMessage"> & Partial<Pick<GoogleChatHistoryReader, "normalizeMessage">> }) {
     this.writes = new SpaceWriteQueue({ logger: opts.logger, intervalMs: opts.writeIntervalMs });
@@ -251,6 +252,10 @@ export class GoogleChatAdapter implements ChatAdapter {
     const attachments: MessageAttachment[] = (message.attachment ?? []).map(a => ({
       url: a.attachmentDataRef?.resourceName ?? "", filename: a.contentName ?? "attachment",
       contentType: a.contentType ?? null, size: 0, platform: this.platform,
+      googleChat: { space: spaceName, source: a.source ?? (a.driveDataRef ? "DRIVE_FILE" : a.attachmentDataRef ? "UPLOADED_CONTENT" : undefined),
+        driveFileId: a.driveDataRef?.driveFileId,
+        appAuth: !isSharedSpace(space) || mentionsChatApp(message.annotations, appUser)
+          || (source === "direct" && appUser === undefined && hasAppMention(message.annotations)) },
     }));
     const text = isSharedSpace(space) ? stripAppMentions(message.text ?? "", message.annotations, appUser) : message.text ?? "";
     let deliveryChannel = home && message.threadReply === true && thread ? channelForThread(thread) : channel;
@@ -622,7 +627,21 @@ export class GoogleChatAdapter implements ChatAdapter {
   }
 
   async downloadAttachment(attachment: MessageAttachment): Promise<Buffer> {
-    const data = await this.opts.api.request<ArrayBuffer>("chat", { method: "GET",
+    const context = attachment.googleChat;
+    if (context?.source === "DRIVE_FILE") {
+      if (!this.opts.driveUploader?.download) throw new Error("Google Chat Drive attachment downloads require configured Drive access");
+      return this.opts.driveUploader.download(context.driveFileId!);
+    }
+    let scope: "chat" | "media" = "chat";
+    if (context?.source === "UPLOADED_CONTENT" && !context.appAuth && this.opts.mediaUser) {
+      let membership: { state?: string } | undefined;
+      try {
+        membership = await this.opts.api.request("memberships", { method: "GET",
+          url: `${root}/${context.space}/members/${encodeURIComponent(this.opts.mediaUser.replace(/^users\//, ""))}` });
+      } catch (err) { if (googleErrorStatus(err) !== 404) throw err; }
+      if (membership?.state === "JOINED") scope = "media";
+    }
+    const data = await this.opts.api.request<ArrayBuffer>(scope, { method: "GET",
       url: `${root}/media/${attachment.url}`, params: { alt: "media" }, responseType: "arraybuffer" });
     return Buffer.from(data);
   }

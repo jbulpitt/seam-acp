@@ -251,6 +251,13 @@ export class RuntimeTransition {
     );
   }
 
+  /** Reload commits join the existing transition queue before the next turn. */
+  queueSavedSelection(record: SessionRecord, before: ConfigDescription): void {
+    this.router.queueRuntimeTransition(record.id, () =>
+      this.applySavedSelectionNow(this.deps.store.get(record.id) ?? record, before)
+    );
+  }
+
   /** Adopt a seeded migration without replacing its context or interrupting a turn. */
   async adoptMigratedSession(target: SessionRecord, selection: {
     agent: string; model: string; effort: string; acpSessionId: string;
@@ -282,15 +289,17 @@ export class RuntimeTransition {
       return;
     }
     const agentChanged = before.agent.value !== after.agent.value;
+    const locationChanged = before.location.value !== after.location.value;
     const modelChanged = before.model.value !== after.model.value;
     const effortChanged = before.effort.value !== after.effort.value;
-    if (!agentChanged && !modelChanged && !effortChanged) return;
+    if (!agentChanged && !locationChanged && !modelChanged && !effortChanged) return;
 
     const binding = { agentId: after.agent.value, location: after.location.value };
     const model = this.deps.modelCatalog.model(binding, after.model.value);
     const reset = detectSessionReset({
       previousAgentId: before.agent.value,
       nextAgentId: after.agent.value,
+      locationChanged,
       modelChanged,
       modelApplicationMode: model?.applicationMode ?? "reload",
     });
@@ -666,11 +675,10 @@ export class RuntimeTransition {
     // Shared rule (#37): Fast is validated per session AND per model, so a
     // model/agent change under an active Fast setting needs a fresh session
     // even though the Fast setting itself did not change.
-    const reset = locationChanged && !agentChanged
-      ? { sessionReset: true, resetReason: "location-switch" as const }
-      : detectSessionReset({
+    const reset = detectSessionReset({
       previousAgentId,
       nextAgentId,
+      locationChanged,
       modelChanged,
       modelApplicationMode: catalogModel?.applicationMode ?? "reload",
       fastModeChanged: fastModeNeedsFreshSession({

@@ -269,13 +269,14 @@ export interface AppliedSessionConfig extends ConfigApplyResult {
 
 export interface SessionResetDecision {
   sessionReset: boolean;
-  resetReason?: "agent-switch" | "model-switch" | "fast-mode-switch";
+  resetReason?: "agent-switch" | "location-switch" | "model-switch" | "fast-mode-switch";
 }
 
 /** Backend reset semantics for cross-thread session control (#129). */
 export function detectSessionReset(input: {
   previousAgentId: string;
   nextAgentId: string;
+  locationChanged?: boolean;
   modelChanged: boolean;
   modelApplicationMode?: "live" | "reload" | "freshSession";
   /** #37: Fast mode is a session-start dimension. Changing it MUST land on a
@@ -285,6 +286,9 @@ export function detectSessionReset(input: {
 }): SessionResetDecision {
   if (input.previousAgentId !== input.nextAgentId) {
     return { sessionReset: true, resetReason: "agent-switch" };
+  }
+  if (input.locationChanged) {
+    return { sessionReset: true, resetReason: "location-switch" };
   }
   if (input.modelChanged && input.modelApplicationMode === "freshSession") {
     return { sessionReset: true, resetReason: "model-switch" };

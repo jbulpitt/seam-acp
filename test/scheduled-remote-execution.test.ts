@@ -315,9 +315,14 @@ describe("pre-prompt bridge reconnect on the scheduled execution paths", () => {
 
 describe("#487 production remote construction paths", () => {
   const failAfterText = () => { throw new RequestError(-32603, "Internal error: native AGY exited_early", { code: "exited_early" }); };
+  const failingEpisode = (h: ReturnType<typeof setup>) => {
+    h.afterText.mockImplementationOnce(failAfterText);
+    // One partial answer, then failed continuations without fresh progress.
+    h.onPrompt.mockImplementation(async () => { if (h.calls.prompts.length > 1) failAfterText(); });
+  };
 
   it("consults the live bridge before scheduled occurrence recovery and only then cleans up", async () => {
-    const h = setup(); h.afterText.mockImplementation(failAfterText);
+    const h = setup(); failingEpisode(h);
     await h.make().runScheduledPrompt(h.row.id);
     expect(h.calls.prompts).toHaveLength(8);
     expect(h.calls.prompts.every(prompt => prompt.sessionId === "scheduled-acp")).toBe(true);
@@ -332,7 +337,7 @@ describe("#487 production remote construction paths", () => {
   });
 
   it("pins the real router runtime's health query to its spawning mux", async () => {
-    const h = setup(); h.afterText.mockImplementation(failAfterText);
+    const h = setup(); failingEpisode(h);
     const muxForSession = vi.fn(() => h.mux);
     const router = new SessionRouter({ logger: h.logger, store: h.store, profiles: [h.profile],
       modelCatalog: fixtureModelCatalog([h.profile]), defaultAgentId: "agy", defaultModel: MODEL,

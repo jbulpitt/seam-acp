@@ -24,7 +24,8 @@ export function projectDiscordConversation(
   const logical: LogicalReconstructionMessage[] = [];
   for (const post of chronological) {
     if (isMessageCardOrNoise(post)) continue;
-    if (post.authorType === "bot" && post.authorId !== seamBotId) continue;
+    const ownOutput = post.isOwnOutput || (post.authorType === "bot" && post.authorId === seamBotId);
+    if (post.authorType === "bot" && !ownOutput) continue;
 
     const raw = post.content.trim();
     const attachmentNote =
@@ -36,7 +37,7 @@ export function projectDiscordConversation(
     if (!text) continue;
 
     const role: LogicalReconstructionMessage["role"] =
-      post.authorType === "bot" && post.authorId === seamBotId ? "assistant" : "user";
+      ownOutput ? "assistant" : "user";
     if (post.authorType === "bot" && role !== "assistant") continue;
 
     const previous = logical[logical.length - 1];
@@ -44,7 +45,7 @@ export function projectDiscordConversation(
       previous &&
       previous.role === "assistant" &&
       role === "assistant" &&
-      post.authorId === seamBotId &&
+      ownOutput &&
       post.timestampMs - previous.timestampMs <= ASSISTANT_FRAGMENT_GAP_MS;
 
     if (sameAssistantFragment && previous) {

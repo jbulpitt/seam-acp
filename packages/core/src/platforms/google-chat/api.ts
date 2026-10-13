@@ -5,30 +5,34 @@ export interface GoogleRequest {
   method?: "GET" | "POST" | "PATCH" | "DELETE";
   params?: Record<string, string>;
   data?: unknown;
+  headers?: Record<string, string>;
   responseType?: "arraybuffer";
   signal?: AbortSignal;
 }
 
-export interface GoogleApi {
-  request<T>(scope: "chat" | "messages" | "pubsub" | "spaces" | "memberships", request: GoogleRequest): Promise<T>;
-}
+export type GoogleScope = "chat" | "messages" | "pubsub" | "spaces" | "memberships" | "media";
+export interface GoogleApi { request<T>(scope: GoogleScope, request: GoogleRequest): Promise<T>; }
 
 /** Use the already-installed Google client for key loading, refresh and REST auth. */
 export class GoogleRestApi implements GoogleApi {
   private readonly auth;
 
-  constructor(keyFile: string, projectId: string) {
+  constructor(keyFile: string, projectId: string, mediaTokenFile?: string) {
     this.auth = {
       chat: new GoogleAuth({ keyFile, projectId, scopes: ["https://www.googleapis.com/auth/chat.bot"] }),
       messages: new GoogleAuth({ keyFile, projectId, scopes: ["https://www.googleapis.com/auth/chat.app.messages.readonly"] }),
       pubsub: new GoogleAuth({ keyFile, projectId, scopes: ["https://www.googleapis.com/auth/pubsub"] }),
       spaces: new GoogleAuth({ keyFile, projectId, scopes: ["https://www.googleapis.com/auth/chat.app.spaces"] }),
       memberships: new GoogleAuth({ keyFile, projectId, scopes: ["https://www.googleapis.com/auth/chat.app.memberships"] }),
+      media: mediaTokenFile ? new GoogleAuth({ keyFile: mediaTokenFile,
+        scopes: ["https://www.googleapis.com/auth/chat.messages.create"] }) : undefined,
     };
   }
 
-  async request<T>(scope: "chat" | "messages" | "pubsub" | "spaces" | "memberships", request: GoogleRequest): Promise<T> {
-    const client = await this.auth[scope].getClient();
+  async request<T>(scope: GoogleScope, request: GoogleRequest): Promise<T> {
+    const auth = this.auth[scope];
+    if (!auth) throw new Error("GOOGLE_CHAT_MEDIA_TOKEN_FILE is not configured for native uploads");
+    const client = await auth.getClient();
     // Writes are retried by the space lane, never invisibly outside its budget.
     const response = await client.request<T>({ ...request, retry: false });
     return response.data;

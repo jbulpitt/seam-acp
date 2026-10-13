@@ -17,7 +17,8 @@ import type { GoogleChatSpaceEvents } from "./space-events.js";
 import type { SpaceWriteQueue } from "./write-queue.js";
 
 type OrgConfig = Pick<Config, "DEFAULT_AGENT" | "REPOS_ROOT" | "GOOGLE_CHAT_DEFAULT_AGENT"
-  | "GOOGLE_CHAT_DEFAULT_LOCATION" | "GOOGLE_CHAT_DEFAULT_MODEL" | "GOOGLE_CHAT_DEFAULT_EFFORT" | "GOOGLE_CHAT_DEFAULT_CWD">;
+  | "GOOGLE_CHAT_DEFAULT_LOCATION" | "GOOGLE_CHAT_DEFAULT_MODEL" | "GOOGLE_CHAT_DEFAULT_EFFORT" | "GOOGLE_CHAT_DEFAULT_CWD"
+  | "GOOGLE_CHAT_MEDIA_USER">;
 type Space = NonNullable<GoogleChatSpaceCreationReceipt["space"]>;
 const root = "https://chat.googleapis.com/v1";
 const platform = "google-chat";
@@ -127,6 +128,7 @@ export class GoogleChatSessionSpaces {
       const receipt: InboundCommandResult = { replies: [], spaceCreation: {
         requestId: randomUUID(), customer: this.opts.customer ?? "customers/my_customer",
         displayName: [...(input.name ?? name)].slice(0, 128).join(""), requester: { ...input.requester }, snapshot,
+        mediaUser: this.opts.config.GOOGLE_CHAT_MEDIA_USER,
       } };
       const now = new Date().toISOString();
       store.admitInbound({ messageId: input.messageId, platform, channelRef: input.origin.id,
@@ -184,6 +186,20 @@ export class GoogleChatSessionSpaces {
         await write("memberships", { method: "PATCH", url: `${root}/${setup.membershipName}`,
           params: { updateMask: "role" }, data: { role: "ROLE_MANAGER" } });
         setup.managerPromoted = true; checkpoint();
+      }
+      if (setup.mediaUser && !setup.mediaMemberJoined) {
+        const user = setup.mediaUser.replace(/^users\//, "");
+        if (user !== setup.requester.id.replace(/^users\//, "")) {
+          try {
+            await write("memberships", { method: "POST", url: `${root}/${space.name}/members`,
+              data: { member: { name: `users/${user}`, type: "HUMAN" } } });
+          } catch (err) {
+            if (googleErrorStatus(err) !== 409) throw err;
+            await this.opts.api.request("memberships", { method: "GET",
+              url: `${root}/${space.name}/members/${encodeURIComponent(user)}` });
+          }
+        }
+        setup.mediaMemberJoined = true; checkpoint();
       }
       if (!setup.appsLocked) {
         await write("spaces", { method: "PATCH", url: `${root}/${space.name}`,

@@ -7,6 +7,7 @@ export interface StoredGoogleChatSpace {
   appUser?: string;
   subscription?: GoogleChatSpaceSubscription;
   messageRoots?: Record<string, GoogleChatMessageRoot>;
+  ownMessages?: Record<string, true>;
 }
 
 export interface GoogleChatMessageRoot {
@@ -49,6 +50,21 @@ export class GoogleChatSpaceStore {
   recordMessageRoot(space: string, thread: string, message: GoogleChatMessageRoot): void {
     const prior = this.get(space) ?? { space: { name: space } };
     this.put({ ...prior, messageRoots: { ...prior.messageRoots, [thread]: message } });
+  }
+
+  /** Reserve the client alias before create, then retain Google's canonical name. */
+  recordOwnMessage(name: string): void {
+    const space = name.split("/messages/")[0]!;
+    const prior = this.get(space) ?? { space: { name: space } };
+    this.put({ ...prior, ownMessages: { ...prior.ownMessages, [name]: true } });
+  }
+
+  isOwnMessage(message: { name?: string; clientAssignedMessageId?: string }): boolean {
+    if (!message.name) return false;
+    const space = message.name.split("/messages/")[0]!;
+    const known = this.get(space)?.ownMessages;
+    return known?.[message.name] === true || Boolean(message.clientAssignedMessageId
+      && known?.[`${space}/messages/${message.clientAssignedMessageId}`]);
   }
 
   delete(name: string): void { this.db.prepare("DELETE FROM google_chat_spaces WHERE name = ?").run(name); }

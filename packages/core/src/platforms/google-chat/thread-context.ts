@@ -10,7 +10,7 @@ export function messageRoot(message: GoogleChatHistoryMessage, own = false): Goo
 
 /** Context is optional; a history outage never prevents prompt admission. */
 export async function threadContext(space: string, thread: string, opts: {
-  store?: Pick<GoogleChatSpaceStore, "messageRoot" | "recordMessageRoot">;
+  store?: Pick<GoogleChatSpaceStore, "messageRoot" | "recordMessageRoot"> & Partial<Pick<GoogleChatSpaceStore, "isOwnMessage">>;
   history?: Pick<GoogleChatHistoryReader, "getMessage" | "readRawPage">;
   logger: Logger;
 }): Promise<string | undefined> {
@@ -21,7 +21,7 @@ export async function threadContext(space: string, thread: string, opts: {
       const message = saved ? await opts.history.getMessage(saved.name)
         : (await opts.history.readRawPage({ space, thread, order: "oldest", limit: 1 })).messages[0];
       if (message) {
-        root = messageRoot(message, message.sender?.type === "BOT");
+        root = messageRoot(message, message.sender?.type === "BOT" || opts.store?.isOwnMessage?.(message));
         opts.store?.recordMessageRoot(space, thread, root);
       }
     } catch (err) {

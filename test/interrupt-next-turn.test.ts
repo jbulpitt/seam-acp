@@ -78,14 +78,16 @@ async function fixture() {
   orch.recoverInterruptedTurns = async () => {};
   orch.reconcileRemoteRecoveries = async () => {};
   const held = gate();
+  const holds = new Map<string, Promise<void>>([["active", held.promise]]);
   // Only provider execution/Discord rendering are synthetic; both queue layers and SQL are real.
   (orch as any).injectTurn = async (row: SessionRecord, prompt: string, opts: any) => {
-    const name = prompt.includes("<seam-interrupt>") ? "interrupt" : ["active", "first", "second"].find(value => prompt.includes(`JOB_${value}`))!;
+    const name = prompt.includes("<seam-interrupt>") ? prompt.includes("second urgent") ? "interrupt2" : "interrupt"
+      : ["active", "first", "second"].find(value => prompt.includes(`JOB_${value}`))!;
     contexts.set(name, row.acpSessionId);
     opts.onSession?.("fixture-acp");
     opts.lifecycle?.beforePrompt?.();
     events.push(`start:${name}`);
-    if (name === "active") await held.promise;
+    await holds.get(name);
     events.push(`end:${name}`);
     const outcome = { text: `DONE_${name}`, stopReason: "end_turn" };
     opts.lifecycle?.onOutcome?.(outcome);
@@ -103,11 +105,11 @@ async function fixture() {
   });
   servers.push(mcp);
   await mcp.start();
-  const send = async (fresh = false) => {
+  const send = async (fresh = false, message = "do the urgent task") => {
     const response = await fetch(`http://127.0.0.1:${mcp.port}/mcp`, { method: "POST",
       headers: { "content-type": "application/json", "X-Seam-Session": "fixture-caller" },
       body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call",
-        params: { name: "send", arguments: { to: target, message: "do the urgent task", interrupt: true, fresh } } }),
+        params: { name: "send", arguments: { to: target, message, interrupt: true, fresh } } }),
     });
     expect(response.status).toBe(200);
     const body = await response.json();
@@ -119,7 +121,7 @@ async function fixture() {
     id, target, prompt: `JOB_${name}`, session: "live", kind: "handoff", returnTo: callerRef,
     createdUtc: `2026-01-01T00:00:0${second}.000Z`,
   }, store.turnAttempts);
-  return { orch, watcher, send, enqueue, events, contexts, held, abortTurn, invalidate };
+  return { orch, watcher, send, enqueue, events, contexts, held, holds, abortTurn, invalidate };
 }
 
 describe("send interrupt next-turn ordering", () => {
@@ -143,13 +145,14 @@ describe("send interrupt next-turn ordering", () => {
       const queued = h.watcher.tick();
       await vi.waitFor(() => expect(h.watcher.inFlightIdsForTarget(target)).toEqual(expect.arrayContaining(["z-first", "a-second"])));
       const receipt = await h.send();
-      const urgent = h.watcher.tick();
-      await vi.waitFor(() => expect(h.watcher.inFlightIdsForTarget(target).length).toBe(active === "dispatch" ? 4 : 3));
+      const urgent = active === "dispatch" ? h.watcher.tick() : Promise.resolve();
+      if (active === "dispatch") await vi.waitFor(() => expect(h.watcher.inFlightIdsForTarget(target)).toHaveLength(4));
       expect.soft(h.abortTurn).not.toHaveBeenCalled();
       expect.soft(h.events.filter(event => event.startsWith("start:"))).toEqual(["start:active"]);
       expect.soft(receipt).toContain("Running work is not cancelled");
       h.held.release();
       await Promise.all([activeRun, queued, urgent]);
+      await h.watcher.tick();
       await h.watcher.drain();
       expect(h.events.filter(event => event.startsWith("start:") || event.startsWith("end:"))).toEqual([
         "start:active", "end:active", "start:interrupt", "end:interrupt",
@@ -191,6 +194,31 @@ describe("send interrupt next-turn ordering", () => {
     await h.watcher.drain();
     expect(h.events.filter(event => event.startsWith("start:"))).toEqual([
       "start:interrupt", "start:first", "start:second",
+    ]);
+  });
+
+  it("a second directive accepted during the first runs next without waiting for another poll", async () => {
+    const h = await fixture();
+    const firstHeld = gate();
+    h.holds.set("interrupt", firstHeld.promise);
+    await h.enqueue("active", "active", 0);
+    await h.watcher.start({ waitForInitialDispatches: false });
+    await vi.waitFor(() => expect(h.events).toContain("start:active"));
+    await h.enqueue("z-first", "first", 1);
+    await h.enqueue("a-second", "second", 2);
+    const queued = h.watcher.tick();
+    await vi.waitFor(() => expect(h.watcher.inFlightIdsForTarget(target)).toHaveLength(3));
+    await h.send();
+    h.held.release();
+    const firstPoll = h.watcher.tick();
+    await vi.waitFor(() => expect(h.events).toContain("start:interrupt"));
+    await h.send(false, "do the second urgent task");
+    firstHeld.release();
+    await Promise.all([queued, firstPoll]);
+    await h.watcher.tick();
+    await h.watcher.drain();
+    expect(h.events.filter(event => event.startsWith("start:"))).toEqual([
+      "start:active", "start:interrupt", "start:interrupt2", "start:first", "start:second",
     ]);
   });
 });

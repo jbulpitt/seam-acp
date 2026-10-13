@@ -12662,7 +12662,7 @@ export class Orchestrator {
   }
 
   scheduleExecution(row: ScheduledPrompt): ScheduledExecutionIdentity {
-    const record = this.router.ensureSessionRecord({ platform: PLATFORM, channelRef: row.channelRef,
+    const record = this.router.ensureSessionRecord({ platform: row.platform, channelRef: row.channelRef,
       ...(row.parentRef ? { parentRef: row.parentRef } : {}), cwd: this.config.REPOS_ROOT });
     const d = this.router.describeConfig(record);
     const p = this.router.getProfile(d.agent.value, d.location.value);
@@ -12912,13 +12912,13 @@ export class Orchestrator {
     assertOwned();
     const id = row.id;
     const bindingThread: ChannelRef = {
-      platform: PLATFORM,
+      platform: row.platform,
       id: row.channelRef,
       ...(row.parentRef ? { parentId: row.parentRef } : {}),
     };
     // Output goes to the configured target channel, or the schedule's own thread.
     const target: ChannelRef = row.sessionMode !== "live" && row.targetChannel
-      ? { platform: PLATFORM, id: row.targetChannel }
+      ? { platform: row.platform, id: row.targetChannel }
       : bindingThread;
     const skip = (cause: string): void => {
       if (!owned) return;
@@ -13039,7 +13039,7 @@ export class Orchestrator {
     //    `cfg.model` / `record.repoPath` columns. Live-mode returns above and
     //    never takes this path.
     const record = this.router.ensureSessionRecord({
-      platform: PLATFORM,
+      platform: row.platform,
       channelRef: row.channelRef,
       ...(row.parentRef ? { parentRef: row.parentRef } : {}),
       cwd: this.config.REPOS_ROOT,

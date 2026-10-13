@@ -927,6 +927,9 @@ export interface GrokUsageData {
   periodStart: string | null;
   periodEnd: string | null;
   isUnifiedBillingUser: boolean;
+  prepaidBalance?: number | null;
+  onDemandCap?: number | null;
+  onDemandUsed?: number | null;
 }
 
 /**
@@ -949,6 +952,10 @@ export function parseGrokBilling(raw: unknown): GrokUsageData {
     ? periodTypeRaw.replace(/^USAGE_PERIOD_TYPE_/i, "").toLowerCase()
     : null;
   const pct = config.creditUsagePercent;
+  const amount = (value: unknown): number | null => {
+    const val = value && typeof value === "object" ? (value as { val?: unknown }).val : undefined;
+    return typeof val === "number" && Number.isFinite(val) ? val : null;
+  };
   return {
     subscriptionTier:
       typeof root.subscription_tier === "string" ? root.subscription_tier : null,
@@ -963,6 +970,9 @@ export function parseGrokBilling(raw: unknown): GrokUsageData {
       (typeof config.billingPeriodEnd === "string" && config.billingPeriodEnd) ||
       null,
     isUnifiedBillingUser: config.isUnifiedBillingUser === true,
+    prepaidBalance: amount(config.prepaidBalance),
+    onDemandCap: amount(config.onDemandCap),
+    onDemandUsed: amount(config.onDemandUsed),
   };
 }
 

@@ -1,6 +1,6 @@
 import type { ProviderUsage } from "../../core/quota/usage-provider.js";
 import { formatUsageObservation } from "../../core/quota/usage-observation.js";
-import { mapAgyQuota } from "../../core/quota/agent-quota.js";
+import { mapAgyQuota, mapGrokQuota } from "../../core/quota/agent-quota.js";
 import { renderQuotaPools } from "../../core/quota/agent-quota-card.js";
 
 export function formatUsage(usage: ProviderUsage): string {
@@ -96,19 +96,22 @@ function formatCopilotUsage(
 function formatGrokUsage(
   d: import("@seam/adapters").GrokUsageData
 ): string {
+  const quota = mapGrokQuota({ agentId: "grok", displayName: "Grok" }, d);
   const lines: string[] = [];
   lines.push(`**Grok usage**${d.subscriptionTier ? ` — ${d.subscriptionTier}` : ""}`);
   const period = d.periodType ? d.periodType : "period";
   const reset = d.periodEnd ? ` · resets ${formatResetTime(d.periodEnd)}` : "";
-  if (d.creditUsagePercent !== null) {
+  if (quota.ok && quota.weekly.usedPercent !== null && !quota.noSubscription) {
     lines.push(
       "",
       `**${period.charAt(0).toUpperCase() + period.slice(1)} allowance**`,
-      usageLine(d.creditUsagePercent, `used${reset}`)
+      usageLine(quota.weekly.usedPercent, `used${reset}`)
     );
   } else {
     lines.push("No billing data available.");
   }
+  if (quota.credits) lines.push(`Credits: ${quota.credits.balance}`);
+  if (quota.credits?.onDemand) lines.push(`On-demand: ${quota.credits.onDemand.used} / ${quota.credits.onDemand.cap}`);
   return lines.join("\n");
 }
 

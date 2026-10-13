@@ -583,15 +583,15 @@ describe("#250 production dispatch lifecycle (synthetic transport, no providers)
       onDispatch: s => recovering.dispatchInjectTurn(s) });
     cleanups.push(() => watcher.stop());
     await watcher.start(); watcher.stop();
-    expect(h.router.getOrStartRuntime).toHaveBeenCalledTimes(3);
+    expect(h.router.getOrStartRuntime).toHaveBeenCalledTimes(6);
     expect(retrySleep).not.toHaveBeenCalled();
-    expect(h.acquisitionSleep.mock.calls).toEqual([[30_000], [30_000]]);
+    expect(h.acquisitionSleep.mock.calls).toEqual([[30_000], [30_000], [120_000], [300_000], [420_000]]);
     expect(h.runtime.prompt).not.toHaveBeenCalled();
     expect(h.notices).toHaveBeenCalledTimes(1);
     expect(h.store.turnAttempts.get(h.spec.id)).toMatchObject({
       state: "suspended",
       generation: 2,
-      stalledReason: "provider acquisition failed during boot-recovery: boot recovery exhausted 3 pre-prompt acquisition attempts: rpc 'spawn' timed out after 30s",
+      stalledReason: "provider acquisition failed during boot-recovery: boot recovery exhausted 6 pre-prompt acquisition attempts: rpc 'spawn' timed out after 30s",
       stallNoticeUtc: expect.any(String),
     });
   });
@@ -632,8 +632,8 @@ describe("#250 production dispatch lifecycle (synthetic transport, no providers)
     h.router.getOrStartRuntime.mockRejectedValue(new Error("Internal error: native resume failed"));
     await h.watcher.start(); await enqueueDispatchSpec(h.dataDir, h.spec);
     await h.watcher.tick(); await h.watcher.drain();
-    expect(h.router.getOrStartRuntime).toHaveBeenCalledTimes(3);
-    expect(h.acquisitionSleep.mock.calls).toEqual([[30_000], [30_000]]);
+    expect(h.router.getOrStartRuntime).toHaveBeenCalledTimes(6);
+    expect(h.acquisitionSleep.mock.calls).toEqual([[30_000], [30_000], [120_000], [300_000], [420_000]]);
     expect(h.runtime.prompt).not.toHaveBeenCalled();
     expect(h.store.get("discord:worker")?.acpSessionId).toBe("recorded-acp");
     expect(h.store.turnAttempts.get(h.spec.id)?.stalledReason).toContain("Internal error: native resume failed");

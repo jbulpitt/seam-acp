@@ -139,7 +139,7 @@ describe("session writer acquisition", () => {
       await expect(new DispatchAcquisitionPhase("incoming", "execution").acquire(() =>
         (orch as any).acquireRecordedRuntime(h.record, "incoming", SAVED_SESSION)))
         .rejects.toMatchObject({ suspension: "defect", reason: "Codex was still attached to this session from the previous turn" });
-      expect(delays).toEqual([30_000, 30_000, 120_000, 300_000, 419_999]);
+      expect(delays).toEqual([30_000, 30_000, 120_000, 300_000, 420_000]);
       expect(load).toHaveBeenCalledTimes(6);
       expect((await h.requests()).filter(frame => frame.method === "session/load")).toHaveLength(2);
       expect((await h.requests()).filter(frame => frame.method === "session/prompt")).toHaveLength(1);

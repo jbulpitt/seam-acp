@@ -74,8 +74,8 @@ async function fixture() {
   orch.reconcileRemoteRecoveries = async () => {};
   const held = gate();
   // Only provider execution/Discord rendering are synthetic; both queue layers and SQL are real.
-  (orch as any).injectTurn = async (input: { prompt: string }) => {
-    const name = input.prompt.includes("<seam-interrupt>") ? "interrupt" : ["active", "first", "second"].find(value => input.prompt.includes(`JOB_${value}`))!;
+  (orch as any).injectTurn = async (_record: SessionRecord, prompt: string) => {
+    const name = prompt.includes("<seam-interrupt>") ? "interrupt" : ["active", "first", "second"].find(value => prompt.includes(`JOB_${value}`))!;
     events.push(`start:${name}`);
     if (name === "active") await held.promise;
     events.push(`end:${name}`);

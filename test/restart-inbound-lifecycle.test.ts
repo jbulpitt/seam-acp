@@ -91,30 +91,44 @@ function setup(logger = pino({ level: "silent" })) {
 }
 
 describe("#250 human turn production pipeline, synthetic transport only", () => {
-  it("logs a recovered in-flight turn's restart suspension below error without settling it", async () => {
+  it("logs the shutdown cause below error, then reattaches and completes the recovered turn", async () => {
     const lines: string[] = [];
     const logger = pino({ level: "debug" }, { write(line: string) { lines.push(line); } });
     const h = setup(logger);
+    simulateRetiredOwnerProcess();
     const row = h.store.recoverInboundChannel("worker", new Date().toISOString());
     const recovered = (h.orch as any).startRecoveredInbound(row) as Promise<void>;
     await h.started;
     h.orch.suspendForRestart();
-    const suspended = h.store.turnAttempts.get("inbound-1");
-    const admission = h.store.getInbound("1");
     h.release();
     await recovered;
     const logs = lines.map(line => JSON.parse(line));
-    expect(logs.filter(log => log.level >= 50)).toEqual([]);
+    expect(logs.filter(log => log.level >= 50 && log.err?.suspension === "shutdown")).toEqual([]);
     expect(logs.find(log => log.suspension === "shutdown")).toMatchObject({
       level: 30, channelRef: "worker", messageId: "1",
       reason: "restart cutoff reached before this turn finished",
       err: { type: "DispatchSuspendedError", suspension: "shutdown",
         reason: "restart cutoff reached before this turn finished" },
     });
-    expect(h.store.turnAttempts.get("inbound-1")).toEqual(suspended);
-    expect(h.store.getInbound("1")).toEqual(admission);
-    expect(suspended).toMatchObject({ state: "suspended", promptStarted: true,
+    expect(h.store.turnAttempts.get("inbound-1")).toMatchObject({ state: "suspended", promptStarted: true,
       acpSessionId: "recorded-acp", outcome: null });
+    h.runtime.prompt.mockImplementationOnce(async () => {
+      await h.emit("RECOVERED_INBOUND_975");
+      return { stopReason: "end_turn" };
+    });
+    const restarted = h.make();
+    await restarted.recoverInterruptedTurns();
+    expect(h.router.getOrStartRuntime.mock.calls.at(-1)?.[1]).toEqual({ resumeSessionId: "recorded-acp" });
+    expect(h.runtime.prompt).toHaveBeenCalledTimes(2);
+    expect(h.runtime.prompt.mock.calls[1]?.[0]).toMatch(/^continue\n/);
+    expect(h.runtime.prompt.mock.calls[1]?.[0]).not.toContain("ORIGINAL DISPOSABLE WORK");
+    expect(h.store.turnAttempts.get("inbound-1")).toMatchObject({ state: "completed",
+      acpSessionId: "recorded-acp", deliveryDone: true,
+      outcome: { status: "completed", output: "RECOVERED_INBOUND_975" } });
+    expect(h.store.getInbound("1")?.state).toBe("completed");
+    expect(h.adapter.sendMessage.mock.calls.filter(([, text]) => text === "RECOVERED_INBOUND_975")).toHaveLength(1);
+    expect(lines.map(line => JSON.parse(line))
+      .filter(log => log.level >= 50 && log.err?.suspension === "shutdown")).toEqual([]);
   });
 
   it.each(["inventory", "exit", "error", "connection result"].flatMap(loss =>

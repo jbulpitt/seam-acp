@@ -14,9 +14,9 @@ export interface RemoteRung1Policy {
   retryableErrorKinds: AdapterErrorKind[];
   /**
    * Optional per-kind schedule that replaces `backoffMs` for that kind,
-   * indexed by how many times that kind has been retried; past its end, that
-   * kind stops retrying. Added after v1 shipped, so it is never required to
-   * validate: an older bridge ignores it and keeps `backoffMs` (#626).
+   * indexed by how many times that kind has been retried. Transient provider
+   * failures repeat the last step until their episode window ends. Optional
+   * for compatibility: an older bridge ignores it and keeps `backoffMs`.
    */
   backoffMsByKind?: Partial<Record<AdapterErrorKind, number[]>>;
 }
@@ -114,7 +114,7 @@ export function isRemoteRung1Policy(value: unknown): value is RemoteRung1Policy 
     && (policy.retryCount ?? 0) <= 10
     && Array.isArray(policy.backoffMs)
     && policy.backoffMs.length === policy.retryCount
-    && policy.backoffMs.every((delay) => Number.isSafeInteger(delay) && delay >= 0 && delay <= 60_000)
+    && policy.backoffMs.every((delay) => Number.isSafeInteger(delay) && delay >= 0 && delay <= PROVIDER_RETRY_WINDOW_MS)
     && Array.isArray(policy.retryableErrorKinds)
     && policy.retryableErrorKinds.length <= ADAPTER_ERROR_KINDS.length
     && policy.retryableErrorKinds.every((kind) => ADAPTER_ERROR_KINDS.includes(kind));
@@ -137,7 +137,6 @@ export function remoteRung1KindBackoff(
   return Array.isArray(schedule)
     && schedule.length <= 10
     && schedule.every((delay) => Number.isSafeInteger(delay) && delay >= 0 && delay <= PROVIDER_RETRY_WINDOW_MS)
-    && schedule.reduce((total, delay) => total + delay, 0) <= PROVIDER_RETRY_WINDOW_MS
     ? schedule as number[]
     : undefined;
 }

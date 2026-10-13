@@ -22,6 +22,7 @@ import { scheduledOccurrenceKey } from "../packages/core/src/core/scheduled-prom
 import { ScheduledPromptManager } from "../packages/core/src/core/scheduled-prompts/manager.js";
 import { simulateRetiredOwnerProcess } from "./restart-process-fixture.js";
 import { DEFAULT_REMOTE_RUNG1_POLICY } from "../packages/core/src/core/remote-spawn.js";
+import { fastProviderRetryClock } from "./helpers/provider-retry-clock.js";
 
 const REMOTE = "remote-synthetic";
 const MODEL = "synthetic-exact-model";
@@ -29,11 +30,7 @@ const RIDERS = ["SCHEDULE_CHANNEL_RIDER", "SCHEDULE_THREAD_RIDER"];
 const OVERRIDE_MODEL = "synthetic-override-model";
 const silent = pino({ level: "silent" }) as any;
 const cleanups: Array<() => void | Promise<void>> = [];
-beforeEach(() => {
-  const timeout = globalThis.setTimeout;
-  vi.spyOn(globalThis, "setTimeout").mockImplementation(((fn: () => void, ms?: number) =>
-    timeout(fn, [2000, 5000, 10000].includes(ms ?? 0) ? 0 : ms)) as typeof setTimeout);
-});
+beforeEach(fastProviderRetryClock);
 afterEach(async () => {
   for (const cleanup of cleanups.splice(0).reverse()) await cleanup();
   vi.useRealTimers(); vi.restoreAllMocks();
@@ -318,14 +315,19 @@ describe("pre-prompt bridge reconnect on the scheduled execution paths", () => {
 
 describe("#487 production remote construction paths", () => {
   const failAfterText = () => { throw new RequestError(-32603, "Internal error: native AGY exited_early", { code: "exited_early" }); };
+  const failingEpisode = (h: ReturnType<typeof setup>) => {
+    h.afterText.mockImplementationOnce(failAfterText);
+    // One partial answer, then failed continuations without fresh progress.
+    h.onPrompt.mockImplementation(async () => { if (h.calls.prompts.length > 1) failAfterText(); });
+  };
 
   it("consults the live bridge before scheduled occurrence recovery and only then cleans up", async () => {
-    const h = setup(); h.afterText.mockImplementation(failAfterText);
+    const h = setup(); failingEpisode(h);
     await h.make().runScheduledPrompt(h.row.id);
-    expect(h.calls.prompts).toHaveLength(4);
+    expect(h.calls.prompts).toHaveLength(8);
     expect(h.calls.prompts.every(prompt => prompt.sessionId === "scheduled-acp")).toBe(true);
     expect(h.calls.prompts.slice(1).every(prompt => prompt.prompt[0].text.startsWith("continue\n"))).toBe(true);
-    expect(h.mux.sendCmd.mock.calls).toEqual(Array.from({ length: 4 }, () => ["listSlots", {}]));
+    expect(h.mux.sendCmd.mock.calls).toEqual(Array.from({ length: 8 }, () => ["listSlots", {}]));
     expect(h.logs).toContainEqual(expect.objectContaining({ msg: "bridge slot health consulted before exit classification", slot: 0, alive: true }));
     expect(h.logs).toContainEqual(expect.objectContaining({ msg: "adapter error classified", errorKind: "protocol_error" }));
     expect(h.logs).not.toContainEqual(expect.objectContaining({ msg: "adapter error classified", errorKind: "agent_exit" }));
@@ -335,7 +337,7 @@ describe("#487 production remote construction paths", () => {
   });
 
   it("pins the real router runtime's health query to its spawning mux", async () => {
-    const h = setup(); h.afterText.mockImplementation(failAfterText);
+    const h = setup(); failingEpisode(h);
     const muxForSession = vi.fn(() => h.mux);
     const router = new SessionRouter({ logger: h.logger, store: h.store, profiles: [h.profile],
       modelCatalog: fixtureModelCatalog([h.profile]), defaultAgentId: "agy", defaultModel: MODEL,
@@ -348,7 +350,7 @@ describe("#487 production remote construction paths", () => {
       muxForSession.mockReturnValue(other);
       const error = await runtime.prompt("fixture", undefined, { recoveryScope: "ephemeral" }).catch(error => error);
       expect(readErrorClassification(error)?.errorKind).toBe("protocol_error");
-      expect(h.mux.sendCmd.mock.calls).toEqual(Array.from({ length: 4 }, () => ["listSlots", {}]));
+      expect(h.mux.sendCmd.mock.calls).toEqual(Array.from({ length: 8 }, () => ["listSlots", {}]));
       expect(other.sendCmd).not.toHaveBeenCalled();
       expect(h.calls.children[0].killed).toBe(false);
     } finally { await router.disposeAll(); }

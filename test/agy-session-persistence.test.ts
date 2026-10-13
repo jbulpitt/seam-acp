@@ -28,15 +28,11 @@ const storeWriter = fileURLToPath(new URL("./fixtures/agy-session-store-writer.m
 
 vi.mock("../packages/core/src/core/recovery-directive.js", async importOriginal => {
   const actual = await importOriginal<typeof import("../packages/core/src/core/recovery-directive.js")>();
-  return { ...actual, runBoundedRecovery: (opts: Parameters<typeof actual.runBoundedRecovery>[0]) =>
-    actual.runBoundedRecovery({ ...opts, sleep: async ms => {
-      vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
-      try {
-        const sleep = new Promise<void>(resolve => setTimeout(resolve, ms));
-        await vi.advanceTimersByTimeAsync(ms);
-        await sleep;
-      } finally { vi.useRealTimers(); }
-    } }) };
+  return { ...actual, runBoundedRecovery: (opts: Parameters<typeof actual.runBoundedRecovery>[0]) => {
+    let elapsed = 0;
+    return actual.runBoundedRecovery({ ...opts, now: () => Date.now() + elapsed,
+      sleep: async ms => { elapsed += ms; } });
+  } };
 });
 
 interface Harness {

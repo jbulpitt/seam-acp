@@ -4,6 +4,7 @@ import { RequestError, type SessionUpdate } from "@agentclientprotocol/sdk";
 import { classifyClaudeError, classifyCodexError, type AgentProfile } from "@seam/adapters";
 import { AgentRuntime, type AgentEvent } from "../packages/core/src/agents/agent-runtime.js";
 import { logger } from "../packages/core/src/lib/logger.js";
+import { fastProviderRetryClock } from "./helpers/provider-retry-clock.js";
 
 const CONTENTION = "Failed to refresh OAuth token: another Claude Code process is refreshing it or exited mid-refresh. This is usually transient; retry in a minute";
 const profile = { id: "claude", classifyError: classifyClaudeError } as unknown as AgentProfile;
@@ -29,9 +30,7 @@ function fixture(options: { output?: boolean; tool?: boolean; update?: SessionUp
     return { stopReason: "end_turn" };
   });
   Object.assign(runtime, { connection: { prompt, cancel: vi.fn() }, sessionId: options.sessionId ?? "s1", promptCapabilities: {} });
-  const timeout = globalThis.setTimeout;
-  vi.spyOn(globalThis, "setTimeout").mockImplementation(((fn: () => void, ms?: number) =>
-    timeout(fn, [2000, 5000, 10000, 30000, 120000, 300000, 420000].includes(ms ?? 0) ? 0 : ms)) as typeof setTimeout);
+  fastProviderRetryClock();
   return { runtime, prompt, events };
 }
 
@@ -125,7 +124,7 @@ describe("#448 one bounded prompt owner", () => {
 
   it("preserves the last provider cause when isolated retries run out", async () => {
     const cause = new Error(CONTENTION);
-    const { runtime, prompt } = fixture({ error: cause, failures: 99, output: true });
+    const { runtime, prompt } = fixture({ error: cause, failures: 99 });
     await expect(runtime.prompt("brief", undefined, { recoveryScope: "ephemeral" })).rejects.toBe(cause);
     expect(prompt).toHaveBeenCalledTimes(4);
     expect(JSON.stringify(prompt.mock.calls.slice(1))).not.toContain('"text":"brief"');
@@ -149,10 +148,10 @@ describe("#448 one bounded prompt owner", () => {
     expect(events.filter(event => event.kind === "agent-text").map(event => event.text)).toEqual(["partial answer", "recovered answer"]);
   });
 
-  it("exhausts one three-retry budget even after output", async () => {
-    const { runtime, prompt } = fixture({ failures: 99, output: true });
-    await expect(runtime.prompt("brief")).rejects.toThrow(/another Claude Code process/);
-    expect(prompt).toHaveBeenCalledTimes(4);
+  it("renews the auth-contention plan after productive continuation", async () => {
+    const { runtime, prompt } = fixture({ failures: 4, output: true });
+    await expect(runtime.prompt("brief")).resolves.toMatchObject({ stopReason: "end_turn" });
+    expect(prompt).toHaveBeenCalledTimes(5);
   });
 
   it("stops on a classified permanent authentication failure", async () => {

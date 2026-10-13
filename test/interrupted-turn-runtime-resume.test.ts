@@ -330,7 +330,7 @@ describe("explicit operator continuation after identity drift", () => {
     await expect(h.orch.dispatchInjectTurn(spec)).rejects.toMatchObject({ reason: expect.stringContaining("moved") });
     expect(h.calls.loads).toEqual([]);
     await expect(h.orch.dispatchInjectTurn(spec, true)).rejects.toMatchObject({ message: expect.stringContaining("synthetic remote session/load refusal") });
-    expect(h.calls.loads).toEqual([RECORDED, RECORDED, RECORDED]);
+    expect(h.calls.loads).toEqual(Array(6).fill(RECORDED));
     expect(h.calls.prompts).toEqual([]);
     expect(h.calls.news).toBe(0);
   });
@@ -620,7 +620,7 @@ describe("#302 real ACP handshake and strict session/load recovery", () => {
       await expect(resume(h)).rejects.toMatchObject({ name: "DispatchSuspendedError",
         reason: expect.stringMatching(mode === "no-load"
           ? /does not advertise session\/load/
-          : /boot recovery exhausted 3 pre-prompt acquisition attempts/) });
+          : /boot recovery exhausted 6 pre-prompt acquisition attempts/) });
       expect(h.calls.news).toBe(0);
       expect(h.calls.prompts).toEqual([]);
       expect(h.store.turnAttempts.get(id)).toMatchObject({
@@ -628,13 +628,12 @@ describe("#302 real ACP handshake and strict session/load recovery", () => {
         generation: 2,
         stalledReason: expect.stringMatching(mode === "no-load"
           ? /does not advertise session\/load/
-          : /boot recovery exhausted 3 pre-prompt acquisition attempts/),
+          : /boot recovery exhausted 6 pre-prompt acquisition attempts/),
       });
       if (mode === "reject-load") {
-        expect(h.calls.loads).toEqual([RECORDED, RECORDED, RECORDED]);
-        // The count is unchanged; ownership is not. Each load now belongs to
-        // one acquisition, not three retries inside a single router call.
-        expect(h.calls.initialized).toBe(3);
+        expect(h.calls.loads).toEqual(Array(6).fill(RECORDED));
+        // Each load belongs to a separate acquisition, not a router retry.
+        expect(h.calls.initialized).toBe(6);
         expect(h.calls.children.every(child => child.killed)).toBe(true);
       }
     },
@@ -644,18 +643,18 @@ describe("#302 real ACP handshake and strict session/load recovery", () => {
     const h = harness("local", "hang-load"); const id = seedPromptedAttempt(h);
     const startedAt = performance.now();
     await expect(resume(h)).rejects.toMatchObject({ name: "DispatchSuspendedError",
-      reason: expect.stringContaining("boot recovery exhausted 3 pre-prompt acquisition attempts") });
+      reason: expect.stringContaining("boot recovery exhausted 6 pre-prompt acquisition attempts") });
     const elapsedMs = performance.now() - startedAt;
     expect(elapsedMs).toBeGreaterThanOrEqual(15);
     expect(elapsedMs).toBeLessThan(500);
-    expect(h.calls.loads).toEqual([RECORDED, RECORDED, RECORDED]);
+    expect(h.calls.loads).toEqual(Array(6).fill(RECORDED));
     expect(h.calls.news).toBe(0);
     expect(h.calls.prompts).toEqual([]);
     expect(h.calls.children.every((child) => child.killed)).toBe(true);
     expect(h.store.turnAttempts.get(id)).toMatchObject({
       state: "suspended",
       generation: 2,
-      stalledReason: expect.stringContaining("boot recovery exhausted 3 pre-prompt acquisition attempts"),
+      stalledReason: expect.stringContaining("boot recovery exhausted 6 pre-prompt acquisition attempts"),
     });
   }, 1_000);
 

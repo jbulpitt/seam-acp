@@ -48,7 +48,8 @@ describe("#448 acquisition owner outcome", () => {
     expect(wrapped.cause).toBe(error);
     expect(bootErrorClassification(wrapped)).toMatchObject({ errorKind: "server_error" });
     expect(bootRecoveryBackoff(wrapped)).toEqual(providerRetryBackoff("server_error")!.map(delay => Math.max(30_000, delay)));
-    expect(bootRecoveryBackoff(new Error("ACP connection closed"))).toEqual([30_000, 30_000]);
+    expect(bootRecoveryBackoff(new Error("ACP connection closed")))
+      .toEqual(providerRetryBackoff("unclassified")!.map(delay => Math.max(30_000, delay)));
   });
 
   it.each(["quota_exhausted", "auth_required", "auth_expired", "model_not_found", "invalid_request"] as const)(

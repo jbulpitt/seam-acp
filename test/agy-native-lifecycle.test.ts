@@ -3,8 +3,8 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { pino } from "pino";
-import { describe, it, expect, vi } from "vitest";
-import { classifyAndAttach, makeAgyProfile, readErrorClassification } from "@seam/adapters";
+import { afterEach, describe, it, expect, vi } from "vitest";
+import { makeAgyProfile, readErrorClassification } from "@seam/adapters";
 import { AgentRuntime, type AgentEvent } from "../packages/core/src/agents/agent-runtime.js";
 import type { Logger } from "../packages/core/src/lib/logger.js";
 import { createOrdinaryAgyFixture } from "./helpers/agy-runtime-fixture.js";
@@ -15,22 +15,20 @@ const fixtures = fileURLToPath(new URL("./fixtures/agy-native-capabilities/", im
 const logger = pino({ level: "silent" }) as unknown as Logger;
 type Row = { scenario?: string; pid?: number; prompt?: string; conversationId?: string; resumedConversation?: string | null; args?: string[]; home?: string; signal?: string; mcpConfig?: unknown };
 const alive = (pid: number): boolean => { try { process.kill(pid, 0); return true; } catch { return false; } };
+const activeFixtures = new Set<() => Promise<void>>();
+afterEach(async () => { for (const close of [...activeFixtures]) await close(); });
 
 vi.mock("../packages/core/src/core/recovery-directive.js", async importOriginal => {
   const actual = await importOriginal<typeof import("../packages/core/src/core/recovery-directive.js")>();
-  return { ...actual, runBoundedRecovery: (opts: Parameters<typeof actual.runBoundedRecovery>[0]) =>
-    actual.runBoundedRecovery({ ...opts, sleep: async ms => {
-      // Advance only backoff; native process deadlines and IO stay real.
-      vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
-      try {
-        const sleep = new Promise<void>(resolve => setTimeout(resolve, ms));
-        await vi.advanceTimersByTimeAsync(ms);
-        await sleep;
-      } finally { vi.useRealTimers(); }
-    } }) };
+  return { ...actual, runBoundedRecovery: (opts: Parameters<typeof actual.runBoundedRecovery>[0]) => {
+    let elapsed = 0;
+    // Advance recovery's clock only; native process deadlines and I/O stay real.
+    return actual.runBoundedRecovery({ ...opts, now: () => Date.now() + elapsed,
+      sleep: async ms => { elapsed += ms; } });
+  } };
 });
 
-async function fixture(timeoutSeconds = 10, fixtureLogger: Logger = logger, terminalFailures = false) {
+async function fixture(timeoutSeconds = 10, fixtureLogger: Logger = logger, stopAfterNativeFailure = false) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "seam-agy-r5-"));
   const log = path.join(root, "invocations");
   const ordinary = createOrdinaryAgyFixture({
@@ -42,25 +40,33 @@ async function fixture(timeoutSeconds = 10, fixtureLogger: Logger = logger, term
     printTimeoutSeconds: timeoutSeconds, exposeGlobalStaging: false,
     mcpServers: [{ type: "http", name: "must-not-inherit", url: "http://127.0.0.1:9", headers: [] }],
   });
-  if (terminalFailures) {
-    const classify = profile.classifyError!.bind(profile);
-    profile.classifyError = error => classifyAndAttach(error, { ...classify(error), errorKind: "invalid_request" });
-  }
   const runtime = new AgentRuntime({ logger: fixtureLogger, profile, spawnFn: profile.spawn.bind(profile) });
   const events: AgentEvent[] = [];
-  runtime.onEvent(event => { events.push(event); });
-  await runtime.start();
-  await runtime.newSession({ cwd: root, model: "fixture-native-model", strictModel: true });
-  const rows = (): Row[] => fs.readFileSync(log, "utf8").trim().split("\n").map(line => JSON.parse(line) as Row);
-  return { root, runtime, ordinary, events, rows, async close() {
-    await runtime.dispose();
-    // Mutation runs may deliberately break reaping; never leave their fixtures.
-    for (const row of rows()) if (row.pid && alive(row.pid)) {
-      try { process.kill(row.pid, "SIGKILL"); } catch { /* already exited */ }
+  runtime.onEvent(async event => {
+    events.push(event);
+    if (stopAfterNativeFailure && event.kind === "recovery") await runtime.cancel();
+  });
+  const rows = (): Row[] => fs.existsSync(log) ? fs.readFileSync(log, "utf8").trim().split("\n")
+    .filter(Boolean).map(line => JSON.parse(line) as Row) : [];
+  let closing: Promise<void> | undefined;
+  const close = (): Promise<void> => closing ??= (async () => {
+    try { await runtime.dispose(); }
+    finally {
+      // The invocation log belongs to this fixture, including resistant children.
+      for (const row of rows()) if (row.pid && alive(row.pid)) {
+        try { process.kill(row.pid, "SIGKILL"); } catch { /* already exited */ }
+      }
+      ordinary.cleanup();
+      fs.rmSync(root, { recursive: true, force: true });
+      activeFixtures.delete(close);
     }
-    ordinary.cleanup();
-    fs.rmSync(root, { recursive: true, force: true });
-  } };
+  })();
+  activeFixtures.add(close);
+  try {
+    await runtime.start();
+    await runtime.newSession({ cwd: root, model: "fixture-native-model", strictModel: true });
+  } catch (error) { await close(); throw error; }
+  return { root, runtime, ordinary, events, rows, close };
 }
 
 describe.sequential("R5 native production lifecycle", () => {
@@ -194,9 +200,13 @@ describe.sequential("R5 native production lifecycle", () => {
   }, 15_000);
 
   it.each([["r5-stream-exit", "exited_early"], ["r5-stream-overflow", "output_overflow"], ["r5-stream-hang", "timeout"]])(
-    "#371 fallback retains lifecycle bounds for %s", async (prompt, code) => {
+    "#371 fallback retains native bounds and cancels recovery for %s", async (prompt, code) => {
       const f = await fixture(3, logger, true);
-      try { await expect(f.runtime.prompt(prompt, undefined, { recoveryScope: "ephemeral" })).rejects.toThrow(code); }
+      try {
+        await expect(f.runtime.prompt(prompt, undefined, { recoveryScope: "ephemeral" })).rejects.toThrow(code);
+        expect(f.rows().filter(row => row.args?.includes("-p"))).toHaveLength(1);
+        expect(f.events.filter(event => event.kind === "recovery")).toHaveLength(1);
+      }
       finally { await f.close(); }
     }, 15_000,
   );

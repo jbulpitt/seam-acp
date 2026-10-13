@@ -40,16 +40,12 @@ export const DEFAULT_REMOTE_RUNG1_POLICY: RemoteRung1Policy = Object.freeze<Remo
     "server_error",
     "timeout",
     "unclassified",
+    "quota_exhausted",
   ],
-  // #626: Claude Code raises auth_contention only when its OAuth refresh lock
-  // went unchanged for ~7.5s (holder dead or stalled) while the token is
-  // expired, and proper-lockfile will not take over that lock until it is 60s
-  // stale. 2s/5s/10s all land inside that window: on 2026-09-24 a wake failed
-  // four times in 46s and was dropped. One retry at 60s lands past it. The
-  // delay stays within the v1 validator's 60s cap, and old bridges ignore
-  // this field and keep `backoffMs`.
-  backoffMsByKind: { auth_contention: [60_000],
-    overloaded: [...providerRetryBackoff("overloaded")!], server_error: [...providerRetryBackoff("server_error")!] },
+  // Older v1 bridges ignore per-kind schedules and retain the short base plan.
+  backoffMsByKind: Object.fromEntries((["overloaded", "server_error", "rate_limit", "timeout",
+    "protocol_error", "unclassified", "auth_contention", "quota_exhausted"] as const)
+    .map(kind => [kind, [...providerRetryBackoff(kind)!]])),
 });
 
 export type MuxSpawnedProcess = ChildProcessByStdio<Writable, Readable, Readable> & {

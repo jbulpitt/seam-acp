@@ -36,6 +36,8 @@ export interface DispatchSpec {
   target: string;
   prompt: string;
   session: DispatchSessionMode;
+  /** Run next after the active turn; any session reset waits for this dispatch. */
+  interrupt?: { fresh: boolean };
   /** Sole human allowed to answer native async questions. Server-stamped from
    * the requesting turn (or explicitly supplied by the trusted spool operator),
    * never a model tool argument. Frozen with the attempt across restart. */
@@ -246,6 +248,7 @@ export const DispatchSpecSchema = z.object({
   target: z.string().min(1, "target (a Discord thread/channel id) is required"),
   prompt: z.string().min(1, "prompt is required"),
   session: z.enum(["live", "isolated"]).default("live"),
+  interrupt: z.object({ fresh: z.boolean() }).optional(),
   model: z.string().min(1).optional(),
   effort: z.string().min(1).optional(),
   cwd: z.string().min(1).optional(),
@@ -407,6 +410,7 @@ export function parseDispatchSpec(id: string, raw: string): DispatchSpec {
     ...(d.chainId ? { chainId: d.chainId } : {}),
     ...(d.stream !== undefined ? { stream: d.stream } : {}),
     ...(d.watchFeedback !== undefined ? { watchFeedback: d.watchFeedback } : {}),
+    ...(d.interrupt !== undefined ? { interrupt: d.interrupt } : {}),
     ...(d.resume !== undefined ? { resume: d.resume } : {}),
     createdUtc: d.createdUtc ?? new Date().toISOString(),
   };

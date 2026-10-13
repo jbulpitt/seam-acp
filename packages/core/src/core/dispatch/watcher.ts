@@ -520,6 +520,7 @@ export class DispatchWatcher {
     );
     claimed.sort(
       (a, b) =>
+        Number(Boolean(b.spec.interrupt)) - Number(Boolean(a.spec.interrupt)) ||
         (a.spec.createdUtc ?? "").localeCompare(b.spec.createdUtc ?? "") ||
         a.id.localeCompare(b.id)
     );
@@ -587,6 +588,25 @@ export class DispatchWatcher {
       return true;
     } finally {
       if (this.inFlight.get(id) === admitted) this.inFlight.delete(id);
+    }
+  }
+
+  /** Promote pending next-turn work inside the caller's already-owned live queue position. */
+  async runNextPending(target: string, execute: DispatchWatcherOpts["onDispatch"]): Promise<void> {
+    for (;;) {
+      const attempt = this.attempts.list("pending")
+        .filter(attempt => attempt.source === "dispatch" && attempt.spec.target === target && attempt.spec.interrupt)
+        .sort((a, b) => a.spec.createdUtc.localeCompare(b.spec.createdUtc) || a.id.localeCompare(b.id))[0];
+      if (!attempt) return;
+      const claimed = this.inFlight.has(attempt.id) ? null
+        : await this.claimSpec(attempt.id, Symbol(attempt.id), this.fenceSequence, this.globalEpoch);
+      const owner = claimed?.owner ?? this.inFlight.get(attempt.id);
+      if (!owner || !this.owns(owner)) return;
+      try {
+        await this.runSpec(attempt.id, owner.spec, owner, execute);
+      } finally {
+        if (claimed && this.inFlight.get(attempt.id) === owner) this.inFlight.delete(attempt.id);
+      }
     }
   }
 
@@ -1140,7 +1160,7 @@ export class DispatchWatcher {
         if (committed) this.logger.warn({ id, target: spec.target, err }, "dispatch: failed");
       }
     };
-    // An adopted live turn already holds its target FIFO position.
+    // Adopted and promoted live work already holds its target FIFO position.
     await (atAdmission ? run() : this.queueFor(spec.target).run(run));
   }
 

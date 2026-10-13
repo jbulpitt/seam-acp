@@ -363,8 +363,8 @@ async function makeHarness(opts?: {
               return queue;
             }),
         }),
-    // Interrupt (#67): default stub records the call and reports a cancelled
-    // redirect. Omit when disableInterrupt is set to test the refusal.
+    // Interrupt: default stub records a prioritized next-turn directive.
+    // Omit when disableInterrupt is set to test the refusal.
     ...(opts?.disableInterrupt
       ? {}
       : {
@@ -372,7 +372,7 @@ async function makeHarness(opts?: {
             opts?.interruptRedirect ??
             (async (caller, to, message, fresh) => {
               interrupts.push({ caller, to, message, fresh });
-              return { ok: true as const, cancelled: "cancelled" as const, fresh, dispatchId: "disp-int-1" };
+              return { ok: true as const, fresh, dispatchId: "disp-int-1" };
             }),
         }),
   });
@@ -2683,7 +2683,7 @@ describe("SeamMcpServer", () => {
     expect(text.indexOf("urgent-reorient")).toBeLessThan(text.indexOf("normal-first-note"));
   });
 
-  // --- send(interrupt) — preemptive cancel-and-redirect (#67) --------------
+  // --- send(interrupt) — next-turn priority ------------------------------
 
   it("send advertises interrupt + fresh in its input schema without changing the tool count (#67)", async () => {
     h = await makeHarness();
@@ -2695,7 +2695,7 @@ describe("SeamMcpServer", () => {
     expect(byName.get("send").inputSchema.properties.fresh.type).toBe("boolean");
   });
 
-  it("send(interrupt:true) routes to interruptRedirect — cancels + redirects, does NOT queue to the inbox (#67)", async () => {
+  it("send(interrupt:true) prioritizes a next-turn directive without cancelling or inboxing", async () => {
     h = await makeHarness();
     const { body } = await h.call(
       "tools/call",
@@ -2711,11 +2711,11 @@ describe("SeamMcpServer", () => {
     expect(h.interrupts[0]!.fresh).toBe(false);
     // ...and NOTHING was queued to the inbox (this is not a pull-only send).
     expect(h.inbox.size).toBe(0);
-    // The result confirms cancel + redirect + no report-back for the old handoff.
+    // The receipt describes next-turn priority, not cancellation or completion.
     const text = body.result.content[0].text as string;
-    expect(text).toContain("Interrupted thread thread-caller");
-    expect(text).toContain("session KEPT");
-    expect(text).toContain("NO result");
+    expect(text).toContain("next-turn directive disp-int-1 for thread thread-caller");
+    expect(text).toContain("Session KEPT");
+    expect(text).toContain("Running work is not cancelled");
   });
 
   it("send(interrupt:true, fresh:true) threads fresh through and reports a session reset (#67)", async () => {
@@ -2726,7 +2726,7 @@ describe("SeamMcpServer", () => {
       { "X-Seam-Session": "good-token" }
     );
     expect(h.interrupts[0]!.fresh).toBe(true);
-    expect(body.result.content[0].text).toContain("session RESET");
+    expect(body.result.content[0].text).toContain("reset requested when the directive starts");
   });
 
   it("send interrupt:true SUPERSEDES priority:true — interrupt path taken, inbox untouched (#67)", async () => {
@@ -2745,11 +2745,10 @@ describe("SeamMcpServer", () => {
     expect(h.inbox.size).toBe(0);
   });
 
-  it("send(interrupt:true) with no active turn degrades to immediate delivery (never lost) (#67)", async () => {
+  it("send(interrupt:true) does not claim immediate delivery even with no active turn", async () => {
     h = await makeHarness({
       interruptRedirect: async (_caller, _to, _message, fresh) => ({
         ok: true as const,
-        cancelled: "idle" as const,
         fresh,
         dispatchId: "disp-int-2",
       }),
@@ -2761,8 +2760,8 @@ describe("SeamMcpServer", () => {
     );
     expect(body.result.isError).toBeFalsy();
     const text = body.result.content[0].text as string;
-    expect(text).toContain("no active turn");
-    expect(text).toContain("delivered immediately");
+    expect(text).toContain("next-turn directive disp-int-2");
+    expect(text).not.toContain("delivered immediately");
   });
 
   it("send(interrupt:true) reports unsupported when the interruptRedirect dep is absent (#67)", async () => {

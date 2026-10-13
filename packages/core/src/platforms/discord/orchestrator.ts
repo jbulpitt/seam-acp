@@ -966,20 +966,12 @@ export class Orchestrator {
    *  call *during* that turn inherits depth+1. Absent ⇒ a fresh (depth-0) wake.
    *  In-memory by design — a restart breaks any runaway loop anyway. */
   private readonly activeWakeDepth = new Map<string, number>();
-  /** #67 interrupt support. `activeLiveDispatch` maps a target thread id → the
-   *  `spec.id` of the LIVE dispatched turn currently running in it, so a
-   *  concurrent `send(interrupt:true)` can find the in-flight handoff to cancel.
-   *  Set at the start of a live dispatched turn, cleared when it ends.
-   *  `interruptedDispatches` holds the ids of dispatches whose turn was
-   *  preemptively cancelled by an interrupt — the report-back / chain-advance
-   *  branch consumes it so the aborted handoff delivers no partial/stale result.
-   *  Both in-memory: a restart ends every live turn anyway. */
+  /** The live dispatch currently executing on each target, for explicit operator cancellation. */
   private readonly activeLiveDispatch = new Map<string, string>();
   /** Exact Voice Console artifact currently inside the ordinary user-turn
    *  pipeline, plus ids fenced by Package A's durable quarantine recovery. */
   private readonly activeThreadVoiceDispatch = new Map<string, string>();
   private readonly quarantinedThreadVoiceDispatches = new Set<string>();
-  private readonly interruptedDispatches = new Set<string>();
   /** Attempts whose exact bridge result is being adopted in this process.
    * Boot delivery reconciliation skips them so it cannot race the adopter's
    * nonce-backed first send; every other completed attempt still recovers. */
@@ -7708,34 +7700,14 @@ export class Orchestrator {
     return { ok: true, queued };
   }
 
-  /**
-   * Preemptive interrupt (#67): the agent-facing twin of `/seam steer now:true`
-   * (cmdSteer). CANCEL the target thread's in-flight dispatched turn and issue
-   * `message` as a fresh directive NOW into that same thread — never a queued
-   * inbox note. Three moves, mirroring the human steer-now path:
-   *
-   *  a. CANCEL — reuse the steer-now canceller `router.abortTurn`, but with
-   *     `{ force: true }` so a wedged turn is escalated to a force-kill (graceful
-   *     ACP cancel → 3s grace → dispose). An interrupt must GUARANTEE the turn is
-   *     gone before the redirect runs, else the new turn would overlap the old
-   *     one's event stream. If nothing was running (`idle`), we degrade
-   *     gracefully — the directive is still delivered so it is never lost.
-   *  b. SUPPRESS — if a LIVE dispatch was running in the target, mark its id
-   *     interrupted BEFORE cancelling, so when its cancelled `run()` reaches the
-   *     onward-delivery branch it skips report-back / chain advance and its
-   *     partial/stale output is never delivered to its `returnTo`.
-   *  c. REDIRECT — enqueue a NEW live dispatch (fresh id/correlation) into the
-   *     SAME thread carrying the framed directive. With `fresh:true` we reset the
-   *     session first (`clearAcpSession`) for a clean slate; otherwise the live
-   *     session/context is kept so the agent pivots off its partial work.
-   */
+  /** Prioritize a directive after the active turn, preserving queued work and its reports. */
   async interruptRedirect(
     caller: SessionRecord,
     to: string,
     message: string,
     fresh: boolean
   ): Promise<
-    | { ok: true; cancelled: "idle" | "cancelled" | "unacknowledged" | "killed"; fresh: boolean; dispatchId: string }
+    | { ok: true; fresh: boolean; dispatchId: string }
     | { ok: false; error: string }
   > {
     const body = (message ?? "").trim();
@@ -7743,45 +7715,14 @@ export class Orchestrator {
     const target = (to ?? "").trim();
     if (!target) return { ok: false, error: "to (a target thread id) is required." };
 
-    const record = await this.bindThreadRecord({ platform: caller.platform, id: target });
-
-    // (b) Mark the in-flight LIVE handoff interrupted BEFORE the cancel, so its
-    // cancelled run() is guaranteed to find the flag set when it reaches the
-    // onward-delivery branch. No live dispatch running ⇒ nothing to suppress.
-    const activeId = this.activeLiveDispatch.get(target);
-    if (activeId) {
-      this.interruptedDispatches.add(activeId);
-      // Cancellation must beat a simultaneous restart durably, not just via
-      // the old in-memory reporting flag. Preserve a completed-output winner.
-      const cancelled = this.store.turnAttempts.cancel(activeId);
-      if (cancelled) await this.dispatchWatcher?.cancelRunning({ id: activeId });
-    }
-
-    // (a) Cancel — the steer-now canceller, escalated to force so a wedged turn
-    // can't block the redirect. "idle" ⇒ there was no active turn (degrade to
-    // immediate delivery below).
-    const cancelled = await this.router.abortTurn(record.id, { force: true });
-
-    // (c) fresh:true ⇒ reset the session first (clean slate) — clear the stored
-    // ACP session id so the redirected turn starts a brand-new session. Kept
-    // otherwise, so the agent pivots off its partial work with full context.
-    if (fresh) {
-      await this.router.invalidate(record.id, {
-        clearAcpSession: true,
-        bindingChange: { source: "Orchestrator.interruptRedirect", cause: "operator requested fresh interrupt" },
-        operatorIntent: "replace-session",
-      });
-    }
-
-    // (c) Redirect — enqueue a fresh LIVE dispatch of the framed directive into
-    // the SAME thread. New id/correlation; report back to the interrupter so the
-    // caller sees the outcome (mirrors the `steer` MCP tool's returnTo=caller).
+    await this.bindThreadRecord({ platform: caller.platform, id: target });
     const dispatchId = randomUUID();
     const spec: DispatchSpec = {
       id: dispatchId,
       target,
       prompt: frameInterruptPrompt(body, fresh),
       session: "live",
+      interrupt: { fresh },
       returnTo: caller.channelRef,
       originThreadRef: caller.channelRef,
       kind: "handoff",
@@ -7791,10 +7732,10 @@ export class Orchestrator {
     await enqueueDispatchSpec(this.config.DATA_DIR, spec, this.store.turnAttempts);
 
     this.logger.info(
-      { from: caller.channelRef, to: target, fresh, cancelled, interruptedDispatch: activeId ?? null, dispatchId },
-      "inbox: interrupt-and-redirect"
+      { from: caller.channelRef, to: target, fresh, dispatchId },
+      "inbox: next-turn directive queued"
     );
-    return { ok: true, cancelled, fresh, dispatchId };
+    return { ok: true, fresh, dispatchId };
   }
 
   /**
@@ -9803,7 +9744,6 @@ export class Orchestrator {
           && current.outcome?.error !== "cancelled by operator") {
           throw err;
         }
-        this.interruptedDispatches.delete(spec.id);
         let completionPending = false;
         try { this.store.updateDelegationStatus(spec.id, "failed"); }
         catch { completionPending = true; }
@@ -9967,7 +9907,21 @@ export class Orchestrator {
       if (this.restartCutoff) {
         throw DispatchSuspendedError.shutdown(spec.id, "restart cutoff reached before the turn started");
       }
+      if (effectiveSession === "live" && !isResume && !spec.interrupt && queueFence) {
+        await this.dispatchWatcher?.runNextPending(spec.target,
+          (next, resume) => this.dispatchInjectTurn(next, resume, queueFence));
+      }
       await this.waitForTurnHost(spec.id, workerLocation, phase);
+      if (effectiveSession === "live") {
+        if (spec.interrupt?.fresh && !isResume) {
+          await this.router.invalidate(record.id, {
+            clearAcpSession: true,
+            bindingChange: { source: "Orchestrator.interruptRedirect", cause: "operator requested fresh interrupt" },
+            operatorIntent: "replace-session",
+          });
+        }
+        Object.assign(record, this.store.get(record.id) ?? record);
+      }
     };
     // Keep the FIFO position while the host is away; execution clocks start after readiness.
     if (effectiveSession === "isolated") await prepareRun();
@@ -10176,7 +10130,7 @@ export class Orchestrator {
             throw DispatchSuspendedError.defect(spec.id,
               "a resumed turn produced an outcome without this attempt submitting a prompt");
           }
-          const suppressed = Boolean(outcome.cancelled || this.interruptedDispatches.has(spec.id) || !this.queueFenceCurrent(queueFence));
+          const suppressed = Boolean(outcome.cancelled || !this.queueFenceCurrent(queueFence));
           const workerStatus = outcome.timedOut ? "timed_out" : outcome.error ? "failed" : "completed";
           // Winner and full onward plan captured BEFORE finally/result callbacks,
           // history deletion, delivery claims, or terminal ledger publication.
@@ -10456,10 +10410,7 @@ export class Orchestrator {
       // deeper (chain-depth cap). Cleared in the finally below.
       const isWake = spec.kind === "wake";
       if (isWake) this.activeWakeDepth.set(spec.target, spec.wakeChainDepth ?? 0);
-      // #67: register this LIVE turn as the target thread's interruptible
-      // dispatch so a concurrent `send(interrupt:true)` can find and cancel it.
-      // Only live runs share the thread's persistent runtime (what an interrupt
-      // cancels); isolated/preset runs use a throwaway runtime and are unaffected.
+      // Track live work for the explicit operator-cancel path.
       const isLiveDispatch = effectiveSession === "live";
       if (isLiveDispatch) this.activeLiveDispatch.set(spec.target, spec.id);
       // Both kinds carry an HTTP waiter that must be settled when the turn ends.
@@ -10620,9 +10571,7 @@ export class Orchestrator {
                   ? "the dispatched turn was cancelled"
                   : !this.queueFenceCurrent(queueFence)
                     ? "the dispatched turn was discarded (thread reset)"
-                    : this.interruptedDispatches.has(spec.id)
-                      ? "the dispatched turn was interrupted"
-                      : undefined;
+                    : undefined;
           this.choiceResults.turnEnded(
             spec.id,
             // Choice keeps its original contract untouched: a declared result or
@@ -10668,7 +10617,7 @@ export class Orchestrator {
       // reach whoever it was reporting to; the interrupt already issued a fresh
       // directive in its place. Consuming here (not at the gate) also means a
       // throw in the visibility/finalize code below can never leak the flag.
-      const wasInterrupted = this.interruptedDispatches.delete(spec.id) || result.cancelled === true;
+      const wasInterrupted = result.cancelled === true;
 
       // The prompt is over and its outcome is durable. Nothing below touches
       // the runtime, so let the next turn start before presentation cleanup.

@@ -423,26 +423,14 @@ export interface SeamMcpServerDeps {
     message: string,
     priority?: boolean
   ) => { ok: true; queued: number } | { ok: false; error: string };
-  /**
-   * Preemptive interrupt (#67): CANCEL the target thread's in-flight dispatched
-   * turn and issue `message` as a NEW directive NOW — the agent-facing twin of
-   * the `/seam steer now:true` human path. Unlike `pushInbox` (pull-only, queued)
-   * this reuses the steer-now canceller (graceful ACP cancel escalating to force
-   * when wedged), SUPPRESSES the cancelled handoff's report-back so its
-   * partial/stale output is never delivered, and re-prompts the SAME thread as a
-   * fresh turn. `fresh:false` keeps the target's session/context (it pivots off
-   * partial work); `fresh:true` resets the session first (clean slate). If the
-   * target has no active turn it degrades to immediate delivery so the directive
-   * is never silently lost. Undefined ⇒ interrupts are unsupported on this
-   * deployment. Wired in index.ts to `orchestrator.interruptRedirect`.
-   */
+  /** Queue a next-turn directive without cancelling the active turn or queued work. */
   interruptRedirect?: (
     caller: SessionRecord,
     to: string,
     message: string,
     fresh: boolean
   ) => Promise<
-    | { ok: true; cancelled: "idle" | "cancelled" | "unacknowledged" | "killed"; fresh: boolean; dispatchId: string }
+    | { ok: true; fresh: boolean; dispatchId: string }
     | { ok: false; error: string }
   >;
   /**
@@ -722,7 +710,7 @@ const TOOLS = [
       "`workProgress` answers whether execution was observed. An observed bridge-owned rung-1 retry that is not succeeded, exhausted, or awaiting_app counts as execution; assigned_not_started does not. Do not fold the two fields together. " +
       "Read three handoff states. " +
       "(1) The entry contains `handoff decision: mid-recovery`: busy is false and the bridge still owns the retry. Hand off `continue`. Do not dispatch new work, do not skip the thread, and do not treat it as a live turn. " +
-      "(2) busy:true, with or without a bridge retry listed: a live turn or admitted queue is running. Prefer `send` (PULL-ONLY — it waits and never interrupts) unless you truly need to preempt, in which case use `steer` or `send(interrupt:true)`. The live turn wins over the retry. " +
+      "(2) busy:true, with or without a bridge retry listed: a live turn or admitted queue is running. Prefer `send` (PULL-ONLY); `send(interrupt:true)` prioritizes a next-turn directive without cancelling running work. The live turn wins over the retry. " +
       "(3) busy:false and no mid-recovery line: the teammate is free. `handoff`/`forward` start a turn. Choose on fit. " +
       "A retained or stalled attempt is housekeeping, not mid-recovery and not a health verdict. It still surfaces as retained work and does NOT block handoff — never skip the thread or replace it with a cold preset because of it. " +
       "`queueState` is runtime_busy, queued, wedged, or idle. Read-only and " +
@@ -1252,14 +1240,10 @@ const TOOLS = [
       "note (priority omitted/false) it merely absorbs into its current plan. Priority is STILL pull-only and " +
       "queued — it does NOT cancel or interrupt the target's turn; it only changes how urgently the message " +
       "reads when polled. " +
-      "Set `interrupt: true` for the PREEMPTIVE tier: instead of queuing, it CANCELS the target's in-flight " +
-      "turn right now and issues `message` as a fresh directive in that same thread — use it when the target " +
-      "is actively working the wrong thing and cannot wait for its next poll. `interrupt` SUPERSEDES " +
-      "`priority`: if both are set the interrupt path is taken and `priority` is ignored (an interrupt is " +
-      "already preemptive). With `interrupt`, `fresh` chooses context: `fresh:false` (default) keeps the " +
-      "target's session so it pivots off its partial work; `fresh:true` resets the session first for a clean " +
-      "slate. The cancelled handoff delivers NO result back to whoever it was reporting to. If the target has " +
-      "no active turn, the directive is still delivered immediately (never lost).",
+      "Set `interrupt: true` to run `message` as the target's NEXT turn, ahead of queued dispatches. " +
+      "Running work is NOT cancelled, and queued work keeps its order and runs afterwards. This is not an " +
+      "inbox note. `interrupt` supersedes `priority`. With `interrupt`, `fresh:false` (default) keeps the " +
+      "session/context; `fresh:true` resets it only when the directive starts, after the active turn finishes.",
     inputSchema: {
       type: "object",
       properties: {
@@ -1275,16 +1259,14 @@ const TOOLS = [
         interrupt: {
           type: "boolean",
           description:
-            "When true, PREEMPT the target: cancel its in-flight turn now and issue `message` as a fresh " +
-            "directive in that thread, rather than queuing to its inbox. Default false. Supersedes `priority`. " +
-            "The cancelled turn's report-back is suppressed. If the target has no active turn, the directive is " +
-            "delivered immediately anyway.",
+            "When true, queue the directive as the target's next turn ahead of pending dispatches. " +
+            "Never cancels running work; queued work runs afterwards in order. Default false. Supersedes priority.",
         },
         fresh: {
           type: "boolean",
           description:
             "Only meaningful with `interrupt:true`. false (default) keeps the target's session/context so it " +
-            "pivots off its partial work; true resets the session first for a clean slate.",
+            "uses its existing context; true resets the session when the directive starts, never during the active turn.",
         },
       },
       required: ["to", "message"],
@@ -3460,9 +3442,7 @@ export class SeamMcpServer {
     const interrupt = optionalBool(args, "interrupt") ?? false;
     const fresh = optionalBool(args, "fresh") ?? false;
 
-    // #67: interrupt SUPERSEDES priority (an interrupt is already preemptive).
-    // Route to the cancel-and-redirect path; the queued/priority inbox path
-    // below is untouched (#61/#66 behavior) when interrupt is off.
+    // Next-turn directives supersede pull-only inbox priority.
     if (interrupt) {
       if (!this.deps.interruptRedirect) {
         return textResult("interrupt is not supported on this deployment.", true);
@@ -3472,20 +3452,13 @@ export class SeamMcpServer {
         return textResult(`Interrupt failed: ${res.error}`, true);
       }
       this.logger.info(
-        { from: caller.channelRef, to, fresh, cancelled: res.cancelled, dispatchId: res.dispatchId },
+        { from: caller.channelRef, to, fresh, dispatchId: res.dispatchId },
         "seam-mcp interrupt redirected"
       );
-      const cancelNote =
-        res.cancelled === "idle"
-          ? `The target had no active turn, so nothing was cancelled — your directive was delivered immediately anyway. `
-          : res.cancelled === "killed"
-            ? `The target's turn was wedged and had to be force-killed, then `
-            : `Cancelled the target's in-flight turn, then `;
       return textResult(
-        `🧭 Interrupted thread ${to}. ` +
-          cancelNote +
-          `issued your directive as a fresh turn there (${res.fresh ? "session RESET — clean slate" : "session KEPT — it pivots off its partial work"}). ` +
-          `The interrupted handoff will deliver NO result back to whoever it was reporting to.`
+        `🧭 Queued next-turn directive ${res.dispatchId} for thread ${to}, ahead of pending dispatches. ` +
+          `Running work is not cancelled; queued work runs afterwards in its original order. ` +
+          (res.fresh ? "Session reset requested when the directive starts." : "Session KEPT — existing context is preserved.")
       );
     }
 

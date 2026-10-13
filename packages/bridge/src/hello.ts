@@ -14,6 +14,6 @@ export function bridgeHello(input: Omit<HelloFrame, "v" | "type" | "protocolVers
     v: input.protocolVersion,
     type: "hello",
     ...input,
-    capabilities: { durableSlots: true },
+    capabilities: { durableSlots: true, accountUsage: true },
   };
 }

@@ -23,7 +23,29 @@ There are three capability families:
 
 ## 1. Model intelligence data (read-only, cache-backed)
 
-All three tools read a cache that a background job refreshes ~every 12h (and on
+### `agent_quota({ agentId?, location? })`
+
+Quota snapshots are global per agent by default, using the controller's account
+readers (Grok can also use its existing live connection). An operator can opt a
+binding into separate tracking with `/seamadmin bridge quota name:<host>
+agent:<id> tracking:separate`; `tracking:global` removes that opt-in.
+The setting is durably persisted and audited through the existing configuration
+path; `/seamadmin bridge list` reports its status. No account-identity detection
+is performed.
+
+For an opted-in host, its bridge runs the existing usage reader with its own
+credentials. The card adds an `agent @ host` row with the reading's host and age.
+Each row keeps the existing polling/event-driven cadence and Refresh control.
+Offline reads show stale last-good data with the real cause, or unavailable
+values—not zero. Older bridges without the account-usage RPC show the separate
+setting as unavailable and remain global until updated.
+
+`agent_quota` with a location selects its separate row when enabled, otherwise
+the global row. Omit both arguments for all global and separate rows. Use
+`ageSeconds`, `stale`, `liveError` and nullable usage values when judging headroom;
+a failed host read is not proof of a fresh global account reading.
+
+The three model-intelligence tools read a cache that a background job refreshes ~every 12h (and on
 boot). They **never** make a live API call or spawn a CLI, so they return in
 milliseconds and are safe to call as often as you like. Source: Artificial
 Analysis (benchmarks) + GitHub Copilot pricing, joined to Seam's current

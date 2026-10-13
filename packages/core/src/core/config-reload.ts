@@ -36,6 +36,7 @@ export interface PresetMaps {
   channelPresets: Map<string, ChannelPreset>;
   threadPresets: Map<string, ThreadPreset>;
   bridgePresets: Map<string, BridgeHostConfig>;
+  quotaTracking?: Map<string, "separate">;
   presetsDisabledReason?: string;
 }
 
@@ -80,6 +81,10 @@ export function reloadChannelPresets(
     (target as PresetMaps).bridgePresets = new Map();
   }
   applyInPlace(target.bridgePresets, next.bridgePresets);
+  if (next.quotaTracking) {
+    target.quotaTracking ??= new Map();
+    applyInPlace(target.quotaTracking, next.quotaTracking);
+  } else target.quotaTracking?.clear();
   target.presetsDisabledReason = undefined;
   logger.info(
     {

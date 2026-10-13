@@ -590,6 +590,12 @@ export function buildSeamAdminCommand(): SlashCommandBuilder {
     g
       .setName("bridge")
       .setDescription("Admin-only: pair and configure remote bridges")
+      .addSubcommand(sub => declareAccess(sub, { kind: "mutating" }, "ephemeral")
+        .setName("quota").setDescription("Track one agent globally or separately on this host")
+        .addStringOption(o => o.setName("name").setDescription("Host id or name (local for this host)").setRequired(true))
+        .addStringOption(o => o.setName("agent").setDescription("Configured agent id").setRequired(true))
+        .addStringOption(o => o.setName("tracking").setDescription("Global by default; separate uses host credentials").setRequired(true)
+          .addChoices({ name: "Global", value: "global" }, { name: "Separate", value: "separate" })))
       .addSubcommand((sub) =>
         declareAccess(sub, { kind: "mutating" }, "ephemeral")
           .setName("add")

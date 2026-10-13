@@ -823,6 +823,26 @@ export class ConfigMutationService {
     });
   }
 
+  setQuotaTracking(opts: { agentId: string; location: string; tracking: "global" | "separate"; actor: MutationActor }):
+    { ok: true; auditId: string } | { ok: false; error: string } {
+    const loaded = this.readPresetsDoc();
+    if (!loaded.ok) return loaded;
+    const key = `${opts.agentId}@${opts.location}`;
+    const before = (loaded.doc.quotaTracking as Record<string, string> | undefined)?.[key] ?? "global";
+    const quotaTracking = { ...(loaded.doc.quotaTracking as Record<string, string> | undefined) };
+    if (opts.tracking === "global") delete quotaTracking[key];
+    else quotaTracking[key] = opts.tracking;
+    const candidate = { ...loaded.doc, quotaTracking };
+    const parsed = PresetsFileSchema.safeParse(candidate);
+    if (!parsed.success) return { ok: false, error: parsed.error.message };
+    const correlationId = randomUUID();
+    const persisted = this.persistPresetsCandidate({ file: loaded.file, candidate, tmpId: correlationId });
+    if (!persisted.ok) return persisted;
+    const audit = this.writeAudit({ tier: "bridge", scope: `quota:${key}`, correlationId, actor: opts.actor,
+      summary: `quota tracking ${key}: ${opts.tracking}`, before: { tracking: before }, after: { tracking: opts.tracking } });
+    return { ok: true, auditId: audit.id };
+  }
+
   /** Persist verified host runtime identity without storing environment values. */
   recordRuntimeProvenance(opts: {
     agentId: string;

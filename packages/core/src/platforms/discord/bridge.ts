@@ -16,6 +16,7 @@ export interface BridgeSlashDeps {
   hub?: BridgeHub;
   logger: Logger;
   publicWsUrl: string;
+  refreshQuotaBindings?: () => Promise<void>;
 }
 
 function actorOf(i: ChatInputCommandInteraction): MutationActor {
@@ -41,6 +42,8 @@ export async function handleBridgeSlash(
 ): Promise<void> {
   const sub = interaction.options.getSubcommand(true);
   switch (sub) {
+    case "quota":
+      return cmdQuota(interaction, deps);
     case "add":
       return cmdAdd(interaction, deps);
     case "rotate":
@@ -57,6 +60,24 @@ export async function handleBridgeSlash(
         flags: MessageFlags.Ephemeral,
       });
   }
+}
+
+async function cmdQuota(i: ChatInputCommandInteraction, deps: BridgeSlashDeps): Promise<void> {
+  const name = i.options.getString("name", true).trim();
+  const location = name === "local" ? "local" : resolveBridgeId(deps, name) ?? name;
+  const agentId = i.options.getString("agent", true).trim();
+  const tracking = i.options.getString("tracking", true);
+  if (tracking !== "global" && tracking !== "separate") {
+    await replyToInteraction(i, { content: `Unknown quota tracking mode: ${tracking}`, flags: MessageFlags.Ephemeral });
+    return;
+  }
+  const result = deps.mutation.setQuotaTracking({ agentId, location, tracking, actor: actorOf(i) });
+  if (!result.ok) return void await replyToInteraction(i, { content: result.error, flags: MessageFlags.Ephemeral });
+  const live = deps.hub?.get(location);
+  const legacy = tracking === "separate" && live && !live.capabilities?.accountUsage;
+  await replyToInteraction(i, { content: `Quota tracking for ${agentId}@${location}: ${tracking}.` +
+    (legacy ? " Separate tracking is unavailable on this bridge; global tracking applies until its bridge supports account usage RPC." : ""), flags: MessageFlags.Ephemeral });
+  await deps.refreshQuotaBindings?.();
 }
 
 async function cmdAdd(
@@ -159,7 +180,11 @@ async function cmdList(
   deps: BridgeSlashDeps
 ): Promise<void> {
   const paired = [...deps.config.bridgePresets.values()];
-  if (paired.length === 0) {
+  const quotaSettings = [...(deps.config.quotaTracking ?? [])].map(([key]) => {
+    const location = key.slice(key.lastIndexOf("@") + 1), live = deps.hub?.get(location);
+    return `${key}: ${live && !live.capabilities?.accountUsage ? "unavailable (legacy bridge; global)" : !live ? "separate (host offline; reading stale/unavailable)" : "separate"}`;
+  });
+  if (paired.length === 0 && quotaSettings.length === 0) {
     await replyToInteraction(i, {
       content: "No bridges paired. Use `/seamadmin bridge add` (admin).",
       flags: MessageFlags.Ephemeral,
@@ -175,6 +200,7 @@ async function cmdList(
       : "offline";
     return `${emoji} **${short}** \`${b.id}\` — ${conn}`;
   });
+  if (quotaSettings.length) lines.push("Quota tracking (unlisted bindings are global):", ...quotaSettings);
   await replyToInteraction(i, { content: lines.join("\n"), flags: MessageFlags.Ephemeral });
 }
 

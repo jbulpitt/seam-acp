@@ -43,22 +43,26 @@ export function quotaPollIntervalMs(turnsInLast10Minutes: number): number {
   return 3_600_000;
 }
 
+export const quotaKey = (agentId: string, location?: string): string => location ? `${agentId}@${location}` : agentId;
+
 export class QuotaRegistry {
   private readonly quotas = new Map<string, AgentQuota>();
 
-  get(agentId: string): AgentQuota | undefined {
-    return this.quotas.get(agentId);
+  get(agentId: string, location?: string): AgentQuota | undefined {
+    return this.quotas.get(quotaKey(agentId, location));
   }
 
   all(): AgentQuota[] {
     return [...this.quotas.values()].sort((a, b) =>
-      a.displayName.localeCompare(b.displayName) || a.agentId.localeCompare(b.agentId)
+      a.displayName.localeCompare(b.displayName) || quotaKey(a.agentId, a.location).localeCompare(quotaKey(b.agentId, b.location))
     );
   }
 
   set(quota: AgentQuota): void {
-    this.quotas.set(quota.agentId, quota);
+    this.quotas.set(quotaKey(quota.agentId, quota.location), quota);
   }
+
+  delete(key: string): void { this.quotas.delete(key); }
 }
 
 export class AgentTurnWindow {

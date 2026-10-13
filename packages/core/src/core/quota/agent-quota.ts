@@ -25,9 +25,7 @@ export interface QuotaPool {
   weekly: QuotaWindow;
 }
 
-export interface AgentQuota {
-  agentId: string;
-  displayName: string;
+export interface AgentQuota extends QuotaAgentIdentity {
   ok: boolean;
   error?: string;
   plan?: string | null;
@@ -41,11 +39,15 @@ export interface AgentQuota {
   fetchedAt: number | null;
   source?: CodexUsageData["source"];
   liveError?: string;
+  stale?: boolean;
 }
 
 export interface QuotaAgentIdentity {
   agentId: string;
   displayName: string;
+  location?: string;
+  host?: string;
+  trackingUnavailable?: string;
 }
 
 export const ROLLING_WINDOW_SECONDS = 5 * 60 * 60;

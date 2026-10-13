@@ -31,7 +31,7 @@ export const ADAPTER_RPC_METHODS = [
 
 export type AdapterRpcMethod = (typeof ADAPTER_RPC_METHODS)[number];
 
-export const HOST_RPC_METHODS = ["shell"] as const;
+export const HOST_RPC_METHODS = ["shell", "readAccountUsage"] as const;
 export type HostRpcMethod = (typeof HOST_RPC_METHODS)[number];
 
 const ADAPTER_RPC_SET = new Set<string>(ADAPTER_RPC_METHODS);
@@ -90,6 +90,7 @@ export interface HelloFrame {
   capabilities?: {
     /** Agent slots outlive this bridge process and can be reconciled by id. */
     durableSlots?: boolean;
+    accountUsage?: boolean;
   };
   /** Legacy rollout field. Receivers must ignore it. */
   devMode?: boolean;

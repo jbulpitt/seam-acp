@@ -88,6 +88,7 @@ export async function verifyStagedReleaseCatalogRpcs(
 export interface ConnectedBridge {
   bridgeId: string;
   instanceId: string;
+  capabilities?: HelloFrame["capabilities"];
   host: {
     os: string;
     arch: string;
@@ -627,6 +628,7 @@ export class BridgeHub {
     const conn: ConnectedBridge = {
       bridgeId: expectedId,
       instanceId: hello.instanceId,
+      capabilities: hello.capabilities,
       host: hello.host ?? { os: "unknown", arch: "unknown" },
       releaseSha,
       ...(hello.sessiond ? { sessiond: { ...hello.sessiond, releaseSha: releaseShaFromHello(hello.sessiond.releaseSha) } } : {}),

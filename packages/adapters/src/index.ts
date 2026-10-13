@@ -34,6 +34,7 @@ export * from "./read-attachment.js";
 export * from "./project-mcp.js";
 export * from "./workspace-scan.js";
 export * from "./adapter-rpc.js";
+export * from "./account-usage.js";
 export * from "./profiles/claude.js";
 export * from "./profiles/claude-catalog.js";
 export * from "./profiles/copilot.js";

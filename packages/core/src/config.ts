@@ -1080,6 +1080,7 @@ export const PresetsFileSchema = z.object({
   threads: z.record(threadPresetId, ThreadPresetSchema).optional().default({}),
   /** D11 host config + D8 pairing hashes. Per-thread @location lives on `threads`. */
   bridges: z.record(bridgeIdKey, BridgeHostSchema).optional().default({}),
+  quotaTracking: z.record(z.string().regex(/^[^@\s]+@[a-z0-9][a-z0-9-]{0,63}$/, "quota key must be agent@host"), z.literal("separate")).optional(),
 });
 
 export type ChannelPresetField<T> = { value: T };
@@ -1121,6 +1122,7 @@ export type Config = Omit<z.infer<typeof Schema>, "BRAND_ICON_BASE_URL" | "SIMPL
   channelPresets: Map<string, ChannelPreset>;
   threadPresets: Map<string, ThreadPreset>;
   bridgePresets: Map<string, BridgeHostConfig>;
+  quotaTracking?: Map<string, "separate">;
 };
 
 export function disabledFeatureReason(config: Pick<Config, "disabledFeatures">, feature: string): string | undefined {
@@ -1511,6 +1513,7 @@ export function buildChannelPresetMaps(
   channelPresets: Map<string, ChannelPreset>;
   threadPresets: Map<string, ThreadPreset>;
   bridgePresets: Map<string, BridgeHostConfig>;
+  quotaTracking?: Map<string, "separate">;
 } {
   const channelPresets = new Map<string, ChannelPreset>();
   const threadPresets = new Map<string, ThreadPreset>();
@@ -1535,7 +1538,7 @@ export function buildChannelPresetMaps(
   }
   if (options.dropInvalidEntries && parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
     const root = parsed as Record<string, unknown>;
-    for (const section of ["channels", "threads", "bridges"] as const) {
+    for (const section of ["channels", "threads", "bridges", "quotaTracking"] as const) {
       const entries = root[section];
       if (!entries || typeof entries !== "object" || Array.isArray(entries)) continue;
       const entrySchema = PresetsFileSchema.shape[section];
@@ -1573,7 +1576,8 @@ export function buildChannelPresetMaps(
     }
     bridgePresets.set(id, normalized);
   }
-  return { channelPresets, threadPresets, bridgePresets };
+  return { channelPresets, threadPresets, bridgePresets,
+    ...(result.data.quotaTracking ? { quotaTracking: new Map(Object.entries(result.data.quotaTracking)) } : {}) };
 }
 
 /** Models for xAI Grok Build.  Context windows from docs.x.ai/developers/models.

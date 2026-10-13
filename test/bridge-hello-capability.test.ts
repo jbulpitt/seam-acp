@@ -10,7 +10,7 @@ describe("#574 bridge hello capability", () => {
       host: { os: "linux", arch: "x64" },
       agents: [],
     });
-    expect(hello.capabilities).toEqual({ durableSlots: true });
+    expect(hello.capabilities).toEqual({ durableSlots: true, accountUsage: true });
     expect(hello.protocolVersion).toBe(1);
   });
 });

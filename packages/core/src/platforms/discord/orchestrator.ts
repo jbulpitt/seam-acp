@@ -871,6 +871,7 @@ export class Orchestrator {
   private readonly renderer: Renderer;
   private readonly modelCatalog: ModelCatalogService;
   private readonly refreshModelIntelligence?: (forceSources: boolean) => Promise<ModelIntelligenceRefreshResult>;
+  private readonly refreshQuotaBindings?: () => Promise<void>;
   /** Installed by index.ts only while the upstream-status subsystem is active. */
   /** Installed by index.ts only when the staging test driver is configured. */
   private canaryRunner?: (target: CanaryTarget) => Promise<CanaryRunResult>;
@@ -1042,6 +1043,7 @@ export class Orchestrator {
     plugins?: PluginHost;
     modelCatalog: ModelCatalogService;
     refreshModelIntelligence?: (forceSources: boolean) => Promise<ModelIntelligenceRefreshResult>;
+    refreshQuotaBindings?: () => Promise<void>;
     restartProcess?: () => Promise<void>;
     /** Test seam for bounded boot-recovery backoff. */
     recoverySleep?: (ms: number) => Promise<void>;
@@ -1056,6 +1058,7 @@ export class Orchestrator {
     this.recoverySleep = opts.recoverySleep ?? ((ms) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
     this.modelCatalog = opts.modelCatalog;
     this.refreshModelIntelligence = opts.refreshModelIntelligence;
+    this.refreshQuotaBindings = opts.refreshQuotaBindings;
     this.restartProcess = opts.restartProcess ?? restartSeamAcpProcess;
     this.plugins = opts.plugins ?? new PluginHost(this.logger, { storageRoot: this.config.DATA_DIR, storageAliases: { presets: { "presets.sqlite": this.store.dbPath } } });
     this.registerKernelComponents();
@@ -5507,6 +5510,7 @@ export class Orchestrator {
         mutation: this.configMutation,
         hub: this.bridgeHub,
         logger: this.logger,
+        refreshQuotaBindings: this.refreshQuotaBindings,
         publicWsUrl:
           this.bridgeHub?.publicWsUrl() ?? `ws://127.0.0.1:${this.config.HEALTH_PORT}/bridge`,
       });

@@ -20,7 +20,7 @@ import {
 
 const cleanups: (() => void)[] = [];
 afterEach(() => { for (const f of cleanups.splice(0).reverse()) f(); vi.restoreAllMocks(); });
-function setup() {
+function setup(logger = pino({ level: "silent" })) {
   const dir = mkdtempSync(path.join(tmpdir(), "seam-250-inbound-"));
   cleanups.push(() => rmSync(dir, { force: true, recursive: true }));
   const store = new SessionStore(path.join(dir, "test.db"));
@@ -70,7 +70,7 @@ function setup() {
     DEFAULT_MODEL: "test", REPO_EMOJIS: new Map(), SEAM_TURN_RESUME_ENABLED: true,
     channelPresets: new Map(), threadPresets: new Map() };
   const make = (bridgeHub?: unknown) => {
-    const orch = new Orchestrator({ logger: pino({ level: "silent" }) as any,
+    const orch = new Orchestrator({ logger: logger as any,
       modelCatalog: fixtureModelCatalog([]), store, router: router as any,
       adapter: adapter as any, renderer: discordRenderer as any, config: config as any });
     if (bridgeHub) orch.setBridgeHub(bridgeHub as any);
@@ -90,6 +90,32 @@ function setup() {
 }
 
 describe("#250 human turn production pipeline, synthetic transport only", () => {
+  it("logs a recovered in-flight turn's restart suspension below error without settling it", async () => {
+    const lines: string[] = [];
+    const logger = pino({ level: "debug" }, { write(line: string) { lines.push(line); } });
+    const h = setup(logger);
+    const row = h.store.recoverInboundChannel("worker", new Date().toISOString());
+    const recovered = (h.orch as any).startRecoveredInbound(row) as Promise<void>;
+    await h.started;
+    h.orch.suspendForRestart();
+    const suspended = h.store.turnAttempts.get("inbound-1");
+    const admission = h.store.getInbound("1");
+    h.release();
+    await recovered;
+    const logs = lines.map(line => JSON.parse(line));
+    expect(logs.filter(log => log.level >= 50)).toEqual([]);
+    expect(logs.find(log => log.suspension === "shutdown")).toMatchObject({
+      level: 30, channelRef: "worker", messageId: "1",
+      reason: "restart cutoff reached before this turn finished",
+      err: { type: "DispatchSuspendedError", suspension: "shutdown",
+        reason: "restart cutoff reached before this turn finished" },
+    });
+    expect(h.store.turnAttempts.get("inbound-1")).toEqual(suspended);
+    expect(h.store.getInbound("1")).toEqual(admission);
+    expect(suspended).toMatchObject({ state: "suspended", promptStarted: true,
+      acpSessionId: "recorded-acp", outcome: null });
+  });
+
   it.each(["inventory", "exit", "error", "connection result"].flatMap(loss =>
     ["before loss", "during retirement"].map(arrival => ({ loss, arrival }))))(
     "lost owner FIFO ($loss) continues before a successor queued $arrival", async ({ loss, arrival }) => {

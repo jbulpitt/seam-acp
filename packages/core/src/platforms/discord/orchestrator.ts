@@ -5229,9 +5229,6 @@ export class Orchestrator {
         }
         // #76: write the terminal state BEFORE removing the marker (writeDone
         // ordering). Skip if the command layer already finalized it as cancelled.
-        if (this.liveTurnByChannel.get(channel.id) === liveMarkerId) {
-          this.liveTurnByChannel.delete(channel.id);
-        }
         await wrapUpStep("live-marker-finish", () => finishLiveTurn(this.config.DATA_DIR, {
           id: liveMarkerId,
           status: "completed",
@@ -5241,6 +5238,9 @@ export class Orchestrator {
           this.logger.warn({ err, id: liveMarkerId }, "live-turn marker finish failed")
         ));
         if (humanAttempt && humanOutcomeOwned && humanDelivered) this.store.turnAttempts.markDeliveryDone(humanAttempt.id);
+        if (this.liveTurnByChannel.get(channel.id) === liveMarkerId) {
+          this.liveTurnByChannel.delete(channel.id);
+        }
         if (humanActivitySubmitted && (!humanAttempt || humanOutcomeOwned || this.store.turnAttempts.get(humanAttempt.id)?.state === "cancelled")) {
           this.plugins.turnActivity.emit({ type: "turn-completed", turnId: liveMarkerId, timestampMs: Date.now(),
             binding: { agentId: described.agent.value, location: described.location.value, account: described.agent.value, sessionId: record.id } });
@@ -15747,7 +15747,9 @@ export class Orchestrator {
     }
     for (const attempt of pending) {
       if (!attempt.remoteRecovery || !attempt.deliveryNonce
-        || this.adoptingRemoteResults.has(attempt.id) || this.remoteAdoptionFinishers.has(attempt.id)) continue;
+        || this.adoptingRemoteResults.has(attempt.id) || this.remoteAdoptionFinishers.has(attempt.id)
+        || this.liveTurnByChannel.get(attempt.spec.target) === attempt.id
+        || this.activeLiveDispatch.get(attempt.spec.target) === attempt.id) continue;
       if (Date.now() < (this.adoptedDeliveryRetryAfter.get(attempt.id) ?? 0)) continue;
       // Back off on the existing tick; the receipt survives a controller restart.
       this.adoptedDeliveryRetryAfter.set(attempt.id, Date.now() + 30_000);

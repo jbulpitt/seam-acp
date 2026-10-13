@@ -47,6 +47,15 @@ export function googleErrorStatus(error: unknown): number | undefined {
   return e?.response?.status ?? e?.status;
 }
 
+export function isGoogleChatCreateCollision(error: unknown, requestId: string): boolean {
+  const cause = (error as { response?: { data?: { error?: {
+    code?: number; status?: string; message?: string; errors?: Array<{ domain?: string; reason?: string }>;
+  } } } } | null)?.response?.data?.error;
+  return googleErrorStatus(error) === 400 && cause?.code === 400 && cause.status === "INVALID_ARGUMENT"
+    && cause.message === `Failed to create a message with the specified request id ${requestId} and thread key . A message may have already been created with the same request id, but a different thread key.`
+    && cause.errors?.some(item => item.domain === "global" && item.reason === "badRequest") === true;
+}
+
 export function isGoogleChatThreadReplyLimit(error: unknown): boolean {
   const cause = (error as { response?: { data?: { error?: {
     code?: number; status?: string; message?: string; errors?: Array<{ domain?: string; reason?: string }>;

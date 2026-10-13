@@ -16,7 +16,7 @@ import { fetchMessagePage as fetchSpaceMessagePage, findMessageByNonce as findSp
 import type { GoogleDriveUploader } from "../../core/files/google-drive-upload.js";
 import type { ComponentAcknowledgement } from "../interaction-response.js";
 import type { GoogleApi } from "./api.js";
-import { googleErrorStatus, isGoogleChatThreadReplyLimit } from "./api.js";
+import { googleErrorStatus, isGoogleChatCreateCollision, isGoogleChatThreadReplyLimit } from "./api.js";
 import { googleChatClientMessageId } from "./message-id.js";
 import { imageMimeType, uploadChatImage } from "./media-upload.js";
 import { PubSubPullTransport } from "./transport.js";
@@ -445,7 +445,7 @@ export class GoogleChatAdapter implements ChatAdapter {
               ...(clientId ? { messageId: clientId } : {}) },
             data: { ...content, ...(thread ? { thread: { name: thread } } : {}) } });
         } catch (err) {
-          if (!clientId || googleErrorStatus(err) !== 409) throw err;
+          if (!clientId || (googleErrorStatus(err) !== 409 && !isGoogleChatCreateCollision(err, requestId))) throw err;
           deduplicated = true;
           return this.opts.api.request<ChatMessage>(mediaClientId ? "messages" : "chat", { method: "GET", url: `${root}/${space}/messages/${clientId}` });
         }

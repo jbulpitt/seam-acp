@@ -114,7 +114,7 @@ afterEach(() => {
 });
 
 describe("Orchestrator.interruptRedirect (#67)", () => {
-  it("cancels (force), marks the active dispatch interrupted, and enqueues a fresh live redirect", async () => {
+  it("preserves the active dispatch and enqueues a next-turn directive", async () => {
     const { orch, abortTurn, invalidate } = makeOrch();
     // A live handoff is running in the target thread.
     (orch as any).activeLiveDispatch.set("thread-worker", "disp-A");
@@ -122,34 +122,29 @@ describe("Orchestrator.interruptRedirect (#67)", () => {
     const res = await orch.interruptRedirect(caller(), "thread-worker", "pivot to the hotfix", false);
     expect(res.ok).toBe(true);
     if (!res.ok) return;
-    expect(res.cancelled).toBe("cancelled");
     expect(res.fresh).toBe(false);
 
-    // (a) Reused the steer-now canceller, escalated to force.
-    expect(abortTurn).toHaveBeenCalledWith("discord:thread-worker", { force: true });
+    expect(abortTurn).not.toHaveBeenCalled();
     // Keep-context: NO session reset when fresh=false.
     expect(invalidate).not.toHaveBeenCalled();
 
-    // (b) The in-flight handoff is marked interrupted so its report-back is skipped.
-    expect((orch as any).interruptedDispatches.has("disp-A")).toBe(true);
-
-    // (c) A fresh LIVE dispatch was enqueued into the SAME thread, framed as an
-    // interrupt, reporting back to the interrupter.
+    // The directive retains the same target and its own report-back route.
     const specs = pendingSpecs();
     expect(specs).toHaveLength(1);
     const spec = specs[0]!;
     expect(spec.target).toBe("thread-worker");
     expect(spec.session).toBe("live");
+    expect(spec.interrupt).toEqual({ fresh: false });
     expect(spec.returnTo).toBe("thread-boss");
     expect(spec.kind).toBe("handoff");
     expect(spec.id).toBe(res.dispatchId);
     expect(spec.correlationId).toBe(res.dispatchId);
     expect(spec.prompt).toContain("<seam-interrupt>");
     expect(spec.prompt).toContain("pivot to the hotfix");
-    expect(spec.prompt).toContain("Abandon that partial work");
+    expect(spec.prompt).toContain("previous turn was not cancelled");
   });
 
-  it("fresh:true resets the target session before redirecting (clean slate)", async () => {
+  it("fresh:true records a deferred reset without invalidating the active session", async () => {
     const { orch, invalidate } = makeOrch();
     (orch as any).activeLiveDispatch.set("thread-worker", "disp-A");
 
@@ -157,19 +152,14 @@ describe("Orchestrator.interruptRedirect (#67)", () => {
     expect(res.ok).toBe(true);
     if (!res.ok) return;
     expect(res.fresh).toBe(true);
-    // Session reset: clearAcpSession so the redirected turn starts fresh.
-    // Removing operator intent leaves older work bound to the discarded session recoverable.
-    expect(invalidate).toHaveBeenCalledWith("discord:thread-worker", {
-      clearAcpSession: true,
-      bindingChange: { source: "Orchestrator.interruptRedirect", cause: "operator requested fresh interrupt" },
-      operatorIntent: "replace-session",
-    });
+    expect(invalidate).not.toHaveBeenCalled();
     const spec = pendingSpecs()[0]!;
+    expect(spec.interrupt).toEqual({ fresh: true });
     expect(spec.prompt).toContain("session was reset");
   });
 
-  it("no active turn on the target → degrades to immediate delivery (directive never lost)", async () => {
-    // abortTurn reports idle (nothing running); interrupt still delivers.
+  it("no active turn still enqueues the same next-turn directive", async () => {
+    // No active runtime is needed to admit the directive.
     const abortTurn = vi.fn(async () => "idle");
     const { orch } = makeOrch({ abortTurn });
     // Note: NO activeLiveDispatch registered for the target.
@@ -177,9 +167,7 @@ describe("Orchestrator.interruptRedirect (#67)", () => {
     const res = await orch.interruptRedirect(caller(), "thread-idle", "do this next", false);
     expect(res.ok).toBe(true);
     if (!res.ok) return;
-    expect(res.cancelled).toBe("idle");
-    // Nothing to suppress, but the directive is still enqueued.
-    expect((orch as any).interruptedDispatches.size).toBe(0);
+    expect(abortTurn).not.toHaveBeenCalled();
     const specs = pendingSpecs();
     expect(specs).toHaveLength(1);
     expect(specs[0]!.target).toBe("thread-idle");
@@ -195,22 +183,15 @@ describe("Orchestrator.interruptRedirect (#67)", () => {
   });
 });
 
-describe("dispatchInjectTurn report-back suppression on interrupt (#67)", () => {
-  it("an interrupted handoff delivers NO report-back to its returnTo (the easy-to-forget bug)", async () => {
+describe("dispatchInjectTurn report-back suppression on explicit cancellation", () => {
+  it("an operator-cancelled handoff delivers no stale report-back", async () => {
     const { orch, abortTurn } = makeOrch();
     const reportBack = vi.fn(async () => {});
     (orch as any).enqueueReportBack = reportBack;
 
-    // The worker's live turn: WHILE it runs, a teammate fires an interrupt at the
-    // same thread. This is the real timing — the interrupt marks the in-flight
-    // dispatch, then the cancelled turn returns partial output.
+    // Explicit operator cancellation, not next-turn prioritization.
     (orch as any).injectTurn = async () => {
-      await orch.interruptRedirect(
-        caller({ id: "discord:thread-interrupter", channelRef: "thread-interrupter" }),
-        "thread-worker",
-        "drop it — do the hotfix",
-        false
-      );
+      store.turnAttempts.cancel("disp-original");
       return { text: "partial, stale work", error: undefined, stopReason: "cancelled" };
     };
 
@@ -230,41 +211,19 @@ describe("dispatchInjectTurn report-back suppression on interrupt (#67)", () => 
       name: "DispatchTurnError", suppressedOnward: true, stopReason: "cancelled",
     });
 
-    // The cancel machinery ran against the target...
-    expect(abortTurn).toHaveBeenCalledWith("discord:thread-worker", { force: true });
+    expect(abortTurn).not.toHaveBeenCalled();
     // ...and — the whole point — the aborted handoff's report-back was SKIPPED:
     // its partial/stale output never reaches thread-boss.
     expect(reportBack).not.toHaveBeenCalled();
-    // The flag was consumed (no leak).
-    expect((orch as any).interruptedDispatches.has("disp-original")).toBe(false);
-
-    // The interrupt's OWN fresh directive was enqueued into the same thread,
-    // reporting back to the interrupter instead.
-    const redirect = pendingSpecs().find((s) => s.prompt.includes("<seam-interrupt>"));
-    expect(redirect).toBeTruthy();
-    expect(redirect!.target).toBe("thread-worker");
-    expect(redirect!.returnTo).toBe("thread-interrupter");
+    expect(pendingSpecs()).toHaveLength(0);
   });
 
-  /**
-   * #174 × #67. The suppression decision lives only in memory, but the
-   * done-file that survives the process copies the spec's `returnTo`/`chainId`
-   * unconditionally. If the ledger write then fails (the shutdown race #174 is
-   * about), boot replay reads that routing and delivers the report-back the
-   * interrupt deliberately withheld — the stale answer landing after the
-   * directive that replaced it. So the error that carries the turn into the
-   * done-file has to carry the suppression too.
-   */
-  it("marks an interrupted completion as suppressed when the ledger write fails", async () => {
+  // Explicit cancellation must keep report-back suppression in the durable error.
+  it("marks an operator-cancelled completion as suppressed when the ledger write fails", async () => {
     const { orch } = makeOrch();
     (orch as any).enqueueReportBack = vi.fn(async () => {});
     (orch as any).injectTurn = async () => {
-      await orch.interruptRedirect(
-        caller({ id: "discord:thread-interrupter", channelRef: "thread-interrupter" }),
-        "thread-worker",
-        "drop it — do the hotfix",
-        false
-      );
+      store.turnAttempts.cancel("disp-suppressed");
       return { text: "partial, stale work", error: undefined, stopReason: "cancelled" };
     };
     // The store closes underneath the completion — the exact #174 failure.

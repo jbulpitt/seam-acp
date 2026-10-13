@@ -72,7 +72,7 @@ still govern the current thread. This primer does not replace them.
    - `handoff` assigns work and reports the result back automatically.
    - `forward` relays content and starts a turn without specialist framing.
    - `steer` redirects a currently running teammate while preserving context.
-   - `send(..., interrupt:true)` cancels and replaces the target's current turn;
+   - `send(..., interrupt:true)` runs next after the current turn, ahead of queued dispatches; it never cancels running work;
      reserve it for a genuine preemption. `fresh:true` also drops its context.
    - `chain` runs a fixed sequence whose output feeds the next worker.
 4. Prefer a thread worker when that teammate already owns relevant context.

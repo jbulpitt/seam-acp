@@ -51,8 +51,13 @@ async function fixture() {
   store.upsert(record(target));
   store.upsert(record(callerRef));
   const events: string[] = [];
+  const contexts = new Map<string, string>();
   const abortTurn = vi.fn(async () => "cancelled" as const);
-  const invalidate = vi.fn(async () => { events.push("reset"); });
+  const invalidate = vi.fn(async (sessionId: string) => {
+    events.push("reset");
+    const row = store.get(sessionId)!;
+    store.upsert({ ...row, acpSessionId: "" }, { source: "fixture", cause: "requested fresh session" });
+  });
   const router = testSessionRouter({
     listProfiles: () => [], getProfile: () => ({ id: "claude" }), hasRuntime: () => true,
     ensureSessionRecord: (input: { channelRef: string }) => store.getByChannel("discord", input.channelRef) ?? record(input.channelRef),
@@ -74,12 +79,17 @@ async function fixture() {
   orch.reconcileRemoteRecoveries = async () => {};
   const held = gate();
   // Only provider execution/Discord rendering are synthetic; both queue layers and SQL are real.
-  (orch as any).injectTurn = async (_record: SessionRecord, prompt: string) => {
+  (orch as any).injectTurn = async (row: SessionRecord, prompt: string, opts: any) => {
     const name = prompt.includes("<seam-interrupt>") ? "interrupt" : ["active", "first", "second"].find(value => prompt.includes(`JOB_${value}`))!;
+    contexts.set(name, row.acpSessionId);
+    opts.onSession?.("fixture-acp");
+    opts.lifecycle?.beforePrompt?.();
     events.push(`start:${name}`);
     if (name === "active") await held.promise;
     events.push(`end:${name}`);
-    return { text: `DONE_${name}`, stopReason: "end_turn" };
+    const outcome = { text: `DONE_${name}`, stopReason: "end_turn" };
+    opts.lifecycle?.onOutcome?.(outcome);
+    return outcome;
   };
   const watcher = createRuntimeDispatchWatcher({ dataDir: dir, attempts: store.turnAttempts, logger,
     runtime: orch, pollMs: 60_000 });
@@ -109,7 +119,7 @@ async function fixture() {
     id, target, prompt: `JOB_${name}`, session: "live", kind: "handoff", returnTo: callerRef,
     createdUtc: `2026-01-01T00:00:0${second}.000Z`,
   }, store.turnAttempts);
-  return { orch, watcher, send, enqueue, events, held, abortTurn, invalidate };
+  return { orch, watcher, send, enqueue, events, contexts, held, abortTurn, invalidate };
 }
 
 describe("send interrupt next-turn ordering", () => {
@@ -127,6 +137,7 @@ describe("send interrupt next-turn ordering", () => {
         await h.watcher.start();
       }
       await vi.waitFor(() => expect(h.events).toContain("start:active"));
+      if (active === "dispatch") expect(store.turnAttempts.get("active")?.promptStarted).toBe(true);
       await h.enqueue("z-first", "first", 1);
       await h.enqueue("a-second", "second", 2);
       const queued = h.watcher.tick();
@@ -167,6 +178,7 @@ describe("send interrupt next-turn ordering", () => {
     expect(h.events.filter(event => !event.startsWith("report:"))).toEqual([
       "start:active", "end:active", "reset", "start:interrupt", "end:interrupt",
     ]);
+    expect(h.contexts.get("interrupt")).toBe("");
   });
 
   it("keeps next-turn priority in SQL when the controller has not started its watcher yet", async () => {

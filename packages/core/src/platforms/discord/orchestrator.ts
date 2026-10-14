@@ -205,6 +205,10 @@ import {
   parkReauthAttempt,
   ReauthParked,
   reauthWaitNotice,
+  reauthStalledReason,
+  reauthWaitingSince,
+  reauthWaitingStatus,
+  REAUTH_CHECKING_TEXT,
   type ReauthPark,
 } from "../../core/reauth-negotiation.js";
 import { reauthAcceptAttemptId, reauthChoiceSpec } from "../../core/reauth-card.js";
@@ -981,6 +985,7 @@ export class Orchestrator {
   private readonly remoteAdoptionFinishers = new Map<string, (retainChild?: boolean) => void>();
   private remoteRecoveryReconciliation?: Promise<void>;
   private readonly adoptedDeliveryRetryAfter = new Map<string, number>();
+  private readonly reauthChecks = new Map<string, { checks: number; nextCheck: number; since: string }>();
   private readonly remoteRecoveryLogFailures = new Map<string, {
     cause: string; err: unknown; sinceMs: number; lastLoggedMs: number;
   }>();
@@ -3693,7 +3698,9 @@ export class Orchestrator {
         const staged = this.stagedRecovery.get(channel.id);
         this.stagedRecovery.delete(channel.id);
         const render = staged ?? await this.processRestartRender(priorHuman);
-        if (!staged) await this.postResumeNotice(channel.id, render.note, admission?.deliveryChannel);
+        if (!staged && !priorHuman.stalledReason?.startsWith(REAUTH_CHECKING_TEXT)) {
+          await this.postResumeNotice(channel.id, render.note, admission?.deliveryChannel);
+        }
         msg = { ...msg, text: render.prompt, attachments: undefined };
       } else {
         this.stagedRecovery.delete(channel.id);
@@ -5088,7 +5095,7 @@ export class Orchestrator {
         const refusal = humanOutcomeOwned ? null : humanRefusal();
         if (refusal) throw refusal;
         if (err instanceof ReauthParked) {
-          const parked = parkReauthAttempt(this.store.turnAttempts, humanAttempt.id, err.park);
+          const parked = parkReauthAttempt(this.store.turnAttempts, humanAttempt.id, err.park, humanResume);
           if (parked) {
             status.setState("Waiting");
             status.setAction("provider authentication");
@@ -10523,7 +10530,7 @@ export class Orchestrator {
         this.assertQueueFence(queueFence);
       } catch (err) {
         if (err instanceof ReauthParked && attempt && lifecycle && !outcomeOwned) {
-          const parked = parkReauthAttempt(this.store.turnAttempts, spec.id, err.park);
+          const parked = parkReauthAttempt(this.store.turnAttempts, spec.id, err.park, previousAttempt?.promptStarted === true);
           if (parked) {
             await this.postReauthCard(spec.target, spec.id, err.park, err.message);
             throw parked;
@@ -11190,7 +11197,7 @@ export class Orchestrator {
     } catch (err) {
       failure = err;
       if (err instanceof ReauthParked && attempt && lifecycle && !outcomeOwned) {
-        const parked = parkReauthAttempt(attemptStore, spec.id, err.park);
+        const parked = parkReauthAttempt(attemptStore, spec.id, err.park, previousAttempt?.promptStarted === true);
         if (parked) {
           await this.postReauthCard(spec.target, spec.id, err.park, err.message);
           failure = parked;
@@ -12640,6 +12647,7 @@ export class Orchestrator {
     queueFence?: ChannelQueueFence): Promise<void> {
     const saved = this.store.scheduledOccurrences.get(key.id);
     const prior = this.store.turnAttempts.get(key.id);
+    const reauthAccepted = prior?.stalledReason?.startsWith(REAUTH_COMPLETED_PREFIX) === true;
     if (saved?.settled) return;
     if (saved && prior?.state === "completed") { await this.deliverScheduledCompletion(saved, prior); return; }
     if (saved && prior?.state === "cancelled") { await this.settleScheduleCancellation(saved); return; }
@@ -12667,13 +12675,15 @@ export class Orchestrator {
     }
     if (this.restartCutoff) return;
     if (isAwaitingReauth(prior?.stalledReason)) {
-      this.patchScheduledStatus(row.id, `retained: ${prior.stalledReason}`);
+      this.patchScheduledStatus(row.id, reauthWaitingStatus(prior, row.timezone));
+      this.recheckReauth(prior, true);
       return;
     }
     // `startPrompt` requires a recorded ACP id, so the feature flag is the only
     // pre-runtime gate. session/load capability is verified by the same strict
     // reattachment path used for human turns (#302).
-    if (prior?.promptStarted && !manualResume && !this.config.SEAM_TURN_RESUME_ENABLED) return;
+    if (prior?.promptStarted && !manualResume && !reauthAccepted
+      && !this.config.SEAM_TURN_RESUME_ENABLED) return;
     try {
       this.store.turnAttempts.registerOwner(this.attemptBoot);
       const attempt = this.store.turnAttempts.claim({ id: key.id, target: row.channelRef,
@@ -12698,10 +12708,10 @@ export class Orchestrator {
         if (err instanceof ReauthParked) {
           const current = this.store.turnAttempts.get(attempt.id);
           if (current) {
-            const parked = parkReauthAttempt(this.store.turnAttempts, attempt.id, err.park);
+            const parked = parkReauthAttempt(this.store.turnAttempts, attempt.id, err.park, prior?.promptStarted === true);
             if (parked) {
-              this.patchScheduledStatus(row.id, `retained: ${parked.reason}`);
               await this.postReauthCard(row.channelRef, attempt.id, err.park, err.message);
+              this.patchScheduledStatus(row.id, reauthWaitingStatus(this.store.turnAttempts.get(attempt.id)!, row.timezone));
               return;
             }
           }
@@ -12977,7 +12987,7 @@ export class Orchestrator {
           }
           if (done.state === "suspended") {
             if (isAwaitingReauth(done.stalledReason)) {
-              this.patchScheduledStatus(id, `retained: ${done.stalledReason}`);
+              this.patchScheduledStatus(id, reauthWaitingStatus(done, row.timezone));
               return;
             }
             throw DispatchSuspendedError.defect(done.id,
@@ -15614,7 +15624,12 @@ export class Orchestrator {
   /** The dispatch tick reconciles owners and retries their recorded deliveries. */
   reconcileRemoteRecoveries(): Promise<void> {
     if (this.remoteRecoveryReconciliation) return this.remoteRecoveryReconciliation;
-    const run = this.reconcileRemoteRecoveriesInner().then(() => this.retryAdoptedDeliveries())
+    const run = this.reconcileRemoteRecoveriesInner().then(() => this.retryAdoptedDeliveries()).then(() => {
+      if (this.restartCutoff) return;
+      for (const attempt of this.store.turnAttempts.list("suspended")) {
+        if (isAwaitingReauth(attempt.stalledReason)) this.recheckReauth(attempt);
+      }
+    })
       .finally(() => { this.remoteRecoveryReconciliation = undefined; });
     this.remoteRecoveryReconciliation = run;
     return run;
@@ -15758,8 +15773,8 @@ export class Orchestrator {
     this.logger.info({ attempt: attempt.id, location: binding.location, slot: binding.slot },
       "parked auth recovery handed back to its recorded session");
     if (accepted && resumeAccepted) {
-      void this.continueAcceptedReauth(attempt.id).catch(err =>
-        this.logger.warn({ err, attempt: attempt.id }, "reauth continuation deferred"));
+      this.trackContinuation(this.continueAcceptedReauth(attempt.id, !attempt.stalledReason?.startsWith(REAUTH_CHECKING_TEXT))
+        .then(() => {}).catch(err => this.logger.warn({ err, attempt: attempt.id }, "reauth continuation deferred")));
     }
     return true;
   }
@@ -19929,10 +19944,16 @@ export class Orchestrator {
   }
 
   private async retireParkedTurnCards(attemptId: string): Promise<void> {
-    const target = this.store.turnAttempts.get(attemptId)?.spec.target;
+    const attempt = this.store.turnAttempts.get(attemptId);
+    const target = attempt?.spec.target;
+    // A human accept closes its card first; an open sign-in card survived automatic recovery.
+    const automatic = attempt?.state === "completed" && attempt.outcome?.status === "completed";
+    this.reauthChecks.delete(attemptId);
     for (const card of this.store.listOpenChoiceCards(target ? this.platformForChannel(target) : PLATFORM)) {
       if (card.options.some(option => parkedTurnAction(option.payload)?.attemptId === attemptId)
-        && this.store.cancelChoiceCard(card.id, card.channelRef)) {
+        && (automatic && card.options.some(option => reauthAcceptAttemptId(option.payload) === attemptId)
+          ? this.store.completeChoiceCard(card.id, card.channelRef, "Resumed automatically after provider sign-in was restored.")
+          : this.store.cancelChoiceCard(card.id, card.channelRef))) {
         await this.refreshChoiceCard(this.store.getChoiceCard(card.id)!);
       }
     }
@@ -20050,6 +20071,15 @@ export class Orchestrator {
     try {
       const attempt = this.store.turnAttempts.get(attemptId);
       const platform = attempt && channelRef === attempt.spec.target ? this.platformForAttempt(attempt) : this.platformForChannel(channelRef);
+      const existing = this.store.listOpenChoiceCards(platform, channelRef).find(card =>
+        card.options.some(option => reauthAcceptAttemptId(option.payload) === attemptId));
+      if (attempt) {
+        const check = this.reauthChecks.get(attemptId) ?? { checks: 0,
+          nextCheck: Date.now() + providerRetryBackoff("unclassified")![0]!,
+          since: existing?.createdUtc ?? reauthWaitingSince(attempt) };
+        this.reauthChecks.set(attemptId, check);
+        this.store.turnAttempts.markStalled(attemptId, `${reauthStalledReason(park)} since=${check.since}`);
+      }
       const record = await this.bindThreadRecord({ platform, id: channelRef });
       const resolved = this.router.describeConfig(record);
       const location = attempt?.spec.location ?? resolved.location.value;
@@ -20059,6 +20089,12 @@ export class Orchestrator {
         cause,
         promptStarted: attempt?.promptStarted === true,
       };
+      if (existing) {
+        this.store.setChoiceBody(existing.id, reauthWaitNotice(park, context));
+        await this.refreshChoiceCard(this.store.getChoiceCard(existing.id)!);
+        return existing.messageId ? { messageId: existing.messageId,
+          jumpLinkUnavailableReason: "Reusing the existing provider sign-in card." } : undefined;
+      }
       await this.adapter.sendMessage({ platform, id: channelRef }, reauthWaitNotice(park, context))
         .then(() => this.store.turnAttempts.markStallNoticeDelivered(attemptId))
         .catch(err => this.logger.warn({ err, attemptId }, "reauth wait notice failed"));
@@ -20121,7 +20157,7 @@ export class Orchestrator {
   }
 
   /** Same executors as operator Resume, after the waiting prefix has been swapped. */
-  private async continueAcceptedReauth(attemptId: string): Promise<string | null> {
+  private async continueAcceptedReauth(attemptId: string, manualResume = true): Promise<string | null> {
     let attempt = this.store.turnAttempts.get(attemptId);
     if (!attempt || attempt.state !== "suspended") return "the attempt is not suspended";
     if (attempt.remoteRecovery) {
@@ -20133,9 +20169,9 @@ export class Orchestrator {
     if (attempt.source === "schedule") {
       const occurrence = this.store.scheduledOccurrences.get(attemptId);
       if (!occurrence) return "no suspended occurrence";
-      void this.runScheduledPrompt(occurrence.scheduleId, occurrence, true).catch((err) => {
+      this.trackContinuation(this.runScheduledPrompt(occurrence.scheduleId, occurrence, manualResume).catch((err) => {
         this.logger.warn({ err, id: attemptId }, "reauth schedule continuation failed");
-      });
+      }));
       return null;
     }
     if (attempt.source === "inbound") {
@@ -20151,6 +20187,39 @@ export class Orchestrator {
     const spec = stale.find((item) => item.id === attemptId);
     if (!spec) return "no suspended dispatch execution is recorded";
     return this.requestDispatchContinuation(spec);
+  }
+
+  /** Bridge hello (including refreshed inventory) bypasses the tick's backoff. */
+  async recoverReauth(location: string): Promise<void> {
+    for (const attempt of this.store.turnAttempts.list("suspended")) {
+      if (normalizeLocation(parseExecutionIdentity(attempt.identity)?.location ?? attempt.spec.location ?? "local") === normalizeLocation(location)
+        && isAwaitingReauth(attempt.stalledReason)) this.recheckReauth(attempt, true);
+    }
+  }
+
+  private recheckReauth(attempt: TurnAttempt, force = false): void {
+    if (this.restartCutoff) return;
+    const backoff = providerRetryBackoff("unclassified")!;
+    const check = this.reauthChecks.get(attempt.id) ?? { checks: 0,
+      nextCheck: Date.parse(reauthWaitingSince(attempt)) + backoff[0]!, since: reauthWaitingSince(attempt) };
+    this.reauthChecks.set(attempt.id, check);
+    if (!force && Date.now() < check.nextCheck) return;
+    // The synchronous prefix swap is shared with the button and wins only once.
+    if (!acceptReauthWait(this.store.turnAttempts, attempt.id, new Date(), true)) return;
+    check.nextCheck = Date.now() + backoff[Math.min(++check.checks, backoff.length - 1)]!;
+    this.logger.info({ attempt: attempt.id, location: attempt.spec.location, check: check.checks },
+      "rechecking provider sign-in through recorded-session continuation");
+    const defer = (cause: string) => {
+      this.logger.warn({ attempt: attempt.id, cause }, "reauth continuation deferred");
+      const current = this.store.turnAttempts.get(attempt.id);
+      if (current?.state === "suspended" && current.generation === attempt.generation
+        && current.stalledReason?.startsWith(REAUTH_CHECKING_TEXT)) {
+        this.store.turnAttempts.markStalled(attempt.id, `${attempt.stalledReason} (recheck deferred: ${cause})`);
+      }
+    };
+    this.trackContinuation(this.continueAcceptedReauth(attempt.id, false).then(refusal => {
+      if (refusal) defer(refusal);
+    }).catch(err => defer(errorMessage(err))));
   }
 
   private async handleChoiceCardInteraction(evt: ChoiceInteraction): Promise<void> {

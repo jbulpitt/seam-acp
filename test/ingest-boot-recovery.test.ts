@@ -50,7 +50,7 @@ beforeEach(() => {
   store.turnAttempts.registerOwner("old-boot");
   const logger = { warn: vi.fn(), info: vi.fn(), error: vi.fn(), debug: vi.fn(), child() { return this; } };
   orch = Object.assign(Object.create(Orchestrator.prototype), {
-    store, logger,
+    store, logger, reauthChecks: new Map(),
     config: { DATA_DIR: dir, REPOS_ROOT: dir, SEAM_TURN_RESUME_ENABLED: true,
       channelPresets: new Map(), threadPresets: new Map() },
     adapter: {

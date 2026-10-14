@@ -46,7 +46,7 @@ function fixture(reportedRoot: string | null = remoteRoot) {
   const { plan } = createConfigFacades({ store, router, mutation, config, modelCatalog, logger, bridgeHub,
     identityCommitted: async () => {}, persistConfig: () => {}, repoDisplay: value => value ?? "",
     unregisteredAgentMessage: (_id, fallback) => fallback });
-  return { store, router, mutation, config, logger, modelCatalog, plan, listWorkspaces, hostExec };
+  return { store, router, mutation, config, logger, modelCatalog, plan, bridgeHub, listWorkspaces, hostExec };
 }
 
 describe("new Space repo uses the selected host", () => {
@@ -88,5 +88,20 @@ describe("new Space repo uses the selected host", () => {
   it("preserves the existing controller-local fallback", async () => {
     const h = fixture();
     expect(await h.plan.resolveRequestedRepoPath("local", "new-repo")).toBe("/home/ubuntu/Projects/new-repo");
+  });
+
+  it.each(["discord", "google-chat"] as const)("reports the disconnected bridge for a pinned %s repo change", async platform => {
+    const h = fixture();
+    const channel = { platform, id: "existing-session" };
+    h.config.threadPresets.set(channel.id, { location: "macbook-air" });
+    const record = h.router.ensureSessionRecord({ platform, channelRef: channel.id, cwd: `${remoteRoot}/barclays` });
+    expect(h.router.describeConfig(record).location.value).toBe("macbook-air");
+    vi.spyOn(h.bridgeHub, "get").mockReturnValue(undefined);
+    const before = h.store.get(record.id);
+    const result = await h.plan.applyRepoChange(channel, record, `${remoteRoot}/other`, { id: "operator", name: "Operator" });
+    expect(result).toEqual({ ok: false, error: 'bridge "macbook-air" is not connected' });
+    expect(h.store.get(record.id)).toEqual(before);
+    expect(h.hostExec).not.toHaveBeenCalled();
+    expect(h.listWorkspaces).not.toHaveBeenCalled();
   });
 });

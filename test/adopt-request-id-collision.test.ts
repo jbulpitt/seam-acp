@@ -36,7 +36,7 @@ function setup(afterSeq = 0) {
   const permission = vi.fn(async () => ({ outcome: { outcome: "selected" as const, optionId: "allow" } }));
   const events: AgentEvent[] = [];
   const runtime = new AgentRuntime({
-    profile: { id: "fixture" } as AgentProfile,
+    profile: { id: "fixture", classifyError: () => ({ agentId: "fixture", errorKind: "invalid_request" }) } as AgentProfile,
     logger: pino({ level: "silent" }), permissionPolicy: permission,
     spawnFn: () => { throw new Error("adoption must not spawn"); },
   });

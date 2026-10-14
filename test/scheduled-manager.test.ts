@@ -4,6 +4,8 @@ import { ScheduledPromptManager } from "../packages/core/src/core/scheduled-prom
 import type { SessionStore } from "../packages/core/src/core/session-store.js";
 import type { ScheduledPrompt } from "../packages/core/src/core/scheduled-prompts/types.js";
 import { scheduledOccurrenceKey, type ScheduledOccurrenceKey } from "../packages/core/src/core/scheduled-prompts/occurrence-store.js";
+import { SessionStore as SqliteSessionStore } from "../packages/core/src/core/session-store.js";
+import { REAUTH_WAITING_TEXT } from "../packages/core/src/core/reauth-negotiation.js";
 
 const silentLogger = {
   info() {},
@@ -58,6 +60,32 @@ function makeStore(row: ScheduledPrompt) {
 }
 
 describe("ScheduledPromptManager overlap guard (D3)", () => {
+  it("a later tick rechecks the original reauth occurrence instead of silently skipping forever", async () => {
+    const row = makeRow({ sessionMode: "isolated" });
+    const store = new SqliteSessionStore(":memory:");
+    store.upsertScheduled(row);
+    const first = scheduledOccurrenceKey(row.id, "2026-10-14T11:00:00.000Z");
+    store.scheduledOccurrences.prepare(first, row, syntheticScheduleExecution);
+    store.turnAttempts.registerOwner("test");
+    const attempt = store.turnAttempts.claim({ id: first.id, target: row.channelRef,
+      prompt: row.promptText, session: "isolated", kind: "scheduled", createdUtc: first.scheduledFor!,
+      agentId: "claude", location: "local" }, "synthetic-not-a-provider-identity", "test", "schedule");
+    store.turnAttempts.bind(attempt, "original-acp");
+    store.turnAttempts.startPrompt(attempt);
+    store.turnAttempts.markStalled(first.id, REAUTH_WAITING_TEXT, "2026-10-14T11:30:00.000Z");
+    const onFire = vi.fn(async () => {});
+    const manager = new ScheduledPromptManager({ store, onFire, logger: silentLogger,
+      resolveExecution: syntheticScheduleExecution });
+    try {
+      await (manager as unknown as { fire(id: string, key: ScheduledOccurrenceKey): Promise<void> })
+        .fire(row.id, scheduledOccurrenceKey(row.id, "2026-10-14T12:00:00.000Z"));
+      expect(onFire).toHaveBeenCalledExactlyOnceWith(row.id, expect.objectContaining({ id: first.id }));
+      expect(store.getScheduled(row.id)?.lastStatus).toBe("waiting for provider sign-in since 06:30 CDT");
+      expect(store.scheduledOccurrences.pending().map(item => item.id)).toEqual([first.id]);
+      expect(store.turnAttempts.get(first.id)).toMatchObject({ acpSessionId: "original-acp", promptStarted: true });
+    } finally { manager.stop(); store.close(); }
+  });
+
   it("drain waits for a fire admitted before stop", async () => {
     const row = makeRow();
     const { store } = makeStore(row);

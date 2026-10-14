@@ -72,6 +72,7 @@ function harness(facts: () => { refreshTokenExpiresAt: number | null } | undefin
   const messages: string[] = [];
   const cards = new Map<string, StructuredPanel>();
   const edits: { ref: MessageRef; panel: StructuredPanel }[] = [];
+  const choiceEdits: StructuredPanel[] = [];
   let panelOrdinal = 0;
   let unavailableCard: string | undefined;
   const described = {
@@ -107,7 +108,7 @@ function harness(facts: () => { refreshTokenExpiresAt: number | null } | undefin
         cards.set(ref.id, panel); edits.push({ ref, panel });
       },
       async sendChoiceCard(channel: unknown) { return { channel, id: "reauth-choice" }; },
-      async editChoiceCard() {},
+      async editChoiceCard(_ref: MessageRef, view: { panel: StructuredPanel }) { choiceEdits.push(view.panel); },
       async sendMessage(_channel: unknown, text: string) { messages.push(text); return { channel: _channel, id: "message" }; },
       async editMessage() {},
       async sendFile() {},
@@ -120,7 +121,7 @@ function harness(facts: () => { refreshTokenExpiresAt: number | null } | undefin
     attempts: store.turnAttempts, onDispatch: spec => orch.dispatchInjectTurn(spec), pollMs: 1_000_000 });
   orch.setDispatchWatcher(watcher);
   cleanups.push(() => watcher.stop());
-  return { dir, store, orch, runtime, prompt, messages, record, described, cards, edits, observations, watcher,
+  return { dir, store, orch, runtime, prompt, messages, record, described, cards, edits, choiceEdits, observations, watcher,
     removeCard: (id: string) => { unavailableCard = id; cards.delete(id); } };
 }
 
@@ -157,6 +158,90 @@ async function parkMessage(h: ReturnType<typeof harness>) {
   });
   return `inbound-${messageId}`;
 }
+
+async function settleContinuations(h: ReturnType<typeof harness>) {
+  await (h.orch as unknown as { settleTrackedContinuations(): Promise<void> }).settleTrackedContinuations();
+}
+
+describe("automatic reauth recovery", () => {
+  it("rechecks on the existing tick after backoff, continuing the same session once without a click", async () => {
+    vi.useFakeTimers({ toFake: ["Date", "setInterval", "clearInterval"] });
+    const h = harness(() => ({ refreshTokenExpiresAt: 1 }), true);
+    const id = await parkMessage(h);
+    const card = h.store.listOpenChoiceCards("discord")[0]!;
+    resumeOutcome(h, false);
+    await h.orch.reconcileRemoteRecoveries();
+    expect(h.prompt).toHaveBeenCalledOnce();
+    await vi.advanceTimersByTimeAsync(10_000);
+    await h.orch.reconcileRemoteRecoveries();
+    await settleContinuations(h);
+    expect(h.store.turnAttempts.get(id)).toMatchObject({ state: "completed", generation: 2,
+      acpSessionId: "fixture-acp", outcome: { status: "completed" } });
+    expect(h.prompt).toHaveBeenCalledTimes(2);
+    expect(JSON.stringify(h.prompt.mock.calls).match(/ORIGINAL-ONCE/g)).toHaveLength(1);
+    expect(JSON.stringify(h.prompt.mock.calls)).toContain("continue");
+    expect(h.messages.filter(text => text === "RESUMED-ONCE")).toHaveLength(1);
+    expect(h.store.getChoiceCard(card.id)).toMatchObject({ status: "exhausted", clickCount: 0,
+      body: expect.stringContaining("Resumed automatically") });
+    expect(JSON.stringify(h.choiceEdits)).toContain("Resumed automatically");
+    await vi.advanceTimersByTimeAsync(60 * 60_000);
+    await h.orch.reconcileRemoteRecoveries();
+    expect(h.prompt).toHaveBeenCalledTimes(2);
+    h.store.close();
+  });
+
+  it("keeps failed checks parked with growing bounded backoff and the original human card", async () => {
+    vi.useFakeTimers({ toFake: ["Date", "setInterval", "clearInterval"] });
+    const h = harness(() => ({ refreshTokenExpiresAt: 1 }));
+    const id = await parkMessage(h);
+    const card = h.store.listOpenChoiceCards("discord")[0]!;
+    const notices = h.messages.length;
+    for (const wait of [10_000, 30_000, 120_000, 300_000, 420_000, 420_000]) {
+      const before = h.prompt.mock.calls.length;
+      await vi.advanceTimersByTimeAsync(wait - 1);
+      await h.orch.reconcileRemoteRecoveries(); await settleContinuations(h);
+      expect(h.prompt).toHaveBeenCalledTimes(before);
+      await vi.advanceTimersByTimeAsync(1);
+      await h.orch.reconcileRemoteRecoveries(); await settleContinuations(h);
+      expect(h.prompt).toHaveBeenCalledTimes(before + 1);
+      expect(h.store.turnAttempts.get(id)).toMatchObject({ state: "suspended",
+        stalledReason: expect.stringContaining("reauth-waiting:") });
+      expect(h.store.listOpenChoiceCards("discord").map(row => row.id)).toEqual([card.id]);
+      expect(h.messages).toHaveLength(notices);
+    }
+    resumeOutcome(h, false);
+    await clickReauth(h);
+    expect(h.store.turnAttempts.get(id)?.state).toBe("completed");
+    expect(JSON.stringify(h.prompt.mock.calls).match(/ORIGINAL-ONCE/g)).toHaveLength(1);
+    h.store.close();
+  });
+
+  it("bridge-ready/inventory refresh forces a check only for that host, and racing the tick does not duplicate it", async () => {
+    const h = harness(() => ({ refreshTokenExpiresAt: 1 }));
+    const id = await parkMessage(h);
+    resumeOutcome(h, false);
+    const recovery = h.orch as unknown as { recoverReauth(location: string): Promise<void> };
+    await recovery.recoverReauth("different-host"); await settleContinuations(h);
+    expect(h.prompt).toHaveBeenCalledOnce();
+    await Promise.all([recovery.recoverReauth("local"), recovery.recoverReauth("local"),
+      h.orch.reconcileRemoteRecoveries()]);
+    await settleContinuations(h);
+    expect(h.store.turnAttempts.get(id)?.state).toBe("completed");
+    expect(h.prompt).toHaveBeenCalledTimes(2);
+    h.store.close();
+  });
+
+  it("does not revive a cancelled parked turn when its bridge reconnects", async () => {
+    const h = harness(() => ({ refreshTokenExpiresAt: 1 }));
+    const id = await parkMessage(h);
+    h.store.turnAttempts.cancel(id, "cancelled by user");
+    await (h.orch as unknown as { recoverReauth(location: string): Promise<void> }).recoverReauth("local");
+    await settleContinuations(h);
+    expect(h.prompt).toHaveBeenCalledOnce();
+    expect(h.store.turnAttempts.get(id)?.state).toBe("cancelled");
+    h.store.close();
+  });
+});
 
 describe("reauth resume status-card settlement", () => {
   it.each([

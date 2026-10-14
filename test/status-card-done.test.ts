@@ -121,13 +121,58 @@ function setup() {
     panels,
     writes,
     label,
-    run: () => (orch as unknown as { handleIncomingMessageInner(m: unknown): Promise<void> })
-      .handleIncomingMessageInner(message),
+    run: (messageId = "1") => {
+      if (messageId !== "1") {
+        const createdUtc = new Date().toISOString();
+        store.admitInbound({ messageId, platform: "discord", channelRef: "worker", parentRef: null,
+          sessionRecordId: record.id, authorId: "user", authorName: "User", text: "next task",
+          attachments: [], createdUtc });
+        store.claimInbound(messageId, 0, createdUtc);
+      }
+      return (orch as unknown as { handleIncomingMessageInner(m: unknown): Promise<void> })
+        .handleIncomingMessageInner({ ...message, messageId });
+    },
     emit: (event: { kind: string; text?: string; title?: string; toolCallId?: string }) => onEvent(event),
   };
 }
 
 describe("finished turn card (#437)", () => {
+  it("settles the previous card after resumed output even while the next turn owns a new card", async () => {
+    vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout", "setInterval", "clearInterval"] });
+    const h = setup();
+    await h.run();
+    await h.emit({ kind: "agent-text", text: "late background output" });
+    await vi.advanceTimersByTimeAsync(2_500);
+    const first = h.store.turnAttempts.get("inbound-1")!;
+    expect(first).toMatchObject({ state: "completed", deliveryDone: true });
+    expect(h.writes.filter(write => write.id === first.statusCard!.messageId).at(-1)?.panel.title).toBe("Working");
+
+    let release!: () => void;
+    let entered!: () => void;
+    const started = new Promise<void>(resolve => { entered = resolve; });
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    h.runtime.prompt.mockImplementationOnce(async () => {
+      entered();
+      await gate;
+      return { stopReason: "end_turn" };
+    });
+    const running = h.run("2");
+    await started;
+    try {
+      const second = h.store.turnAttempts.get("inbound-2")!;
+      expect(second.statusCard!.messageId).not.toBe(first.statusCard!.messageId);
+      await vi.advanceTimersByTimeAsync(10_000);
+
+      expect(h.writes.filter(write => write.id === first.statusCard!.messageId).at(-1)?.panel.title).toBe("Done");
+      expect(h.store.turnAttempts.get(first.id)?.statusCardState?.status.input.state).toBe("Done");
+      expect(h.writes.filter(write => write.id === second.statusCard!.messageId).at(-1)?.panel.title).toBe("Working");
+      expect(h.store.turnAttempts.get(second.id)?.state).toBe("active");
+    } finally {
+      release();
+      await running;
+    }
+  });
+
   it("says Done after a monitor-titled tool, and Working only when output resumes", async () => {
     const h = setup();
     await h.run();

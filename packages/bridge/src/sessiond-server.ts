@@ -379,7 +379,7 @@ export class SessiondServer {
         if (error.code !== "ENOENT") throw error;
       });
     }
-    await this.persistQueue;
+    await this.persist();
   }
 
   private accept(socket: Socket): void {
@@ -1073,7 +1073,7 @@ export class SessiondServer {
           ...(entry.exitedAt ? { exitedAt: entry.exitedAt } : {}),
           lastSeq: entry.lastSeq,
           ...(entry.exitSeq !== undefined ? { exitSeq: entry.exitSeq } : {}),
-          ...(entry.exitSeq !== undefined && entry.outputAckedThrough !== undefined
+          ...(entry.outputAckedThrough !== undefined
             ? { outputAckedThrough: entry.outputAckedThrough } : {}),
           status: this.entryAlive(entry) ? "live" : "dead",
           ...(entry.lastStdoutAt !== undefined ? { lastStdoutAt: entry.lastStdoutAt } : {}),

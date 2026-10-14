@@ -85,6 +85,12 @@ export type ProbeErrorCode =
   | "not_settled"
   | "protocol_error";
 
+export interface ProbeOverflow {
+  limit: "stdout" | "stderr" | "StreamAgentStateUpdates frame" | "startup log" | "HTTP metadata";
+  limitBytes: number;
+  observedBytes: number;
+}
+
 /**
  * A probe failure. `code` is what callers and logs should branch on; `detail`
  * is already redacted and safe to render. Raw child output is NEVER attached.
@@ -92,7 +98,7 @@ export type ProbeErrorCode =
 export class ProbeError extends Error {
   readonly code: ProbeErrorCode;
   readonly detail: string;
-  constructor(code: ProbeErrorCode, detail: string) {
+  constructor(code: ProbeErrorCode, detail: string, readonly overflow?: ProbeOverflow) {
     super(`${code}: ${detail}`);
     this.name = "ProbeError";
     this.code = code;
@@ -329,7 +335,8 @@ export async function runBoundedProbe<T>(options: BoundedProbeOptions<T>): Promi
   const onStdout = (chunk: Buffer): void => {
     stdoutBytes += chunk.length;
     if (stdoutBytes > stdoutLimit) {
-      fail(new ProbeError("output_overflow", `${label} stdout exceeded ${stdoutLimit} bytes`));
+      fail(new ProbeError("output_overflow", `${label} stdout exceeded ${stdoutLimit} bytes (observed ${stdoutBytes} bytes)`,
+        { limit: "stdout", limitBytes: stdoutLimit, observedBytes: stdoutBytes }));
       stdout.destroy();
       return;
     }
@@ -344,7 +351,8 @@ export async function runBoundedProbe<T>(options: BoundedProbeOptions<T>): Promi
   const onStderr = (chunk: Buffer): void => {
     stderrBytes += chunk.length;
     if (stderrBytes > stderrLimit) {
-      fail(new ProbeError("output_overflow", `${label} stderr exceeded ${stderrLimit} bytes`));
+      fail(new ProbeError("output_overflow", `${label} stderr exceeded ${stderrLimit} bytes (observed ${stderrBytes} bytes)`,
+        { limit: "stderr", limitBytes: stderrLimit, observedBytes: stderrBytes }));
       return;
     }
     stderrTail = (stderrTail + chunk.toString("utf8")).slice(-PROBE_STDERR_CAPTURE_BYTES);

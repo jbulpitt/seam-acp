@@ -11,11 +11,13 @@ import {
   redactProbeText,
   terminateProcessGroup,
   type ProbeErrorCode,
+  type ProbeOverflow,
 } from "./probe-process.js";
 
 interface AgyFailureEvidence {
   exitCode?: number | null;
   signal?: NodeJS.Signals | null;
+  overflow?: ProbeOverflow;
 }
 
 /** Never retain raw CLI diagnostics: they may contain auth, prompts or paths. */
@@ -24,7 +26,11 @@ export function agyFailure(
   errorKind?: AdapterErrorKind,
   evidence: AgyFailureEvidence = {},
 ): ProbeError {
-  const failure = new ProbeError(code, "native AGY lifecycle failed");
+  const overflow = evidence.overflow;
+  const detail = overflow
+    ? `native AGY ${overflow.limit} exceeded ${overflow.limitBytes} bytes (observed ${overflow.observedBytes} bytes)`
+    : "native AGY lifecycle failed";
+  const failure = new ProbeError(code, detail, overflow);
   if (errorKind) {
     // #481: retain only the closed enum learned before the diagnostic is
     // destroyed. Attaching `details` here would recreate the credential leak
@@ -84,7 +90,9 @@ export class AgyTurnLifecycle {
   private onStderr = (chunk: Buffer): void => {
     // A noisy child must not exhaust host memory/IO before cancellation runs.
     this.stderrBytes += chunk.length;
-    if (this.stderrBytes > 256_000) this.fail("output_overflow");
+    if (this.stderrBytes > 256_000) this.abortWith(agyFailure("output_overflow", undefined, {
+      overflow: { limit: "stderr", limitBytes: 256_000, observedBytes: this.stderrBytes },
+    }));
     // #491: the Daily Standup child emitted useful output, then exited and its
     // entire diagnostic was discarded. Retain only this bounded in-memory tail
     // until `close` drains stderr; classification keeps a closed enum and exit
@@ -100,7 +108,9 @@ export class AgyTurnLifecycle {
     this.stdoutBytes += chunk.length;
     if (this.stdoutBytes > 1_000_000) {
       this.stdoutOverflow = true;
-      if (this.structured) this.fail("output_overflow");
+      if (this.structured) this.abortWith(agyFailure("output_overflow", undefined, {
+        overflow: { limit: "stdout", limitBytes: 1_000_000, observedBytes: this.stdoutBytes },
+      }));
       return;
     }
     this.stdout.push(chunk);
@@ -174,7 +184,9 @@ export class AgyTurnLifecycle {
   };
   async structuredOutput(): Promise<string> {
     await agyWait(this.exit, this.abort.signal);
-    if (this.stdoutOverflow) throw agyFailure("output_overflow");
+    if (this.stdoutOverflow) throw agyFailure("output_overflow", undefined, {
+      overflow: { limit: "stdout", limitBytes: 1_000_000, observedBytes: this.stdoutBytes },
+    });
     return Buffer.concat(this.stdout).toString("utf8");
   }
   commitStream(): void {

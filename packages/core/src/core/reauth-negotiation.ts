@@ -202,11 +202,12 @@ export function parkReauthAttempt(
   store: { markStalled(id: string, reason: string): boolean; unstartRejectedPrompt(id: string): boolean },
   attemptId: string,
   park: ReauthPark,
+  previouslySubmitted = false,
 ): DispatchSuspendedError | null {
   const reason = reauthStalledReason(park);
   if (!store.markStalled(attemptId, reason)) return null;
   // Accept then sends the pending prompt once instead of a bare continuation.
-  if (park.promptRejected) store.unstartRejectedPrompt(attemptId);
+  if (park.promptRejected && !previouslySubmitted) store.unstartRejectedPrompt(attemptId);
   return DispatchSuspendedError.defect(attemptId, reason);
 }
 

@@ -3698,7 +3698,9 @@ export class Orchestrator {
         const staged = this.stagedRecovery.get(channel.id);
         this.stagedRecovery.delete(channel.id);
         const render = staged ?? await this.processRestartRender(priorHuman);
-        if (!staged) await this.postResumeNotice(channel.id, render.note, admission?.deliveryChannel);
+        if (!staged && !priorHuman.stalledReason?.startsWith(REAUTH_CHECKING_TEXT)) {
+          await this.postResumeNotice(channel.id, render.note, admission?.deliveryChannel);
+        }
         msg = { ...msg, text: render.prompt, attachments: undefined };
       } else {
         this.stagedRecovery.delete(channel.id);
@@ -5093,7 +5095,7 @@ export class Orchestrator {
         const refusal = humanOutcomeOwned ? null : humanRefusal();
         if (refusal) throw refusal;
         if (err instanceof ReauthParked) {
-          const parked = parkReauthAttempt(this.store.turnAttempts, humanAttempt.id, err.park);
+          const parked = parkReauthAttempt(this.store.turnAttempts, humanAttempt.id, err.park, humanResume);
           if (parked) {
             status.setState("Waiting");
             status.setAction("provider authentication");
@@ -10528,7 +10530,7 @@ export class Orchestrator {
         this.assertQueueFence(queueFence);
       } catch (err) {
         if (err instanceof ReauthParked && attempt && lifecycle && !outcomeOwned) {
-          const parked = parkReauthAttempt(this.store.turnAttempts, spec.id, err.park);
+          const parked = parkReauthAttempt(this.store.turnAttempts, spec.id, err.park, previousAttempt?.promptStarted === true);
           if (parked) {
             await this.postReauthCard(spec.target, spec.id, err.park, err.message);
             throw parked;
@@ -11195,7 +11197,7 @@ export class Orchestrator {
     } catch (err) {
       failure = err;
       if (err instanceof ReauthParked && attempt && lifecycle && !outcomeOwned) {
-        const parked = parkReauthAttempt(attemptStore, spec.id, err.park);
+        const parked = parkReauthAttempt(attemptStore, spec.id, err.park, previousAttempt?.promptStarted === true);
         if (parked) {
           await this.postReauthCard(spec.target, spec.id, err.park, err.message);
           failure = parked;
@@ -12706,7 +12708,7 @@ export class Orchestrator {
         if (err instanceof ReauthParked) {
           const current = this.store.turnAttempts.get(attempt.id);
           if (current) {
-            const parked = parkReauthAttempt(this.store.turnAttempts, attempt.id, err.park);
+            const parked = parkReauthAttempt(this.store.turnAttempts, attempt.id, err.park, prior?.promptStarted === true);
             if (parked) {
               await this.postReauthCard(row.channelRef, attempt.id, err.park, err.message);
               this.patchScheduledStatus(row.id, reauthWaitingStatus(this.store.turnAttempts.get(attempt.id)!, row.timezone));

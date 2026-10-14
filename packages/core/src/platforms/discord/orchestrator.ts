@@ -920,10 +920,6 @@ export class Orchestrator {
    * callback/output path checks its captured epoch before observable work. */
   private channelQueueEpochs = new Map<string, number>();
   private channelQueueMeta = new Map<string, ChannelQueueMeta>();
-  /** Per-session timers that settle a woken "Working" card back to "Done"
-   *  after resumed output goes quiet. Display-only; cleared when a new turn
-   *  takes over the session's status card. */
-  private readonly bgSettleTimers = new Map<string, NodeJS.Timeout>();
   /** Set by index.ts after construction; used by /seamadmin schedule handlers to
    *  arm/disarm timers and by the fire runner to drop deleted-thread schedules. */
   private scheduledManager?: ScheduledPromptManager;
@@ -3784,20 +3780,14 @@ export class Orchestrator {
     voiceConsoleSpeech = this.voiceConsole?.beginVisibleTurn(channel.id, liveMarkerId) ?? null;
     if (voiceConsoleSpeech) this.voiceConsoleSpeechByChannel.set(channel.id, voiceConsoleSpeech);
 
-    // A new turn owns this session's status card now — cancel any lingering
-    // settle-back-to-Done timer left by the previous turn's resumed output
-    // so it can't edit the new card.
-    const prevSettle = this.bgSettleTimers.get(record.id);
-    if (prevSettle) {
-      clearTimeout(prevSettle);
-      this.bgSettleTimers.delete(record.id);
-    }
     // `turnFinalized`: the main turn has fully finalized, so any *further*
     // generative activity is output that actually resumed (not the trailing
     // in-turn backlog the idle() drain handles) and flips the card back to
     // Working. A finished turn says Done. Display-only.
     const BG_SETTLE_MS = 10_000;
     let turnFinalized = false;
+    // Each callback owns its captured card, including after the next turn starts.
+    let bgSettleTimer: NodeJS.Timeout | undefined;
 
     const cfg = this.store.readConfig(record);
     const described = this.router.describeConfig(record);
@@ -4319,17 +4309,13 @@ export class Orchestrator {
             status.setAction("Resumed — background activity");
             void refresh();
           }
-          const prev = this.bgSettleTimers.get(record.id);
-          if (prev) clearTimeout(prev);
-          this.bgSettleTimers.set(
-            record.id,
-            setTimeout(() => {
-              this.bgSettleTimers.delete(record.id);
-              status.setState("Done");
-              status.setAction("Resumed — output complete");
-              void refresh(true);
-            }, BG_SETTLE_MS)
-          );
+          if (bgSettleTimer) clearTimeout(bgSettleTimer);
+          bgSettleTimer = setTimeout(() => {
+            bgSettleTimer = undefined;
+            status.setState("Done");
+            status.setAction("Resumed — output complete");
+            void refresh(true);
+          }, BG_SETTLE_MS);
         }
         switch (event.kind) {
           case "notice":

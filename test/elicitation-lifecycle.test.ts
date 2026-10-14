@@ -15,6 +15,45 @@ afterAll(() => executables.close());
 const until = async (predicate: () => unknown) => vi.waitFor(() => expect(predicate()).toBeTruthy(), { timeout: 10_000 });
 
 describe("ordinary elicitation lifecycle", () => {
+  it("does not cancel a freshly emitted question when an older child lacks the ordinary status cache", async () => {
+    const h = await savedSessionHost(executables);
+    const cards: ElicitationCardPost[] = [];
+    const control = h.slots.permissionControl.bind(h.slots);
+    const oldStatus = vi.spyOn(h.slots, "permissionControl").mockImplementation(async (slot, type, identity, answer) => {
+      // Actual pre-change PendingPermissions reply for an ordinary request.
+      if ("method" in identity && identity.method === "elicitation/create") {
+        return { state: "gone", pid: (await h.client.listSlots()).health.find(row => row.slot === slot)!.pid! };
+      }
+      return control(slot, type, identity, answer);
+    });
+    const router = h.makeRouter();
+    const adapter = { sendElicitationCard: async (_channel: unknown, card: ElicitationCardPost) => {
+      cards.push(card); return { channel: { platform: "discord", id: h.record.channelRef }, id: "old-child-card" };
+    }, editElicitationCard: async () => {} };
+    const old = h.makeOrchestrator(router, adapter);
+    const next = h.makeOrchestrator(h.makeRouter(), adapter);
+    try {
+      (old as any).currentAuthorIds.set(h.record.channelRef, "fixture-user");
+      const runtime = await router.getOrStartRuntime(h.record);
+      const prompt = runtime.prompt("continue form question").catch(error => error);
+      await vi.waitFor(async () => expect(cards.length + (await h.requests()).filter(row => row.method === "elicitation/response").length).toBeGreaterThan(0));
+      expect(cards).toHaveLength(1);
+      const row = h.store.listOpenElicitations()[0]!;
+      await next.recoverElicitations();
+      expect(h.store.getElicitation(row.id)?.status).toBe("open");
+      const click = { customId: elicitationCustomId("bool", row.id, "1"), messageId: "old-child-card",
+        channel: { platform: "discord", id: h.record.channelRef }, userId: "fixture-user", userName: "Fixture",
+        interactionId: "old-child-answer", kind: "button", replyEphemeral: vi.fn(async () => {}) } as unknown as ComponentEvent;
+      await expect(((next as any).elicitations as ElicitationManager).handleComponent(click)).rejects.toThrow(/not reattached/);
+      expect(h.store.getElicitation(row.id)?.status).toBe("open");
+      // Its ORIGINAL attached controller can still answer through the SDK.
+      await ((old as any).elicitations as ElicitationManager).handleComponent(click);
+      await expect(prompt).resolves.toMatchObject({ stopReason: "end_turn" });
+      expect((await h.requests()).filter(row => row.method === "elicitation/response"))
+        .toEqual([expect.objectContaining({ params: { action: "accept", content: { proceed: true } } })]);
+    } finally { oldStatus.mockRestore(); old.suspendForRestart(); next.suspendForRestart(); await h.close(); }
+  }, 20_000);
+
   it("boot reconciles an unanswered form against its live owner without freezing or reposting the card", async () => {
     const h = await savedSessionHost(executables);
     const cards: ElicitationCardPost[] = [];

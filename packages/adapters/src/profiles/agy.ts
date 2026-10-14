@@ -95,6 +95,7 @@ function agyKindFromCode(code: string): AdapterErrorKind {
     case "cancelled":
       return "cancelled";
     case "output_overflow":
+      return "output_overflow";
     case "protocol_error":
     case "not_settled":
     default:

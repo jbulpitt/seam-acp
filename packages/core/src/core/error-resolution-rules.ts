@@ -15,6 +15,7 @@ const POLICY: Record<Exclude<AdapterErrorKind, "unclassified">,
   session_gone: { transience: "terminal", startRung: 4, needsHuman: "no" },
   connection_closed: { transience: "transient", startRung: 3, needsHuman: "no" },
   protocol_error: { transience: "unknown", startRung: 1, needsHuman: "unknown" },
+  output_overflow: { transience: "terminal", startRung: 5, needsHuman: "unknown" },
   agent_exit: { transience: "unknown", startRung: 3, needsHuman: "unknown" },
   // #516: the host, not the adapter, exhausted memory. Reattach/fallback is
   // appropriate, but rung 1 would replay a possibly billable prompt into the
@@ -39,9 +40,8 @@ export const DEFAULT_ERROR_RULES: readonly ErrorRule[] = Object.freeze(
       charged: "unknown" as const,
       sideEffects: "unknown" as const,
       sessionUsable: errorKind === "session_gone" ? "no" as const : "unknown" as const,
-      // An explicit cancellation is not an unexpected failure. Preserve stop;
-      // every genuine failure still has a visible recovery route (#448).
-      action: errorKind === "cancelled" ? "stop" as const : "recover" as const,
+      // Cancellation and a local output limit cannot clear through retries.
+      action: errorKind === "cancelled" || errorKind === "output_overflow" ? "stop" as const : "recover" as const,
     }),
   })),
 );

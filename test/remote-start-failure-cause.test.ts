@@ -12,6 +12,7 @@ import { describe, expect, it, vi } from "vitest";
 import { makeMux, type AgentProfile } from "@seam/adapters";
 import { AgentRuntime } from "../packages/core/src/agents/agent-runtime.js";
 import { discordRenderer } from "../packages/core/src/platforms/discord/renderer.js";
+import { TurnStatus, renderStatusPanel } from "../packages/core/src/core/status-panel.js";
 import { spawnRefusalFrame } from "../packages/bridge/src/resolve-adapter.js";
 import type { Logger } from "../packages/core/src/lib/logger.js";
 
@@ -45,6 +46,29 @@ function remoteRuntime() {
 }
 
 describe("#610 remote start failure cause", () => {
+  it.each(["stream", "exit-tail"])("keeps the retained bootstrap cause visible on the card (%s)", async source => {
+    const { ws, runtime, child } = remoteRuntime();
+    const failure = runtime.start().catch((error: unknown) => error as Error);
+    await new Promise(resolve => setImmediate(resolve));
+    const stderr = "[adapter-child] startup diagnostic\n[adapter-child] invalid bootstrap\n";
+    if (source === "stream") {
+      ws.deliver({ slot: child().slot, type: "stderr", data: stderr });
+      await new Promise(resolve => setImmediate(resolve));
+    }
+    ws.deliver({ slot: child().slot, type: "exit", code: 1,
+      ...(source === "exit-tail" ? { stderrTail: stderr } : {}) });
+    const error = await failure;
+    const action = discordRenderer.trimShort(error.message, 120);
+    const status = new TurnStatus({ model: "fixture", repoDisplay: "/fixture", style: "full" });
+    status.setState("Failed");
+    status.setAction(action);
+    const card = renderStatusPanel(discordRenderer, status.toInput(), Date.now());
+    expect(card.fields.find(field => field.name === "Action")?.value).toContain("[adapter-child] invalid bootstrap");
+    expect(action).toMatch(/^\[adapter-child\] invalid bootstrap/);
+    expect(error.message).toContain("remote agent supervisor exited before initialize on host 'portable-host' (code=1, signal=null)");
+    expect(error.message).toContain(`agent stderr (last lines):\n${stderr.trim()}`);
+  });
+
   it("rejects start with the bridge's reason and stderr, not the 45s timeout", async () => {
     const { ws, runtime, child } = remoteRuntime();
     const started = Date.now();

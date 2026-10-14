@@ -136,7 +136,7 @@ describe("#631 a killed slot has no recovery to adopt", () => {
 });
 
 describe("#631 a restarted bridge recovers live slots' recovery records", () => {
-  it.each([false, true])("queries an idle child only on attachment (rebound=%s)", async rebound => {
+  it.each([false, true])("inventory stays read-only; explicit rebind can query an idle child (rebound=%s)", async rebound => {
     const { server, socketPath, childPath } = await sessiond(`
       process.stdin.resume();
       process.on("SIGTERM", () => process.exit(0));
@@ -147,7 +147,7 @@ describe("#631 a restarted bridge recovers live slots' recovery records", () => 
     const writes = vi.spyOn(only.client, "write");
     if (rebound) await only.slots.rebind();
     else await only.slots.listSlots();
-    expect(writes).toHaveBeenCalledTimes(1);
+    expect(writes).toHaveBeenCalledTimes(rebound ? 1 : 0);
     writes.mockClear();
 
     await only.slots.listSlots();
@@ -167,6 +167,8 @@ describe("#631 a restarted bridge recovers live slots' recovery records", () => 
     expect(await connectHolder(entry, 0)).toBe(true);
 
     await only.slots.listSlots();
+    expect(writes).not.toHaveBeenCalled();
+    await only.slots.rebind();
     expect(writes).toHaveBeenCalledExactlyOnceWith(20, expect.stringContaining('"type":"report_recovery"'));
     writes.mockClear();
     await only.slots.listSlots();
@@ -218,11 +220,11 @@ describe("#631 a restarted bridge recovers live slots' recovery records", () => 
 
     reconnect.mockRestore();
     expect(await connectHolder(entry, 0)).toBe(true);
-    await until(async () => (await second.slots.listSlots()).health.some(row => row.slot === 18
-      && (row as { recovery?: { submissionId: string } }).recovery?.submissionId === "sub-r"), "recovery after attachment");
-    expect(await second.slots.writeInput(18, "after-reattach\n")).toBe(true);
     const replay = await second.slots.replay(18, 0);
     replay.activate();
+    await until(async () => (await second.slots.listSlots()).health.some(row => row.slot === 18
+      && (row as { recovery?: { submissionId: string } }).recovery?.submissionId === "sub-r"), "recovery after replay");
+    expect(await second.slots.writeInput(18, "after-reattach\n")).toBe(true);
     await until(() => [...replay.result.frames, ...second.frames].some(frame => frame.type === "data"
       && frame.data?.includes("after-reattach")), "input reaching the retained child");
     expect(await health(second.client, 18)).toMatchObject({ alive: true, attached: true, pid });

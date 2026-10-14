@@ -6,12 +6,51 @@
  * switch to a select once the button layout would get crowded.
  */
 import type { StructuredPanel } from "../../core/types.js";
+import { choiceOptionList } from "../../core/choice/types.js";
+import { toGraphemes } from "../../core/prompt-excerpt.js";
 
 /** StringSelectMenuBuilder.addOptions hard cap. */
 export const DISCORD_SELECT_MAX = 25;
 /** Soft cap before we drop buttons and use a select (3 rows of 5). */
 export const DISCORD_BUTTON_SOFT_MAX = 15;
 export const DISCORD_BUTTONS_PER_ROW = 5;
+export const DISCORD_BUTTON_LABEL_MAX = 80;
+export const DISCORD_SELECT_LABEL_MAX = 100;
+
+function labelExcerpt(text: string, max: number): string {
+  if (text.length <= max) return text;
+  let prefix = "";
+  for (const grapheme of toGraphemes(text)) {
+    if (prefix.length + grapheme.length > max - 1) break;
+    prefix += grapheme;
+  }
+  const wordEnd = prefix.lastIndexOf(" ");
+  return `${(wordEnd > 0 ? prefix.slice(0, wordEnd) : prefix).trimEnd()}…`;
+}
+
+/** Control excerpts only; clicks still resolve the original option by index. */
+export function describeChoiceOption(label: string, index: number, numbered: boolean, max: number): {
+  label: string; description?: string;
+} {
+  const text = label.replace(/\s+/g, " ").trim();
+  const prefix = numbered ? `${index + 1}. ` : "";
+  const excerpt = labelExcerpt(text, max - prefix.length);
+  return {
+    label: `${prefix}${excerpt}`,
+    ...(excerpt !== text ? { description: labelExcerpt(text.slice(excerpt.length - 1).trimStart(), 100) } : {}),
+  };
+}
+
+/** Keep whole numbered options together; publish overflow before the clickable message. */
+export function choiceBodyChunks(options: ReadonlyArray<{ label: string }>): string[] {
+  const chunks: string[] = [];
+  for (const entry of choiceOptionList(options)) {
+    const last = chunks.at(-1);
+    if (last && last.length + entry.length + 2 <= 2000) chunks[chunks.length - 1] = `${last}\n\n${entry}`;
+    else chunks.push(entry);
+  }
+  return chunks;
+}
 
 export type ChoicePickerLayout = {
   useButtons: boolean;
@@ -72,7 +111,7 @@ export type MultiSelectMenuSpec = {
   minValues: number;
   maxValues: number;
   placeholder: string;
-  options: Array<{ label: string; value: string; default?: boolean }>;
+  options: Array<{ label: string; description?: string; value: string; default?: boolean }>;
   confirmCustomId: string;
   confirmDisabled: boolean;
   confirmLabel: string;
@@ -96,13 +135,14 @@ export function describeMultiSelectMenu(opts: {
   const maxValues = Math.min(Math.max(minValues, opts.max), Math.max(1, n));
   const count = pending.size;
   const inRange = count >= minValues && count <= maxValues;
+  const numbered = choiceOptionList(opts.options).length > 0;
   return {
     customId: opts.makeSelectId(opts.choiceId),
     minValues,
     maxValues,
     placeholder: MULTI_SELECT_PLACEHOLDER,
     options: opts.options.map((o, i) => ({
-      label: o.label.slice(0, 100),
+      ...describeChoiceOption(o.label, i, numbered, DISCORD_SELECT_LABEL_MAX),
       value: String(i),
       ...(pending.has(i) ? { default: true as const } : {}),
     })),

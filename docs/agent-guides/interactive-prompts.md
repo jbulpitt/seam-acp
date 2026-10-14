@@ -139,11 +139,29 @@ Cover recursion next.
 }
 ```
 
-- `title` required, ≤256. `options` 1–25 (≤24 if any option is `custom`).
+- `title` required, ≤256 (Discord embed title limit). `options` 1–25
+  (≤24 if any option is `custom`, for the Discord choice layout).
+- `label` required, non-empty, ≤500 characters (Seam's sanity bound).
 - `kind: "prompt"` requires non-empty `payload`. `kind: "custom"` ignores payload.
 - `target` omitted → `defaultTarget` → `{ "type": "live" }`.
 - `select: { min?, max? }` ⇒ multi-select dropdown + Confirm (see above). Cannot
   combine with `custom` or `maxClicks>1` (v1).
+
+Long labels are accepted, frozen and returned **in full** with the selected
+payload. Discord buttons use word-boundary ellipses within their 80-character
+limit; dropdown labels and overflow descriptions each fit 100 characters.
+If any label exceeds 80 characters, every option's full text is numbered in
+the card's message body. Large lists continue in preceding messages, each
+within Discord's 2,000-character content limit; controls use matching numbers.
+The full list stays visible after a click or cancellation. These are display
+excerpts, not changes to the stored labels or payloads.
+[Discord component limits](https://docs.discord.com/developers/components/reference).
+
+Google Chat keeps full button/selection text and also shows the numbered full
+list for long labels. Google publishes no per-button text character cap in its
+[Button schema](https://developers.google.com/workspace/chat/api/reference/rest/v1/cards#Button);
+its [32 KB cards limit](https://developers.google.com/workspace/chat/api/reference/rest/v1/spaces.messages)
+still applies, and provider errors retain their cause.
 
 ---
 

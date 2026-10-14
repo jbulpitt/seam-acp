@@ -191,7 +191,7 @@ describe("Google Chat cardsV2 renderer", () => {
     expect(JSON.stringify(card)).toContain("x".repeat(4001));
     expect(JSON.stringify(card)).toContain(label);
     const widgets = card.cardsV2[0]!.card.sections[0]!.widgets;
-    expect(widgets[1]).toMatchObject({ buttonList: { buttons: Array.from({ length: 6 }, () => ({ text: label })) } });
+    expect(widgets.find(widget => "buttonList" in widget)).toMatchObject({ buttonList: { buttons: Array.from({ length: 6 }, () => ({ text: label })) } });
     expect(googleChatCardsPayloadBytes(card)).toBe(Buffer.byteLength(JSON.stringify(card), "utf8"));
     expect(googleChatCardsPayloadBytes(renderGoogleChatPanel({ ...panel, description: "🌍" }, "utf8")))
       .toBeGreaterThan(JSON.stringify(renderGoogleChatPanel({ ...panel, description: "🌍" }, "utf8")).length);

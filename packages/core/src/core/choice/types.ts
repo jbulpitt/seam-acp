@@ -11,20 +11,22 @@ export const CHOICE_CUSTOM_ID_PREFIX = "choice:";
 export const CHOICE_MAX_CLICKS = 100;
 export const CHOICE_DEFAULT_MAX_CLICKS = 1;
 export const CHOICE_TITLE_MAX = 256;
-export const CHOICE_LABEL_MAX = 80;
+export const CHOICE_LABEL_MAX = 500;
 export const CHOICE_CUSTOM_TEXT_MAX = 4000;
+
+const CHOICE_LABEL_RULE = " Labels may be up to 500 characters; shortened controls are accompanied by full numbered text, and the selected label is returned in full.";
 
 /** Fence-only authoring bullet — live turns that run emitClosedFence. */
 export const CHOICE_FENCE_RULE =
-  "To publish a frozen click-card in this thread, output a fenced block tagged `seam-choice` whose body is JSON `{ title, options:[{label, kind:\"prompt\"|\"custom\", payload?}] }`. Default is live in THIS thread, one person, one pick — after they choose, the card shows the selection and buttons go away. For \"pick several of N\", add `select:{min,max}` — the card becomes a dropdown + Confirm and returns one combined prompt (all options must be prompt; not combinable with maxClicks>1). Set maxClicks > 1 only for multi-user. Destinations live|isolated|thread and HTTP ingest: docs/agent-guides/interactive-prompts.md. Participants may click; they cannot create or cancel.";
+  "To publish a frozen click-card in this thread, output a fenced block tagged `seam-choice` whose body is JSON `{ title, options:[{label, kind:\"prompt\"|\"custom\", payload?}] }`. Default is live in THIS thread, one person, one pick — after they choose, the card shows the selection and buttons go away. For \"pick several of N\", add `select:{min,max}` — the card becomes a dropdown + Confirm and returns one combined prompt (all options must be prompt; not combinable with maxClicks>1). Set maxClicks > 1 only for multi-user. Destinations live|isolated|thread and HTTP ingest: docs/agent-guides/interactive-prompts.md. Participants may click; they cannot create or cancel." + CHOICE_LABEL_RULE;
 
 /** MCP-only authoring bullet — sessions that actually have seam-mcp attached. */
 export const CHOICE_MCP_RULE =
-  "To publish a frozen click-card in this thread, call `create_choice` with `{ title, options:[{label, kind:\"prompt\"|\"custom\", payload?}] }`. Default is live in THIS thread, one person, one pick — after they choose, the card shows the selection and buttons go away. For \"pick several of N\", add `select:{min,max}` — the card becomes a dropdown + Confirm and returns one combined prompt (all options must be prompt; not combinable with maxClicks>1). Set maxClicks > 1 only for multi-user. Destinations live|isolated|thread and HTTP ingest: docs/agent-guides/interactive-prompts.md. Participants may click; they cannot create or cancel.";
+  "To publish a frozen click-card in this thread, call `create_choice` with `{ title, options:[{label, kind:\"prompt\"|\"custom\", payload?}] }`. Default is live in THIS thread, one person, one pick — after they choose, the card shows the selection and buttons go away. For \"pick several of N\", add `select:{min,max}` — the card becomes a dropdown + Confirm and returns one combined prompt (all options must be prompt; not combinable with maxClicks>1). Set maxClicks > 1 only for multi-user. Destinations live|isolated|thread and HTTP ingest: docs/agent-guides/interactive-prompts.md. Participants may click; they cannot create or cancel." + CHOICE_LABEL_RULE;
 
 /** Combined fence + MCP bullet when both capabilities are on. */
 export const CHOICE_AUTHORING_RULE =
-  "To publish a frozen click-card in this thread, output a fenced block tagged `seam-choice` whose body is JSON `{ title, options:[{label, kind:\"prompt\"|\"custom\", payload?}] }` (or call `create_choice`). Default is live in THIS thread, one person, one pick — after they choose, the card shows the selection and buttons go away. For \"pick several of N\", add `select:{min,max}` — the card becomes a dropdown + Confirm and returns one combined prompt (all options must be prompt; not combinable with maxClicks>1). Set maxClicks > 1 only for multi-user. Destinations live|isolated|thread and HTTP ingest: docs/agent-guides/interactive-prompts.md. Participants may click; they cannot create or cancel.";
+  "To publish a frozen click-card in this thread, output a fenced block tagged `seam-choice` whose body is JSON `{ title, options:[{label, kind:\"prompt\"|\"custom\", payload?}] }` (or call `create_choice`). Default is live in THIS thread, one person, one pick — after they choose, the card shows the selection and buttons go away. For \"pick several of N\", add `select:{min,max}` — the card becomes a dropdown + Confirm and returns one combined prompt (all options must be prompt; not combinable with maxClicks>1). Set maxClicks > 1 only for multi-user. Destinations live|isolated|thread and HTTP ingest: docs/agent-guides/interactive-prompts.md. Participants may click; they cannot create or cancel." + CHOICE_LABEL_RULE;
 
 /** Capability-driven choice ads (#108). Not keyed off agentId. */
 export function choiceAuthoringRules(opts: { fence?: boolean; mcp?: boolean }): string[] {
@@ -49,6 +51,13 @@ export interface ChoiceOption {
   kind: "prompt" | "custom";
   payload?: string;
   target?: ChoiceTarget;
+}
+
+/** Full numbered text when labels outgrow compact controls. Frozen options stay unchanged. */
+export function choiceOptionList(options: ReadonlyArray<Pick<ChoiceOption, "label">>): string[] {
+  return options.some((option) => option.label.length > 80)
+    ? options.map((option, index) => `${index + 1}. ${option.label}`)
+    : [];
 }
 
 export interface ChoiceIngress {
@@ -151,7 +160,8 @@ const TargetSchema = z
   });
 
 const OptionSchema = z.object({
-  label: z.string().trim().min(1).max(CHOICE_LABEL_MAX),
+  label: z.string().trim().min(1, "choice label must not be empty")
+    .max(CHOICE_LABEL_MAX, `Seam choice label sanity bound: at most ${CHOICE_LABEL_MAX} characters`),
   kind: z.enum(["prompt", "custom"]),
   payload: z.string().optional(),
   target: TargetSchema.optional(),
@@ -159,7 +169,7 @@ const OptionSchema = z.object({
 
 export const ChoiceSpecSchema = z
   .object({
-    title: z.string().trim().min(1).max(CHOICE_TITLE_MAX),
+    title: z.string().trim().min(1).max(CHOICE_TITLE_MAX, `Discord embed title limit: at most ${CHOICE_TITLE_MAX} characters`),
     body: z.string().optional(),
     maxClicks: z.number().int().min(1).max(CHOICE_MAX_CLICKS).optional(),
     targetUserId: z.string().regex(/^\d+$/).nullable().optional(),
@@ -190,8 +200,8 @@ export const ChoiceSpecSchema = z
       ctx.addIssue({
         code: z.ZodIssueCode.custom,
         message: hasCustom
-          ? `at most 24 options when a custom option is present (got ${spec.options.length})`
-          : `at most 25 options (got ${spec.options.length})`,
+          ? `Discord choice layout limit: at most 24 options when a custom option is present (got ${spec.options.length})`
+          : `Discord choice layout limit: at most 25 options (got ${spec.options.length})`,
       });
     }
     spec.options.forEach((o, i) => {
@@ -533,8 +543,8 @@ export function choiceLayoutCapError(options: ReadonlyArray<Pick<ChoiceOption, "
   if (options.length < 1) return "at least one option is required";
   if (options.length > cap) {
     return hasCustom
-      ? `at most 24 options when a custom option is present (got ${options.length})`
-      : `at most 25 options (got ${options.length})`;
+      ? `Discord choice layout limit: at most 24 options when a custom option is present (got ${options.length})`
+      : `Discord choice layout limit: at most 25 options (got ${options.length})`;
   }
   return null;
 }

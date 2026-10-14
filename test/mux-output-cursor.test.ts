@@ -47,6 +47,67 @@ const flush = async (n = 6): Promise<void> => {
 
 afterEach(() => vi.restoreAllMocks());
 
+describe("adoption replay binding", () => {
+  it("does not emit a late replay rejection after its owner detached", async () => {
+    const ws = new FakeWs();
+    const mux = makeMux({ id: "b1" });
+    mux.attach(ws as never);
+    const child = mux.adopt(12, { allowAppTraffic: true });
+    const errors: unknown[] = [];
+    child.on("error", error => errors.push(error));
+    await flush();
+    const replay = ws.cmds("replayOutput").at(-1)!;
+    child.detach();
+    ws.emit("close");
+    await flush();
+    expect(errors).toEqual([]);
+    expect(mux.isBound(12)).toBe(false);
+    expect(replay.action).toBe("replayOutput");
+    expect(ws.sent.filter(frame => frame.type === "kill" || frame.type === "spawn")).toEqual([]);
+  });
+
+  it("never delivers an old owner's replay to a replacement binding on the same slot", async () => {
+    const ws = new FakeWs();
+    const mux = makeMux({ id: "b1" });
+    mux.attach(ws as never);
+    const previous = mux.adopt(12, { allowAppTraffic: true });
+    await flush();
+    const oldReplay = ws.cmds("replayOutput").at(-1)!;
+    previous.detach();
+    const replacement = mux.adopt(12, { allowAppTraffic: true });
+    const chunks: string[] = [];
+    replacement.stdout.on("data", chunk => chunks.push(chunk.toString()));
+    await flush();
+    const replay = ws.cmds("replayOutput").at(-1)!;
+    ws.reply(oldReplay, { frames: [{ seq: 1, type: "data", data: "old owner's output\n" }] });
+    await flush();
+    expect(chunks).toEqual([]);
+    expect(ws.cmds("ackOutput")).toEqual([]);
+    ws.reply(replay, { frames: [{ seq: 2, type: "data", data: "replacement's output\n" }] });
+    await flush();
+    expect(chunks).toEqual(["replacement's output\n"]);
+    expect(mux.isBound(12)).toBe(true);
+    expect(ws.sent.filter(frame => frame.type === "kill" || frame.type === "spawn")).toEqual([]);
+    replacement.detach();
+  });
+
+  it("reports the real replay error to the still-owned binding", async () => {
+    const ws = new FakeWs();
+    const mux = makeMux({ id: "b1" });
+    mux.attach(ws as never);
+    const child = mux.adopt(12, { allowAppTraffic: true });
+    const errors: Error[] = [];
+    child.on("error", error => errors.push(error));
+    await flush();
+    ws.fail(ws.cmds("replayOutput").at(-1)!, "fixture's original replay cause");
+    await flush();
+    expect(errors.map(error => error.message)).toEqual(["fixture's original replay cause"]);
+    expect(mux.isBound(12)).toBe(true);
+    expect(ws.sent.filter(frame => frame.type === "kill" || frame.type === "spawn")).toEqual([]);
+    child.detach();
+  });
+});
+
 function harness(opts: Record<string, unknown> = {}) {
   const ws = new FakeWs();
   const gaps: Array<{ slot: number; gap: unknown }> = [];

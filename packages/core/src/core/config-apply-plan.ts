@@ -196,7 +196,9 @@ export class ConfigApplyPlan {
   }
 
   async resolveRequestedRepoPath(location: string, requested: string): Promise<string> {
-    const root = this.bridgeHub?.get(location)?.host.workspaceRoot ??
+    const bridge = this.bridgeHub?.get(location);
+    if (!bridge && location !== "local") throw new Error(`bridge "${location}" is not connected`);
+    const root = bridge?.host.workspaceRoot ??
       (location === "local" ? this.config.REPOS_ROOT : undefined);
     if (!root) throw new Error(`Host \`${location}\` did not report a workspace root.`);
     if (!path.isAbsolute(requested)) {

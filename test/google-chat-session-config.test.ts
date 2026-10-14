@@ -28,6 +28,7 @@ vi.mock("../packages/core/src/agents/agent-runtime.js", async importOriginal => 
     finishPrompt?: () => void;
     constructor(readonly options: { profile: AgentProfile }) {}
     async start() {}
+    getPromptCapabilities() { return undefined; }
     markActivity() { this.lastActivityAtMs = Date.now(); }
     async loadSession(input: { sessionId: string; cwd: string; model?: string; effort?: string }) {
       this.sessionId = input.sessionId; this.cwd = input.cwd; this.modelOverride = input.model; this.effortOverride = input.effort;

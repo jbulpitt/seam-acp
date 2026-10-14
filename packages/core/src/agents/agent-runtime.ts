@@ -1,4 +1,5 @@
 import { Readable, Writable } from "node:stream";
+import { adoptedAcpStream } from "./adopted-acp-stream.js";
 import { buildRecoveryDirective, runBoundedRecovery } from "../core/recovery-directive.js";
 import { newSubmissionEvidence, observeClaudeSubmission, observePromptWrites, type SubmissionEvidence } from "./submission-evidence.js";
 import {
@@ -712,7 +713,7 @@ export class AgentRuntime {
     if (lastActivityAtMs !== undefined && Number.isFinite(lastActivityAtMs)) this.lastActivityMs = lastActivityAtMs;
 
     Object.assign(child, { remoteRung1Recovery: true });
-    this.connectClient(child, true);
+    this.connectClient(child, true, true);
   }
 
   /** Release a completed adopted prompt without sending cancel or killing twice. */
@@ -783,6 +784,7 @@ export class AgentRuntime {
   private connectClient(
     child: ReturnType<AgentProfile["spawn"]>,
     observeWrites: boolean,
+    adopted = false,
   ): ClientSideConnection {
     child.on("exit", (code, signal) => {
       // 130 = SIGINT, 143 = SIGTERM, etc. Surface the agent's own stderr tail on
@@ -819,7 +821,8 @@ export class AgentRuntime {
 
     const writable = Writable.toWeb(child.stdin) as unknown as WritableStream<Uint8Array>;
     const readable = Readable.toWeb(child.stdout) as unknown as ReadableStream<Uint8Array>;
-    const wire = ndJsonStream(writable, readable);
+    const raw = ndJsonStream(writable, readable);
+    const wire = adopted ? adoptedAcpStream(raw) : raw;
     const stream = observeWrites ? observePromptWrites(wire, params => {
       const evidence = this.submissionRequests.get(params);
       if (!evidence) return undefined;

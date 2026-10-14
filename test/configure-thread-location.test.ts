@@ -31,6 +31,7 @@ vi.mock("../packages/core/src/agents/agent-runtime.js", async importOriginal => 
     modelOverride?: string;
     finishPrompt?: () => void;
     async start() {}
+    getPromptCapabilities() { return undefined; }
     markActivity() {}
     async loadSession(input: { sessionId: string; cwd: string; model?: string }) {
       this.sessionId = input.sessionId; this.cwd = input.cwd; this.modelOverride = input.model;

@@ -39,6 +39,7 @@ vi.mock("../packages/core/src/agents/agent-runtime.js", async (importOriginal) =
       modelOverride?: string;
       effortOverride?: string;
       async start(): Promise<void> {}
+      getPromptCapabilities() { return undefined; }
       supportsSessionLoad(): boolean { return true; }
       hasDelegatedTurnInFlight(): boolean { return false; }
       markActivity(): void {

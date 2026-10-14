@@ -104,4 +104,34 @@ describe("warm-slot lifecycle", () => {
       expect(h.commands.filter(frame => frame.type === "rpc" && frame.method === "spawn")).toHaveLength(1);
     } finally { await h.close(); }
   }, 20_000);
+
+  it("waits for a retained non-delegated prompt before sending the successor", async () => {
+    const h = await savedSessionHost(executables);
+    try {
+      const previous = h.makeRouter();
+      const runtime = await previous.getOrStartRuntime(h.record);
+      Object.assign(runtime, { permissionPolicy: () => new Promise(() => {}) });
+      const original = runtime.prompt("continue client reply").catch(() => undefined);
+      const slot = runtime.getSlot()!;
+      const permission = { requestId: "fixture-client-reply", sessionId: SAVED_SESSION, toolCallId: "fixture-call" };
+      await vi.waitFor(async () => expect(await h.slots.permissionControl(slot, "permission_status", permission))
+        .toMatchObject({ state: "pending" }));
+      await previous.disposeAll();
+      await original;
+      await h.restartBridge();
+      const router = h.makeRouter();
+      const retained = await router.getOrStartRuntime(h.record);
+      expect(retained.getSlot()).toBe(slot);
+      expect(retained.busy).toBe(true);
+      const next = retained.prompt("continue successor");
+      await drain();
+      expect((await h.requests()).filter(row => row.method === "session/prompt")).toHaveLength(1);
+      await h.slots.permissionControl(slot, "answer_permission", permission,
+        { outcome: { outcome: "selected", optionId: "allow" } });
+      await expect(next).resolves.toMatchObject({ stopReason: "end_turn" });
+      expect((await h.requests()).filter(row => row.method === "session/prompt")).toHaveLength(2);
+      expect((await h.requests()).filter(row => row.method === "session/load")).toHaveLength(1);
+      expect(h.commands.filter(frame => frame.type === "kill")).toEqual([]);
+    } finally { await h.close(); }
+  }, 20_000);
 });

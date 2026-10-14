@@ -1046,6 +1046,14 @@ export class TurnAttemptStore {
     return settled;
   }
 
+  findByRemoteSlot(location: string, slot: number): TurnAttempt | null {
+    const row = this.db.prepare(`SELECT id FROM turn_attempts
+      WHERE json_extract(runtime_json, '$.remoteRecovery.location')=?
+        AND json_extract(runtime_json, '$.remoteRecovery.slot')=? ORDER BY updated_utc DESC LIMIT 1`)
+      .get(location, slot) as { id: string } | undefined;
+    return row ? this.get(row.id) : null;
+  }
+
   list(state: TurnAttempt["state"], onUnreadable: (id: string, err: unknown) => void =
     (id, err) => console.error("dispatch: unreadable SQL attempt; other attempts remain available", id, err)): TurnAttempt[] {
     const attempts: TurnAttempt[] = [];

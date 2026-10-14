@@ -650,7 +650,7 @@ async function main(): Promise<void> {
   orchestrator.setBridgeHub(bridgeHub);
   stopBridgeUpdates = await installBridgeUpdater(bridgeHub, logger);
   stopPermissionBridgeRecovery = bridgeHub.onBridgeReady(location => orchestrator.recoverPermissionCards(location));
-  // #631: slots outlive controllers; stop the ones no turn owns.
+  // Slots outlive controllers; rebind sessions before reaping true orphans.
   bridgeHub.onBridgeReady((location) => orchestrator.sweepUnownedSlots(location));
   stopCatalogBridgeRefresh = bridgeHub.onBridgeReady((location) => {
     const bridge = bridgeHub?.get(location);

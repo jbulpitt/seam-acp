@@ -1,6 +1,6 @@
 import { fileURLToPath } from "node:url";
 import { randomUUID } from "node:crypto";
-import { threadEnvironment, type RemoteRecoveryResult, type RemoteRecoverySnapshot } from "@seam/adapters";
+import { threadEnvironment, type BridgeSessionSnapshot, type RemoteRecoveryResult, type RemoteRecoverySnapshot } from "@seam/adapters";
 import {
   ADAPTER_CHILD_PROTOCOL_VERSION,
   adapterChildLine,
@@ -20,10 +20,11 @@ import type {
 
 export interface SupervisedBridgeFrame {
   seq: number;
-  type: "data" | "stderr" | "recovery" | "recovery_result" | "exit";
+  type: "data" | "stderr" | "recovery" | "recovery_result" | "session" | "exit";
   data?: string;
   recovery?: RemoteRecoverySnapshot;
   recoveryResult?: RemoteRecoveryResult;
+  session?: BridgeSessionSnapshot;
   code?: number | null;
   signal?: NodeJS.Signals | null;
   spawnError?: string;
@@ -80,6 +81,7 @@ function outputFrame(frame: SessiondOutputFrame, parsedOutput?: ReturnType<typeo
   const parsed = parsedOutput ?? parseAdapterChildOutput(Buffer.from(frame.dataBase64, "base64").toString("utf8"));
   if (!parsed) return undefined;
   if (parsed.type === "data") return { seq: frame.seq, type: "data", data: parsed.data };
+  if (parsed.type === "session") return { seq: frame.seq, type: "session", session: parsed.session };
   if (parsed.type === "recovery") return { seq: frame.seq, type: "recovery", recovery: parsed.recovery };
   if (parsed.type === "recovery_result") {
     return { seq: frame.seq, type: "recovery_result", recoveryResult: parsed.recoveryResult };
@@ -140,6 +142,7 @@ export class SupervisedSlots {
   private readonly configs = new Map<number, SlotSpawnConfig>();
   private readonly queues = new Map<number, Promise<unknown>>();
   private readonly recoveries = new Map<number, RemoteRecoverySnapshot>();
+  private readonly sessions = new Map<number, BridgeSessionSnapshot>();
   private attached = new Map<number, boolean>();
   private readonly controlWaiters = new Map<string, {
     resolve(value: unknown): void;
@@ -187,7 +190,7 @@ export class SupervisedSlots {
       type: "report_recovery",
     }).catch(() => {})));
     const deadline = Date.now() + 1_000;
-    while (Date.now() < deadline && live.some((health) => !this.recoveries.has(health.slot))) {
+    while (Date.now() < deadline && live.some((health) => !this.recoveries.has(health.slot) && !this.sessions.has(health.slot))) {
       await new Promise((resolve) => setTimeout(resolve, 50));
     }
     return listed;
@@ -203,11 +206,14 @@ export class SupervisedSlots {
     if (this.bindings.get(slot)?.dead) {
       this.bindings.delete(slot);
       this.recoveries.delete(slot);
+      this.sessions.delete(slot);
     }
     this.configs.set(slot, config);
   }
 
-  async listSlots(params: SessiondListSlotsParams = {}): Promise<SessiondListSlotsResult> {
+  async listSlots(params: SessiondListSlotsParams = {}): Promise<SessiondListSlotsResult & {
+    health: Array<SessiondListSlotsResult["health"][number] & { session?: BridgeSessionSnapshot; recovery?: RemoteRecoverySnapshot }>;
+  }> {
     const listed = await this.options.client.listSlots(params);
     // Idle holders have no recovery record; query only on attachment.
     const previous = this.attached;
@@ -223,7 +229,8 @@ export class SupervisedSlots {
         ...(this.recoveries.has(entry.slot)
           ? { recovery: this.recoveries.get(entry.slot) }
           : {}),
-      })) as SessiondListSlotsResult["health"],
+        ...(this.sessions.has(entry.slot) ? { session: this.sessions.get(entry.slot) } : {}),
+      })),
     };
   }
 
@@ -356,6 +363,7 @@ export class SupervisedSlots {
           && fresh.acpSessionId === input.acpSessionId && owner?.pid === health.pid
           && owner.alive && owner.attached && owner.resumePending === false)) return { state: "owned" };
         this.recoveries.delete(slot);
+        this.sessions.delete(slot);
         return { state: "missing", cause: `bridge slot ${slot} armed recovery but never received a complete session/prompt for this submission`,
           retainChild: true };
       }
@@ -531,6 +539,7 @@ export class SupervisedSlots {
       binding.exitSeen = true;
     }
     if (frame.type === "recovery" && frame.recovery) this.recoveries.set(slot, frame.recovery);
+    if (frame.type === "session" && frame.session) this.sessions.set(slot, frame.session);
     if (binding.mode === "buffering") binding.buffered.set(frame.seq, frame);
     else if (binding.mode === "live") this.options.onFrame({ slot, ...frame });
   }

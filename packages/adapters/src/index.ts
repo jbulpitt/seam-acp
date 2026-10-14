@@ -3,6 +3,8 @@ export { makeMux, BridgeUnreachableError, CATALOG_FETCH_TIMEOUT_MS } from "./mux
 export type {
   MuxSpawnOpts,
   MuxChild,
+  BridgeSessionSnapshot,
+  BridgeSlotHealth,
   BridgeLivenessTimeout,
   RemoteExitEvidence,
   RemoteHostOomEvidence,

@@ -47,6 +47,11 @@ sentinel, and promptly enters the bounded shutdown quiesce; systemd restarts
 the controller. Running turns stay with sessiond and reattach. Messages sent
 while the controller is down are caught up from Discord on startup.
 
+Idle warm sessions detach too. The next controller adopts their retained bridge
+slots by persisted ACP/session identity instead of cancelling them or spawning
+a second writer. Normal idle-timeout retirement is unchanged. Reconnect cleanup
+retains known sessions and only reaps identified orphans after its existing grace.
+
 On production, the command now waits for a deploy verdict, correlated to the
 old controller's PID/start identity and the requested commit. It checks the new
 identity, `/health`, `seam-acp ready`, and every level 50/60 log between boot and

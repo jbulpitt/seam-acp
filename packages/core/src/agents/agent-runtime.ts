@@ -685,10 +685,11 @@ export class AgentRuntime {
   /** Reattach the application side while the bridge retains prompt ownership. */
   attachRecovery(child: ReturnType<AgentProfile["spawn"]>, sessionId: string,
     modes?: Pick<SessionInfo, "availableModes" | "currentModeId">, lastActivityAtMs?: number,
-    retained?: { busy: boolean }): void {
+    retained?: { busy: boolean }, promptCapabilities?: PromptCapabilities): void {
     if (this.connection || this.child) throw new Error("runtime is already attached");
     this.child = child;
     this.sessionId = sessionId;
+    this.promptCapabilities = promptCapabilities;
     this.sessionInfo = { sessionId, availableModels: [], availableModes: [], ...modes };
     this.promptInFlight = retained?.busy ?? true;
     this.delegatedTurn = retained === undefined;

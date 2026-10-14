@@ -12,7 +12,7 @@ import { SessionRouter } from "../packages/core/src/core/session-router.js";
 import { Orchestrator } from "../packages/core/src/platforms/discord/orchestrator.js";
 import { discordRenderer } from "../packages/core/src/platforms/discord/renderer.js";
 import { fixtureModelCatalog } from "./model-catalog-fixture.js";
-import { localBridgeWiring } from "./local-bridge-fixture.js";
+import { localBridgeHub, localBridgeWiring } from "./local-bridge-fixture.js";
 
 // Only the provider is fake; commits, reloads, queues and acquisition are real.
 vi.mock("../packages/core/src/agents/agent-runtime.js", async importOriginal => {
@@ -87,6 +87,10 @@ async function fixture(threadPreset?: unknown) {
     getThreadLiveState: vi.fn(async () => ({ exists: true, archived: false, locked: false })) };
   const orchestrator = new Orchestrator({ config, logger, store, router, modelCatalog: catalog,
     adapter: adapter as never, renderer: discordRenderer });
+  const hub = localBridgeHub(profiles, dir);
+  const connected = hub.get("local");
+  hub.get = () => connected;
+  orchestrator.setBridgeHub(hub);
   await orchestrator.loadPlugins();
   cleanups.push(() => (orchestrator as any).plugins.dispose());
   const mutation = orchestrator.getConfigMutation(), plan = orchestrator.getConfigApplyPlan();

@@ -42,8 +42,8 @@ export interface ModelVisionRouting {
  * Resolve model perception separately from the ACP transport capability.
  * A Claude-compatible harness can advertise image blocks even when the model
  * behind it is text-only; `tool`/`none` must therefore force staging before the
- * attachment reaches AgentRuntime. Native models still respect an explicitly
- * image-incapable ACP bridge. Unannotated models preserve the legacy behavior.
+ * attachment reaches AgentRuntime. Native and unannotated models inline images
+ * only with advertised transport support; unknown support uses file staging.
  */
 export function resolveModelVisionRouting(
   transportHasVision: boolean | undefined,
@@ -51,7 +51,7 @@ export function resolveModelVisionRouting(
 ): ModelVisionRouting {
   if (visionMode === "tool") return { agentHasVision: false, viaTool: true };
   if (visionMode === "none") return { agentHasVision: false, viaTool: false };
-  return { agentHasVision: transportHasVision, viaTool: false };
+  return { agentHasVision: transportHasVision === true, viaTool: false };
 }
 
 /**

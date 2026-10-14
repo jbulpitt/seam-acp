@@ -196,7 +196,7 @@ describe("automatic reauth recovery", () => {
     const id = await parkMessage(h);
     const card = h.store.listOpenChoiceCards("discord")[0]!;
     const notices = h.messages.length;
-    for (const wait of [10_000, 30_000, 120_000, 300_000, 420_000, 420_000]) {
+    for (const wait of [10_000, 30_000, 120_000, 300_000, 420_000, 420_000, 420_000, 420_000]) {
       const before = h.prompt.mock.calls.length;
       await vi.advanceTimersByTimeAsync(wait - 1);
       await h.orch.reconcileRemoteRecoveries(); await settleContinuations(h);

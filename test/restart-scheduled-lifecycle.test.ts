@@ -16,6 +16,7 @@ import { ScheduledPromptManager } from "../packages/core/src/core/scheduled-prom
 import type { DeliveryNonceLookup } from "../packages/core/src/platforms/chat-adapter.js";
 import { attachLocalBridge } from "./local-bridge-fixture.js";
 import { DispatchSuspendedError } from "../packages/core/src/core/dispatch/attempt-store.js";
+import { ReauthParked } from "../packages/core/src/core/reauth-negotiation.js";
 
 const transport = vi.hoisted(() => ({ prompt: vi.fn(), load: vi.fn(), fresh: vi.fn(), delete: vi.fn(), dispose: vi.fn() }));
 const RIDERS = ["SCHEDULE_CHANNEL_RIDER", "SCHEDULE_THREAD_RIDER"];
@@ -88,6 +89,37 @@ function rewriteAsLegacy(store: SessionStore, id: string, legacy = "a".repeat(64
 }
 
 describe("#252 actual isolated scheduler + injectTurn, synthetic transport", () => {
+  it("a later schedule tick resumes its parked isolated ACP session, preserving the frozen cwd and original prompt", async () => {
+    const h = setup("isolated", "claude");
+    h.row.cwd = "/synthetic/frozen-schedule-cwd";
+    h.store.upsertScheduled(h.row);
+    const orch = h.make();
+    const manager = new ScheduledPromptManager({ store: h.store, logger: pino({ level: "silent" }) as any,
+      resolveExecution: row => orch.scheduleExecution(row), onFire: (id, key) => orch.runScheduledPrompt(id, key) });
+    cleanups.push(() => manager.stop());
+    transport.prompt.mockRejectedValueOnce(new ReauthParked({ action: "park", reason: "Authentication required",
+      park: { errorKind: "auth_required" } }, new Error("Authentication required")));
+    const key = scheduledOccurrenceKey(h.row.id, "2026-10-14T11:30:00.000Z");
+    await orch.runScheduledPrompt(h.row.id, key);
+    expect(h.store.turnAttempts.get(key.id)).toMatchObject({ state: "suspended", promptStarted: true,
+      acpSessionId: "new-disposable-session" });
+    expect(h.store.getScheduled(h.row.id)?.lastStatus).toContain("waiting for provider sign-in since");
+    transport.prompt.mockResolvedValueOnce({ stopReason: "end_turn" });
+    await (manager as unknown as { fire(id: string, key: ReturnType<typeof scheduledOccurrenceKey>): Promise<void> })
+      .fire(h.row.id, scheduledOccurrenceKey(h.row.id, "2026-10-14T12:00:00.000Z"));
+    await (orch as unknown as { settleTrackedContinuations(): Promise<void> }).settleTrackedContinuations();
+    expect(h.store.turnAttempts.get(key.id)).toMatchObject({ state: "completed", generation: 2,
+      acpSessionId: "new-disposable-session", spec: { cwd: h.row.cwd } });
+    expect(h.store.scheduledOccurrences.get(key.id)?.settled).toBe(true);
+    expect(h.store.scheduledOccurrences.pending()).toEqual([]);
+    expect(transport.fresh).toHaveBeenCalledOnce();
+    expect(transport.load).toHaveBeenCalledWith("new-disposable-session");
+    expect(transport.prompt).toHaveBeenCalledTimes(2);
+    expect(transport.prompt.mock.calls[1]![0]).toContain("continue");
+    expect(JSON.stringify(transport.prompt.mock.calls).match(/ORIGINAL DISPOSABLE SCHEDULE/g)).toHaveLength(1);
+    expect(h.store.getScheduled(h.row.id)?.lastStatus).toBe("ok");
+  });
+
   it("retains the exact live schedule suspension from runtime binding", async () => {
     const h = setup("live");
     const orch = h.make();

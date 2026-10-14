@@ -164,6 +164,38 @@ async function settleContinuations(h: ReturnType<typeof harness>) {
 }
 
 describe("automatic reauth recovery", () => {
+  it("a rejected auth continuation never unstarts or replays the previously submitted original", async () => {
+    const h = harness(() => undefined);
+    const id = await parkMessage(h);
+    h.prompt.mockRejectedValueOnce(new RequestError(-32603, "Authentication required", { errorKind: "auth_required" }));
+    await (h.orch as unknown as { recoverReauth(location: string): Promise<void> }).recoverReauth("local");
+    await settleContinuations(h);
+    expect(h.store.turnAttempts.get(id)).toMatchObject({ state: "suspended", promptStarted: true,
+      acpSessionId: "fixture-acp" });
+    resumeOutcome(h, false);
+    await (h.orch as unknown as { recoverReauth(location: string): Promise<void> }).recoverReauth("local");
+    await settleContinuations(h);
+    expect(h.store.turnAttempts.get(id)?.state).toBe("completed");
+    expect(h.prompt).toHaveBeenCalledTimes(3);
+    expect(JSON.stringify(h.prompt.mock.calls).match(/ORIGINAL-ONCE/g)).toHaveLength(1);
+    expect(h.messages.filter(text => text === "RESUMED-ONCE")).toHaveLength(1);
+    h.store.close();
+  });
+
+  it("a rejected auth original remains pending and is submitted once after sign-in works", async () => {
+    const h = harness(() => undefined);
+    h.prompt.mockRejectedValueOnce(new RequestError(-32603, "Authentication required", { errorKind: "auth_required" }));
+    const id = await parkMessage(h);
+    expect(h.store.turnAttempts.get(id)?.promptStarted).toBe(false);
+    resumeOutcome(h, false);
+    await (h.orch as unknown as { recoverReauth(location: string): Promise<void> }).recoverReauth("local");
+    await settleContinuations(h);
+    expect(h.store.turnAttempts.get(id)?.state).toBe("completed");
+    expect(h.prompt).toHaveBeenCalledTimes(2);
+    expect(JSON.stringify(h.prompt.mock.calls[1])).toContain("ORIGINAL-ONCE");
+    h.store.close();
+  });
+
   it("rechecks on the existing tick after backoff, continuing the same session once without a click", async () => {
     vi.useFakeTimers({ toFake: ["Date", "setInterval", "clearInterval"] });
     const h = harness(() => ({ refreshTokenExpiresAt: 1 }), true);

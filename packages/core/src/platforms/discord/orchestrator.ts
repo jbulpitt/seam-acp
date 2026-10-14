@@ -3367,25 +3367,7 @@ export class Orchestrator {
     );
   }
 
-  /**
-   * Phase two of shutdown (#174), run AFTER `router.disposeAll()`.
-   *
-   * Disposal is not passive: killing an agent rejects its in-flight turn, and
-   * those rejections run cleanup that settles cards, releases queues, and
-   * registers fresh post-turn continuations. A single `setImmediate` yield is
-   * not a barrier for that — the work can span multiple awaits and I/O.
-   *
-   * It waits for exactly what phase 1 waits for, deliberately: phase 1 may have
-   * TIMED OUT, and `disposeAll()` is then the thing that forces those wedged
-   * turns to finish. A phase-2 barrier that watched less than phase 1 would be
-   * blind to precisely the work disposal just released. That is not
-   * hypothetical — an ISOLATED dispatch has no channel queue and no tracked
-   * continuation (see `dispatchInjectTurn`; it is counted in `activeTurns` and
-   * lives in the watcher's own queue), so a phase 2 built from
-   * `channelQueues` + continuations alone would return with the done-file
-   * unwritten and close the store on top of it. That is the original #174 race,
-   * one phase later.
-   */
+  /** Join all callbacks released by controller transport detach before closing resources. */
   async drainAfterDispose(opts: { timeoutMs?: number; clock?: DeadlineClock } = {}): Promise<QuiesceOutcome> {
     return this.runBoundedDrain(
       "post-dispose",

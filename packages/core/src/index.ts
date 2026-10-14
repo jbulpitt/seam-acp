@@ -1797,24 +1797,14 @@ async function main(): Promise<void> {
       await seamMcpServer?.stop({ timeoutMs: budget.forStage(5000) });
     });
     stopTunnelGist?.();
-    // #174 phase 2: dispose runtimes while the adapter and store are STILL
-    // usable. Disposal kills agent processes, which rejects any in-flight turn;
-    // those rejections run cleanup that posts to Discord and writes to the
-    // store. Stopping the adapter first (the old order) guaranteed that
-    // cleanup hit a dead adapter.
-    // A disposal that did not finish is the sharpest case of all: killing an
-    // agent REJECTS its in-flight turn, and that rejection runs cleanup which
-    // posts to Discord and writes the ledger. If disposal is still going, that
-    // cleanup is still coming.
+    // Detach client transports while their late callbacks can still use the
+    // adapter and store. The bridge-owned processes keep running.
     verdicts.push({
       stage: "router-dispose",
       drained: await bounded("router disposeAll", 10_000, () => router.disposeAll()),
     });
-    // #174 phase 3: disposal SPAWNS work — rejection handlers register fresh
-    // post-turn continuations. A single setImmediate is not a barrier for
-    // that, so drain the tracked set again, bounded, before the transport and
-    // store go away. Anything still outstanding when this expires is exactly
-    // what boot done-file reconciliation repairs.
+    // Closing client transports can register new continuation callbacks.
+    // Drain those too before closing the adapter and store.
     const postDisposeDrained = await orchestrator
       .drainAfterDispose({ timeoutMs: budget.forStage(config.SHUTDOWN_QUIESCE_TIMEOUT_MS) })
       .then(

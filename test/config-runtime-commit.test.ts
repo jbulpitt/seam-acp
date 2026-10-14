@@ -30,6 +30,7 @@ vi.mock("../packages/core/src/agents/agent-runtime.js", async importOriginal => 
     finishPrompt?: () => void;
     constructor(readonly options: any) {}
     async start() {}
+    getPromptCapabilities() { return undefined; }
     async loadSession(input: { sessionId: string }) { this.sessionId = input.sessionId; }
     async newSession() {
       this.sessionId = `fresh-${this.options.profile.id}`;

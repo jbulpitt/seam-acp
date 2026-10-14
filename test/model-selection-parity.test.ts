@@ -32,6 +32,7 @@ vi.mock("../packages/core/src/agents/agent-runtime.js", async importOriginal => 
       if (boundary.rejection) throw boundary.rejection;
     }
     async loadSession(input: { sessionId: string }) { this.sessionId = input.sessionId; }
+    getPromptCapabilities() { return undefined; }
     async newSession() { this.sessionId = "fresh-provider-session"; return { sessionId: this.sessionId }; }
     getSessionInfo() { return { sessionId: this.sessionId, currentModelId: this.modelOverride, availableModels: [] }; }
     async dispose() {}

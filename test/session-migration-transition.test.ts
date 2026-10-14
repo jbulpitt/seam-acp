@@ -26,6 +26,7 @@ vi.mock("../packages/core/src/agents/agent-runtime.js", async importOriginal => 
     rejectPrompt?: (error: Error) => void;
     constructor(readonly options: { profile: AgentProfile }) {}
     async start() {}
+    getPromptCapabilities() { return undefined; }
     markActivity() { this.lastActivityAtMs = Date.now(); }
     async loadSession(input: { sessionId: string }) { this.sessionId = input.sessionId; }
     async newSession() { this.sessionId = `fresh-${this.options.profile.id}`; return { sessionId: this.sessionId }; }

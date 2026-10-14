@@ -26,6 +26,7 @@ vi.mock("../packages/core/src/agents/agent-runtime.js", async importOriginal => 
     sessionId = "";
     lastActivityAtMs = Date.now();
     async start() {}
+    getPromptCapabilities() { return undefined; }
     async loadSession(input: { sessionId: string }) { this.sessionId = input.sessionId; }
     async newSession() { this.sessionId = "fresh-provider-context"; return { sessionId: this.sessionId }; }
     getSessionInfo() { return { sessionId: this.sessionId, currentModelId: this.modelOverride, availableModels: [] }; }

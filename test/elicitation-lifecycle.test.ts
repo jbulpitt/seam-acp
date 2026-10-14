@@ -6,7 +6,9 @@ import { readSessiondProcessIdentity } from "../packages/bridge/src/sessiond-ser
 import { ElicitationManager } from "../packages/core/src/core/elicitation/manager.js";
 import { elicitationCustomId } from "../packages/core/src/core/elicitation/types.js";
 import { PendingPermissions } from "../packages/bridge/src/pending-permissions.js";
-import type { ComponentEvent, ElicitationCardPost } from "../packages/core/src/platforms/chat-adapter.js";
+import type { ComponentEvent, ElicitationCardPost, MessageRef } from "../packages/core/src/platforms/chat-adapter.js";
+import { DiscordAdapter } from "../packages/core/src/platforms/discord/adapter.js";
+import { GoogleChatAdapter } from "../packages/core/src/platforms/google-chat/adapter.js";
 import { savedSessionHost, SAVED_SESSION } from "./helpers/saved-session-recovery.js";
 import { prepareSessionExecutables } from "./helpers/saved-session-executables.js";
 
@@ -15,6 +17,34 @@ afterAll(() => executables.close());
 const until = async (predicate: () => unknown) => vi.waitFor(() => expect(predicate()).toBeTruthy(), { timeout: 10_000 });
 
 describe("ordinary elicitation lifecycle", () => {
+  it("Discord terminal edits explicitly replace existing controls with components: []", async () => {
+    const logger = pino({ level: "silent" });
+    const adapter = new DiscordAdapter({ config: { DISCORD_ALLOWED_USER_IDS: new Set(), DISCORD_USER_NAMES: new Map() } as any, logger });
+    const edit = vi.fn(async () => ({}));
+    const fetch = vi.fn(async () => ({ edit }));
+    (adapter as any).fetchSendableChannel = vi.fn(async () => ({ messages: { fetch } }));
+    const ref = { channel: { platform: "discord", id: "thread" }, id: "same-form-card" };
+    const panel = { color: 0, title: "Question", fields: [], footer: "✅ Completed" };
+    await adapter.editElicitationCard(ref, { panel });
+    expect(fetch).toHaveBeenCalledExactlyOnceWith(ref.id);
+    expect(edit).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ components: [], embeds: [expect.anything()] }));
+  });
+
+  it("Google Chat terminal edits replace the entire cardsV2 field without control widgets", async () => {
+    const request = vi.fn(async () => ({}));
+    const adapter = new GoogleChatAdapter({ api: { request }, subscription: "projects/test/subscriptions/events",
+      allowedUserIds: new Set(), defaultCwd: "/projects", logger: pino({ level: "silent" }), writeIntervalMs: 0 } as any);
+    const ref = { channel: { platform: "google-chat", id: "dm.thread", parentId: "dm" }, id: "spaces/dm/messages/same-form-card" };
+    const panel = { color: 0, title: "Question", fields: [], footer: "✅ Completed" };
+    await adapter.editElicitationCard(ref, { panel });
+    expect(request).toHaveBeenCalledExactlyOnceWith("chat", expect.objectContaining({ method: "PATCH",
+      url: `https://chat.googleapis.com/v1/${ref.id}`, params: { updateMask: "cardsV2" } }));
+    const body = (request.mock.calls[0] as unknown as [string, { data: any }])[1].data;
+    expect(body.cardsV2).toHaveLength(1);
+    expect(body.cardsV2[0].cardId).toBe(ref.id);
+    expect(body.cardsV2[0].card.sections[0].widgets).toEqual([{ textParagraph: { text: "✅ Completed" } }]);
+  });
+
   it("does not cancel a freshly emitted question when an older child lacks the ordinary status cache", async () => {
     const h = await savedSessionHost(executables);
     const cards: ElicitationCardPost[] = [];
@@ -111,15 +141,16 @@ describe("ordinary elicitation lifecycle", () => {
   it.each(["answered", "cancelled", "expired", "owner exited"])("%s: retains the original live request and card across controller detach", async mode => {
     const h = await savedSessionHost(executables);
     const cards: ElicitationCardPost[] = [];
-    const edits: ElicitationCardPost[] = [];
+    const edits: Array<{ ref: MessageRef; card: ElicitationCardPost }> = [];
     const adapter = {
       sendElicitationCard: async (_channel: unknown, card: ElicitationCardPost) => {
         cards.push(card); return { channel: { platform: "discord", id: h.record.channelRef }, id: "same-form-card" };
       },
-      editElicitationCard: async (_ref: unknown, card: ElicitationCardPost) => { edits.push(card); },
+      editElicitationCard: async (ref: MessageRef, card: ElicitationCardPost) => { edits.push({ ref, card }); },
     };
     let previous: ReturnType<typeof h.makeOrchestrator> | undefined;
     let next: ReturnType<typeof h.makeOrchestrator> | undefined;
+    let clock: ReturnType<typeof vi.spyOn> | undefined;
     try {
       const oldRouter = h.makeRouter();
       previous = h.makeOrchestrator(oldRouter, adapter);
@@ -143,6 +174,8 @@ describe("ordinary elicitation lifecycle", () => {
       expect((await h.requests()).filter(frame => frame.method === "session/cancel")).toEqual([]);
 
       const newRouter = h.makeRouter();
+      let now = Date.now();
+      clock = vi.spyOn(Date, "now").mockImplementation(() => now);
       next = h.makeOrchestrator(newRouter, adapter);
       // Production boot has no transient author entry for this surviving request.
       await next.recoverElicitations();
@@ -169,8 +202,8 @@ describe("ordinary elicitation lifecycle", () => {
         await manager.recoverOpen();
         expect(h.store.getElicitation(row.id)).toMatchObject({ status: "interrupted", terminalDetail: expect.stringMatching(/agent process|owner.*(exited|gone)/i) });
       } else if (mode === "expired") {
-        const clock = vi.spyOn(Date, "now").mockReturnValue(Date.parse(row.expiresUtc) + 1);
-        try { await manager.sweep(); } finally { clock.mockRestore(); }
+        now = Date.parse(row.expiresUtc) + 1;
+        await manager.sweep();
         expect(h.store.getElicitation(row.id)).toMatchObject({ status: "expired", terminalDetail: "The request expired." });
       } else {
         await manager.handleComponent(click);
@@ -188,8 +221,15 @@ describe("ordinary elicitation lifecycle", () => {
         expect(h.commands.filter(frame => frame.type === "rpc" && frame.method === "spawn")).toHaveLength(1);
       }
       expect(cards).toHaveLength(1);
-      expect(edits.at(-1)?.buttons).toEqual([]);
+      const footer = mode === "answered" ? "✅ Completed" : mode === "cancelled" ? "🚫 Cancelled"
+        : mode === "expired" ? "⌛ Expired" : "♻️ Interrupted by restart/session replacement";
+      await vi.waitFor(() => {
+        expect(edits.at(-1)).toMatchObject({ ref: { id: "same-form-card", channel: { id: h.record.channelRef } }, card: { panel: { footer } } });
+        expect(edits.at(-1)!.card.buttons ?? []).toEqual([]);
+        expect(edits.at(-1)!.card.select).toBeUndefined();
+      });
     } finally {
+      clock?.mockRestore();
       vi.useRealTimers();
       previous?.suspendForRestart(); next?.suspendForRestart(); await h.close();
     }

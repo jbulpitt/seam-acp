@@ -841,7 +841,7 @@ export class AgentRuntime {
       })
       .onRequest(methods.client.elicitation.create, async ({ params, requestId, signal }) => {
         if (!this.elicitationHandler) return { action: "decline" };
-        const context: ElicitationRequestContext = { requestId, signal };
+        const context: ElicitationRequestContext = { requestId, signal, isDetached: () => this.detached };
         return this.elicitationHandler(params, context);
       })
       .onNotification(methods.client.elicitation.complete, async ({ params }) => {

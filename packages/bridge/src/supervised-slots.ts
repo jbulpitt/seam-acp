@@ -8,8 +8,7 @@ import {
   type AdapterChildInput,
 } from "./adapter-child-protocol.js";
 import type { SlotSpawnConfig } from "./rpc.js";
-import type { PermissionIdentity, PermissionSnapshot } from "./pending-permissions.js";
-import type { RequestPermissionResponse } from "@agentclientprotocol/sdk";
+import type { PendingRequestIdentity, PendingResponse, PermissionSnapshot } from "./pending-permissions.js";
 import { SessiondClient, SessiondClientError } from "./sessiond-client.js";
 import type {
   SessiondEvent,
@@ -381,9 +380,11 @@ export class SupervisedSlots {
   }
 
   async permissionControl(slot: number, type: "permission_status" | "answer_permission",
-    permission: PermissionIdentity, answer?: RequestPermissionResponse): Promise<PermissionSnapshot> {
+    permission: PendingRequestIdentity, answer?: PendingResponse): Promise<PermissionSnapshot> {
     return this.serial(slot, async () => {
-      if (!this.bindings.get(slot) || this.bindings.get(slot)?.dead) return { state: "gone", pid: 0 };
+      if (!this.bindings.get(slot) || this.bindings.get(slot)?.dead) return {
+        state: "gone", pid: 0, detail: "The original agent process is no longer alive.",
+      };
       const requestId = randomUUID();
       const response = this.waitForControl(requestId);
       try {

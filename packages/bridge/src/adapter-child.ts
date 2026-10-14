@@ -227,7 +227,7 @@ function start(config: AdapterChildBootstrap): void {
       observeSession(line, false);
       if (resumeOutput(line)) continue;
       resumeRecord.observeOutput(line);
-      permissions.observeOutput(line);
+      permissions.observeOutput(line, acpSessionId);
       resumeRecord.record(recovery.resumable(config.slot));
       if (decision.forward !== null) publish({
         v: ADAPTER_CHILD_PROTOCOL_VERSION,
@@ -307,8 +307,8 @@ function start(config: AdapterChildBootstrap): void {
       if (snapshot) publish({ v: ADAPTER_CHILD_PROTOCOL_VERSION, type: "recovery", recovery: snapshot });
       const result = recovery.terminalResult(config.slot);
       if (result) publish({ v: ADAPTER_CHILD_PROTOCOL_VERSION, type: "recovery_result", recoveryResult: result });
-      if (message.replayPermissions && snapshot && !result) {
-        for (const data of permissions.unanswered(snapshot.acpSessionId)) {
+      if (message.replayPermissions && acpSessionId) {
+        for (const data of permissions.unanswered(acpSessionId)) {
           publish({ v: ADAPTER_CHILD_PROTOCOL_VERSION, type: "data", data });
         }
       }

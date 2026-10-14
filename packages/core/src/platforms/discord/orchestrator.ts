@@ -861,6 +861,7 @@ export class Orchestrator {
   suspendForRestart(): void {
     this.restartCutoff = true;
     this.actionCards.detach();
+    this.elicitations.detach();
     for (const panel of this.attemptStatusPanels.values()) panel.stop();
     this.attemptStatusPanels.clear();
     for (const unsubscribe of this.remoteAdoptionWaiters.values()) unsubscribe();
@@ -1069,6 +1070,28 @@ export class Orchestrator {
       currentUserId: (channelRef) => this.currentAuthorIds.get(channelRef),
       isTurnActive: (channelRef) => this.channelQueues.has(this.queueChannelRef(channelRef)),
       onCodexAsyncAnswer: (delivery) => this.admitCodexAsyncAnswer(delivery),
+      owner: async (row, response) => {
+        const record = this.store.get(row.sessionRecordId);
+        if (!record || record.acpSessionId !== row.acpSessionId) return {
+          state: "gone", pid: 0, detail: !record
+            ? "The originating session record no longer exists."
+            : "The originating ACP session changed; its request is no longer current.",
+        };
+        const identity = JSON.parse(row.requestCorrelation) as {
+          requestId?: string | number | null;
+          owner?: { location: string; slot: number; ownerPid?: number };
+        };
+        // Older rows bind their original request when it is replayed.
+        if (!identity.owner || identity.requestId === undefined) return undefined;
+        const mux = this.bridgeHub?.muxFor(identity.owner.location);
+        if (!mux) throw new Error(`bridge ${JSON.stringify(identity.owner.location)} is not connected`);
+        return await mux.sendCmd(response ? "answerPermission" : "permissionStatus", {
+          slot: identity.owner.slot, permission: {
+            method: "elicitation/create", requestId: identity.requestId, sessionId: row.acpSessionId,
+            ...(identity.owner.ownerPid ? { ownerPid: identity.owner.ownerPid } : {}),
+          }, ...(response ? { response } : {}),
+        }) as import("../../core/elicitation/types.js").ElicitationOwnerState;
+      },
     });
     this.router.setElicitationHandlers({
       create: (record, request, context) => this.elicitations.create(record, request, context),
@@ -1889,7 +1912,7 @@ export class Orchestrator {
     this.watchQueueWedges();
   }
 
-  /** Freeze any card whose ACP request disappeared with the prior process. */
+  /** Rebind cards to their surviving requests; retire only requests that ended. */
   async recoverElicitations(): Promise<number> {
     await this.actionCards.recover();
     return this.elicitations.recoverOpen();
@@ -7042,6 +7065,8 @@ export class Orchestrator {
   recoverPermissionCards(location: string): void {
     this.trackContinuation(this.actionCards.recover(location).catch(err =>
       this.logger.warn({ err, location }, "permission recovery failed")));
+    this.trackContinuation(this.elicitations.recoverOpen(location).then(() => {}).catch(err =>
+      this.logger.warn({ err, location }, "elicitation recovery failed")));
   }
 
   setChoiceResults(hub: ChoiceResultHub): void {

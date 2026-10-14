@@ -26,6 +26,8 @@ import {
   parseElicitationCustomId,
   responseForTerminal,
   type ElicitationField,
+  type ElicitationOwner,
+  type ElicitationOwnerState,
   type ElicitationRequestContext,
   type ElicitationRow,
   type ElicitationTerminalStatus,
@@ -471,6 +473,8 @@ export class ElicitationManager {
   ) => Promise<boolean>;
   private readonly waiters = new Map<string, Waiter>();
   private readonly timers = new Map<string, ReturnType<typeof setTimeout>>();
+  private readonly owner?: (row: ElicitationRow, response?: CreateElicitationResponse) => Promise<ElicitationOwnerState | undefined>;
+  private detached = false;
 
   constructor(opts: {
     store: SessionStore;
@@ -479,6 +483,7 @@ export class ElicitationManager {
     currentUserId: (channelRef: string) => string | undefined;
     isTurnActive?: (channelRef: string) => boolean;
     onCodexAsyncAnswer?: (delivery: CodexAsyncAnswerDelivery) => Promise<boolean>;
+    owner?: (row: ElicitationRow, response?: CreateElicitationResponse) => Promise<ElicitationOwnerState | undefined>;
     now?: () => number;
   }) {
     this.store = opts.store;
@@ -487,24 +492,47 @@ export class ElicitationManager {
     this.currentUserId = opts.currentUserId;
     this.isTurnActive = opts.isTurnActive ?? (() => false);
     this.onCodexAsyncAnswer = opts.onCodexAsyncAnswer;
+    this.owner = opts.owner;
     this.now = opts.now ?? Date.now;
   }
 
-  async recoverOpen(): Promise<number> {
+  async recoverOpen(location?: string): Promise<number> {
+    if (this.detached) return 0;
     const rows = this.store.listOpenElicitations();
     for (const row of rows) {
       if (row.source === "codex_async") {
+        if (location) continue;
         if (row.answerMessageId) await this.deliverClaimedCodexAsyncAnswer(row);
         else this.armExpiry(row.id, row.expiresUtc);
         continue;
       }
-      const settled = this.store.settleElicitation(
-        row.id, "interrupted", "Seam restarted before this request completed.", this.nowUtc()
-      );
-      if (settled) await this.refresh(settled);
+      if (location && this.requestIdentity(row).owner?.location !== location) continue;
+      try {
+        if (row.expiresUtc <= this.nowUtc()) await this.cancelOne(row.id, "expired", "The request expired.");
+        else {
+          const owner = this.owner ? await this.owner(row) : {
+            state: "gone" as const, pid: 0, detail: "The original request has no surviving agent owner.",
+          };
+          if (owner?.state === "gone") {
+            await this.cancelOne(row.id, owner.cancelled ? "cancelled" : "interrupted", owner.detail ?? "The original agent request is no longer pending.");
+          } else if (owner?.state === "answered" && owner.response) {
+            await this.settleResponse(row, owner.response, "Answered by the original agent request.");
+          } else this.armExpiry(row.id, row.expiresUtc);
+        }
+      } catch (error) {
+        this.logger.warn({ error, id: row.id }, "elicitation recovery awaits bridge");
+        this.armExpiry(row.id, row.expiresUtc);
+      }
     }
     this.store.clearExpiredElicitationLeases(this.nowUtc());
     return rows.length;
+  }
+
+  detach(): void {
+    this.detached = true;
+    for (const timer of this.timers.values()) clearTimeout(timer);
+    this.timers.clear();
+    this.waiters.clear();
   }
 
   async createCodexAsync(
@@ -562,7 +590,7 @@ export class ElicitationManager {
     };
     const superseded = this.store.replaceOpenElicitation(row);
     for (const old of superseded) {
-      this.finish(old, responseForTerminal(old.status as ElicitationTerminalStatus));
+      await this.finish(old, responseForTerminal(old.status as ElicitationTerminalStatus));
       await this.refresh(old);
     }
     try {
@@ -620,8 +648,7 @@ export class ElicitationManager {
     request: CreateElicitationRequest,
     context: ElicitationRequestContext
   ): Promise<CreateElicitationResponse> {
-    const userId = this.currentUserId(record.channelRef);
-    if (!userId || !this.adapter.sendElicitationCard || !this.adapter.editElicitationCard) {
+    if (!this.adapter.sendElicitationCard || !this.adapter.editElicitationCard) {
       return { action: "decline" };
     }
     const correlation = this.correlation(record, request);
@@ -650,7 +677,17 @@ export class ElicitationManager {
     }
 
     const now = this.now();
-    const row: ElicitationRow & { status: "open" } = {
+    const identity = { ...JSON.parse(correlation.value), requestId: context.requestId,
+      ...(context.owner ? { owner: context.owner } : {}) };
+    const previous = this.store.requestElicitations(record.id).find(row => {
+      if (row.acpSessionId !== record.acpSessionId || row.requestJson !== durableRequest(request)) return false;
+      const old = this.requestIdentity(row);
+      return old.requestId === undefined ? row.status === "open" : old.requestId === context.requestId
+        && (!old.owner || !context.owner || old.owner.location === context.owner.location && old.owner.slot === context.owner.slot);
+    });
+    const userId = previous?.authorizedUserId ?? this.currentUserId(record.channelRef);
+    if (!userId) return { action: "decline" };
+    const row: ElicitationRow = previous ?? {
       id: randomUUID(),
       sessionRecordId: record.id,
       platform: record.platform,
@@ -658,7 +695,7 @@ export class ElicitationManager {
       parentRef: record.parentRef,
       authorizedUserId: userId,
       acpSessionId: record.acpSessionId || null,
-      requestCorrelation: correlation.value,
+      requestCorrelation: JSON.stringify(identity),
       source: "request",
       answerMessageId: null,
       mode: request.mode,
@@ -678,21 +715,58 @@ export class ElicitationManager {
       updatedUtc: new Date(now).toISOString(),
       expiresUtc: new Date(now + ELICITATION_TTL_MS).toISOString(),
     };
-    const superseded = this.store.replaceOpenElicitation(row);
-    for (const old of superseded) this.finish(old, responseForTerminal(old.status as ElicitationTerminalStatus));
+    if (previous && !this.requestIdentity(previous).owner && context.owner) {
+      row.requestCorrelation = JSON.stringify(identity);
+      this.store.bindElicitationRequest(row.id, row.requestCorrelation, this.nowUtc());
+    }
+    if (row.status !== "open") {
+      const response = row.status === "accepted" && request.mode === "form" && (validated as ValidatedForm).fields.length
+        ? { action: "accept" as const, content: parseStored<ElicitationValues>(row.valuesJson, {}) }
+        : responseForTerminal(row.status);
+      await this.finish(row, response);
+      return response;
+    }
+    if (this.owner && this.requestIdentity(row).owner) {
+      const owner = await this.owner(row);
+      if (owner?.state === "gone") {
+        if (previous) await this.cancelOne(row.id, "interrupted", owner.detail ?? "The original agent request is no longer pending.");
+        return { action: "cancel" };
+      }
+      if (owner?.state === "answered" && owner.response) return owner.response;
+      if (owner?.pid) {
+        row.requestCorrelation = JSON.stringify({ ...this.requestIdentity(row),
+          owner: { ...this.requestIdentity(row).owner, ownerPid: owner.pid } });
+        if (previous) this.store.bindElicitationRequest(row.id, row.requestCorrelation, this.nowUtc());
+      }
+    }
+    const superseded = previous ? [] : this.store.replaceOpenElicitation(row as ElicitationRow & { status: "open" });
+    for (const old of superseded) await this.finish(old, responseForTerminal(old.status as ElicitationTerminalStatus));
 
     const response = new Promise<CreateElicitationResponse>((resolve) => {
       this.waiters.set(row.id, { resolve });
     });
-    const onAbort = () => void this.cancelOne(row.id, "cancelled", "ACP request was cancelled.");
+    const onAbort = async () => {
+      if (context.isDetached?.()) {
+        this.waiters.delete(row.id);
+        this.clearTimer(row.id);
+        return;
+      }
+      const reason = context.signal.reason;
+      const owner = this.owner && this.requestIdentity(row).owner ? await this.owner(row) : undefined;
+      if (context.isDetached?.()) return;
+      await this.cancelOne(row.id, owner?.state === "gone" && !owner.cancelled ? "interrupted" : "cancelled",
+        owner?.detail ?? (reason instanceof Error ? reason.message : String(reason ?? "ACP request was cancelled.")));
+    };
+    const abortListener = () => void onAbort().catch(error =>
+      this.logger.warn({ error, id: row.id }, "elicitation cancellation awaits bridge"));
     if (context.signal.aborted) {
-      await this.cancelOne(row.id, "cancelled", "ACP request was already cancelled.");
+      await onAbort();
     } else {
-      context.signal.addEventListener("abort", onAbort, { once: true });
+      context.signal.addEventListener("abort", abortListener, { once: true });
     }
     try {
       for (const old of superseded) await this.refresh(old);
-      if (this.store.getElicitation(row.id)?.status === "open") {
+      if (this.store.getElicitation(row.id)?.status === "open" && !row.messageId) {
         const card = this.render(row, validated);
         const sent = await this.adapter.sendElicitationCard(
           { platform: row.platform, id: row.channelRef, ...(row.parentRef ? { parentId: row.parentRef } : {}) },
@@ -706,17 +780,17 @@ export class ElicitationManager {
         } else {
           row.messageId = sent.id;
         }
-        this.armExpiry(row.id, row.expiresUtc);
       }
+      if (this.store.getElicitation(row.id)?.status === "open") this.armExpiry(row.id, row.expiresUtc);
     } catch (error) {
       this.logger.warn({ error, id: row.id }, "elicitation card post failed");
       const failed = this.store.settleElicitation(
         row.id, "declined", "The Discord card could not be posted.", this.nowUtc()
       );
-      if (failed) this.finish(failed, { action: "decline" });
+      if (failed) await this.finish(failed, { action: "decline" });
     }
     const result = await response;
-    context.signal.removeEventListener("abort", onAbort);
+    context.signal.removeEventListener("abort", abortListener);
     this.clearTimer(row.id);
     if (result.action === "accept") this.store.clearElicitationValues(row.id);
     return result;
@@ -769,11 +843,7 @@ export class ElicitationManager {
         await event.replyEphemeral("That approval is not valid.").catch(() => {});
         return;
       }
-      const accepted = this.store.acceptElicitation(row.id, "Approved on the card.", this.nowUtc());
-      if (accepted) {
-        this.finish(accepted, { action: "accept" });
-        await this.refresh(accepted, form);
-      }
+      await this.settleResponse(row, { action: "accept" }, "Approved on the card.", undefined, form);
       return;
     }
     if (action.kind === "skip") {
@@ -936,13 +1006,7 @@ export class ElicitationManager {
     const row = this.store.findOpenElicitationByExternalId(elicitationId);
     if (!row || row.mode !== "url" ||
         (sessionRecordId !== undefined && row.sessionRecordId !== sessionRecordId)) return false;
-    const accepted = this.store.acceptElicitation(
-      row.id, "The secure page reported completion.", this.nowUtc()
-    );
-    if (!accepted) return false;
-    this.finish(accepted, { action: "accept" });
-    await this.refresh(accepted);
-    return true;
+    return this.settleResponse(row, { action: "accept" }, "The secure page reported completion.");
   }
 
   async cancelForSession(
@@ -954,7 +1018,7 @@ export class ElicitationManager {
       sessionRecordId, status, detail, this.nowUtc()
     );
     for (const row of rows) {
-      this.finish(row, { action: "cancel" });
+      await this.finish(row, { action: "cancel" });
       await this.refresh(row);
     }
     return rows.length;
@@ -1208,11 +1272,8 @@ export class ElicitationManager {
       }
       return delivered;
     }
-    const row = this.store.acceptElicitation(id, detail, this.nowUtc(), leaseToken);
-    if (!row) return false;
-    this.finish(row, { action: "accept", content: values });
-    await this.refresh(row, known);
-    return true;
+    if (!current || current.status !== "open" || (leaseToken !== undefined && current.leaseToken !== leaseToken)) return false;
+    return this.settleResponse(current, { action: "accept", content: values }, detail, leaseToken, known);
   }
 
   private async deliverClaimedCodexAsyncAnswer(
@@ -1280,12 +1341,31 @@ export class ElicitationManager {
   ): Promise<boolean> {
     const row = this.store.settleElicitation(id, status, detail, this.nowUtc());
     if (!row) return false;
-    this.finish(row, responseForTerminal(status));
-    await this.refresh(row);
+    try { await this.finish(row, responseForTerminal(status)); }
+    finally { await this.refresh(row); }
     return true;
   }
 
-  private finish(row: ElicitationRow, response: CreateElicitationResponse): void {
+  private requestIdentity(row: ElicitationRow): { requestId?: string | number | null; owner?: ElicitationOwner } {
+    return parseStored(row.requestCorrelation, {});
+  }
+
+  private async settleResponse(row: ElicitationRow, response: CreateElicitationResponse, detail: string,
+    leaseToken?: string, known?: ValidatedForm): Promise<boolean> {
+    const settled = response.action === "accept"
+      ? this.store.acceptElicitation(row.id, detail, this.nowUtc(), leaseToken, JSON.stringify(response.content ?? {}))
+      : this.store.settleElicitation(row.id, response.action === "decline" ? "declined" : "cancelled", detail, this.nowUtc());
+    if (!settled) return false;
+    try { await this.finish(settled, response); }
+    finally { await this.refresh(settled, known); }
+    return true;
+  }
+
+  private async finish(row: ElicitationRow, response: CreateElicitationResponse): Promise<void> {
+    if (row.source === "request" && this.owner && this.requestIdentity(row).owner) {
+      const owner = await this.owner(row, response);
+      if (owner?.state !== "pending") this.store.clearElicitationValues(row.id);
+    }
     const waiter = this.waiters.get(row.id);
     if (!waiter) return;
     this.waiters.delete(row.id);
@@ -1311,7 +1391,8 @@ export class ElicitationManager {
   private armExpiry(id: string, expiresUtc: string): void {
     this.clearTimer(id);
     const delay = Math.max(0, Date.parse(expiresUtc) - this.now());
-    const timer = setTimeout(() => void this.cancelOne(id, "expired", "The request expired."), delay);
+    const timer = setTimeout(() => void this.cancelOne(id, "expired", "The request expired.")
+      .catch(error => this.logger.warn({ error, id }, "elicitation expiry delivery failed")), delay);
     timer.unref?.();
     this.timers.set(id, timer);
   }

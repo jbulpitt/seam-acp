@@ -985,7 +985,7 @@ export class Orchestrator {
   private readonly remoteAdoptionFinishers = new Map<string, (retainChild?: boolean) => void>();
   private remoteRecoveryReconciliation?: Promise<void>;
   private readonly adoptedDeliveryRetryAfter = new Map<string, number>();
-  private readonly reauthChecks = new Map<string, { checks: number; nextCheck: number; since: string; automatic: boolean }>();
+  private readonly reauthChecks = new Map<string, { checks: number; nextCheck: number; since: string }>();
   private readonly remoteRecoveryLogFailures = new Map<string, {
     cause: string; err: unknown; sinceMs: number; lastLoggedMs: number;
   }>();
@@ -15771,8 +15771,8 @@ export class Orchestrator {
     this.logger.info({ attempt: attempt.id, location: binding.location, slot: binding.slot },
       "parked auth recovery handed back to its recorded session");
     if (accepted && resumeAccepted) {
-      void this.continueAcceptedReauth(attempt.id, !attempt.stalledReason?.startsWith(REAUTH_CHECKING_TEXT)).catch(err =>
-        this.logger.warn({ err, attempt: attempt.id }, "reauth continuation deferred"));
+      this.trackContinuation(this.continueAcceptedReauth(attempt.id, !attempt.stalledReason?.startsWith(REAUTH_CHECKING_TEXT))
+        .then(() => {}).catch(err => this.logger.warn({ err, attempt: attempt.id }, "reauth continuation deferred")));
     }
     return true;
   }
@@ -19944,8 +19944,8 @@ export class Orchestrator {
   private async retireParkedTurnCards(attemptId: string): Promise<void> {
     const attempt = this.store.turnAttempts.get(attemptId);
     const target = attempt?.spec.target;
-    const automatic = this.reauthChecks.get(attemptId)?.automatic && attempt?.state === "completed"
-      && attempt.outcome?.status === "completed";
+    // A human accept closes its card first; an open sign-in card survived automatic recovery.
+    const automatic = attempt?.state === "completed" && attempt.outcome?.status === "completed";
     this.reauthChecks.delete(attemptId);
     for (const card of this.store.listOpenChoiceCards(target ? this.platformForChannel(target) : PLATFORM)) {
       if (card.options.some(option => parkedTurnAction(option.payload)?.attemptId === attemptId)
@@ -20072,7 +20072,7 @@ export class Orchestrator {
       const existing = this.store.listOpenChoiceCards(platform, channelRef).find(card =>
         card.options.some(option => reauthAcceptAttemptId(option.payload) === attemptId));
       if (attempt) {
-        const check = this.reauthChecks.get(attemptId) ?? { checks: 0, automatic: false,
+        const check = this.reauthChecks.get(attemptId) ?? { checks: 0,
           nextCheck: Date.now() + providerRetryBackoff("unclassified")![0]!,
           since: existing?.createdUtc ?? reauthWaitingSince(attempt) };
         this.reauthChecks.set(attemptId, check);
@@ -20143,8 +20143,6 @@ export class Orchestrator {
       return;
     }
     const promptStarted = this.store.turnAttempts.get(attemptId)?.promptStarted === true;
-    const check = this.reauthChecks.get(attemptId);
-    if (check) check.automatic = false;
     const refusal = await this.continueAcceptedReauth(attemptId);
     await evt.followUpEphemeral(
       refusal
@@ -20200,13 +20198,12 @@ export class Orchestrator {
   private recheckReauth(attempt: TurnAttempt, force = false): void {
     if (this.restartCutoff) return;
     const backoff = providerRetryBackoff("unclassified")!;
-    const check = this.reauthChecks.get(attempt.id) ?? { checks: 0, automatic: false,
+    const check = this.reauthChecks.get(attempt.id) ?? { checks: 0,
       nextCheck: Date.parse(reauthWaitingSince(attempt)) + backoff[0]!, since: reauthWaitingSince(attempt) };
     this.reauthChecks.set(attempt.id, check);
     if (!force && Date.now() < check.nextCheck) return;
     // The synchronous prefix swap is shared with the button and wins only once.
     if (!acceptReauthWait(this.store.turnAttempts, attempt.id, new Date(), true)) return;
-    check.automatic = true;
     check.nextCheck = Date.now() + backoff[Math.min(++check.checks, backoff.length - 1)]!;
     this.logger.info({ attempt: attempt.id, location: attempt.spec.location, check: check.checks },
       "rechecking provider sign-in through recorded-session continuation");

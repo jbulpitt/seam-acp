@@ -24,6 +24,7 @@ const watchers: DispatchWatcher[] = [];
 function controller() {
   const orch = Object.create(Orchestrator.prototype) as any;
   orch.store = store;
+  orch.reauthChecks = new Map();
   orch.logger = logger;
   orch.config = { DATA_DIR: dir, REPOS_ROOT: dir, DISCORD_ALLOWED_USER_IDS: new Set(["user"]),
     channelPresets: new Map(), threadPresets: new Map() };

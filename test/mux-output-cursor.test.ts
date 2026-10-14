@@ -48,6 +48,20 @@ const flush = async (n = 6): Promise<void> => {
 afterEach(() => vi.restoreAllMocks());
 
 describe("adoption replay binding", () => {
+  it("does not start an obsolete owner's replay after synchronous replacement", async () => {
+    const ws = new FakeWs();
+    const mux = makeMux({ id: "b1" });
+    mux.attach(ws as never);
+    const previous = mux.adopt(12, { allowAppTraffic: true });
+    previous.detach();
+    const replacement = mux.adopt(12, { allowAppTraffic: true });
+    await flush();
+    expect(ws.cmds("replayOutput")).toHaveLength(1);
+    ws.reply(ws.cmds("replayOutput")[0]!, { frames: [] });
+    await flush();
+    replacement.detach();
+  });
+
   it("does not emit a late replay rejection after its owner detached", async () => {
     const ws = new FakeWs();
     const mux = makeMux({ id: "b1" });

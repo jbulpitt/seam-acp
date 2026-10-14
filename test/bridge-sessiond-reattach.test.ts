@@ -161,6 +161,9 @@ describe("#574 bridge process reattachment", () => {
       .toEqual(["gap-1\n", "gap-2\n", "RESUMED\n", "after\n"]);
     expect(received.map(frame => frame.seq)).toEqual([...new Set(received.map(frame => frame.seq))].sort((a, b) => a - b));
     await secondExited;
+    const ended = output(observer, live.seq, frame => frame.stream === "exit");
+    await ended.subscribed;
+    await ended.frame;
 
     const listed = await observer.listSlots();
     expect(listed.health.find((entry) => entry.slot === 7)?.alive).toBe(false);

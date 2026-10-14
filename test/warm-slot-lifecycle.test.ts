@@ -109,8 +109,8 @@ describe("warm-slot lifecycle", () => {
     const h = await savedSessionHost(executables);
     try {
       const previous = h.makeRouter();
+      previous.setAskUser(() => new Promise(() => {}));
       const runtime = await previous.getOrStartRuntime(h.record);
-      Object.assign(runtime, { permissionPolicy: () => new Promise(() => {}) });
       const original = runtime.prompt("continue client reply").catch(() => undefined);
       const slot = runtime.getSlot()!;
       const permission = { requestId: "fixture-client-reply", sessionId: SAVED_SESSION, toolCallId: "fixture-call" };
@@ -120,10 +120,14 @@ describe("warm-slot lifecycle", () => {
       await original;
       await h.restartBridge();
       const router = h.makeRouter();
+      router.setAskUser(() => new Promise(() => {}));
       const retained = await router.getOrStartRuntime(h.record);
       expect(retained.getSlot()).toBe(slot);
       expect(retained.busy).toBe(true);
+      expect(await h.slots.permissionControl(slot, "permission_status", permission))
+        .toMatchObject({ state: "pending" });
       const next = retained.prompt("continue successor");
+      void next.catch(() => {});
       await drain();
       expect((await h.requests()).filter(row => row.method === "session/prompt")).toHaveLength(1);
       await h.slots.permissionControl(slot, "answer_permission", permission,

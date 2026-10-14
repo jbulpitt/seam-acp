@@ -282,6 +282,7 @@ describe("#250 human turn production pipeline, synthetic transport only", () => 
     { location: "local", notice: "Model fallback: original → sibling; capability unknown; price unknown." },
   ])("#467/#575 adopts $location bridge result after Seam restart without resubmitting", async ({ location, notice }) => {
     const h = setup();
+    h.router.releaseRecoveryRuntime.mockImplementation((_id, _runtime, retainChild) => retainChild === true);
     const attempts = h.store.turnAttempts;
     attempts.registerOwner("pre-restart-owner");
     const attempt = attempts.claim({
@@ -365,10 +366,14 @@ describe("#250 human turn production pipeline, synthetic transport only", () => 
       outcome: { output },
     });
     expect(h.store.getInbound("1")?.state).toBe("completed");
-    await vi.waitFor(() => expect(adopted.kill).toHaveBeenCalledTimes(1));
-    expect(h.router.releaseRecoveryRuntime).toHaveBeenCalledWith(
-      "discord:worker", expect.any(Object), false
-    );
+    await vi.waitFor(() => expect(h.router.releaseRecoveryRuntime).toHaveBeenCalledWith(
+      "discord:worker", h.router.adoptRecoveryRuntime.mock.results[0].value, true
+    ));
+    expect(adopted.kill).not.toHaveBeenCalled();
+    expect(adopted.detach).not.toHaveBeenCalled();
+    expect(mux.adopt).toHaveBeenCalledTimes(1);
+    expect(h.router.adoptRecoveryRuntime).toHaveBeenCalledTimes(1);
+    expect(h.router.getOrStartRuntime).not.toHaveBeenCalled();
     expect(h.adapter.editPanel).toHaveBeenCalledWith(
       { channel: { platform: "discord", id: "worker" }, id: "persisted-panel" },
       expect.objectContaining({ title: "Done", fields: expect.arrayContaining([{ name: "Action", value: "end_turn", inline: true }]) })

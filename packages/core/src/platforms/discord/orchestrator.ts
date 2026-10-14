@@ -15563,16 +15563,13 @@ export class Orchestrator {
           ...(payload?.kind === "messages" && payload.stream ? { stream: payload.stream } : {}) } : null;
       }
       await this.finishRemoteRecoveryCompletion(current, completed, delivery);
-      if (result.stopReason !== "prompt_not_received") {
-        try { child.kill(); } catch { /* result is already durable */ }
-      }
     };
     child.on("remoteRecoveryResult", (result: RemoteRecoveryResult) => {
       if (result.submissionId !== binding.submissionId
         || result.acpSessionId !== binding.acpSessionId) return;
       void finalize(result).catch((err) =>
         this.logger.warn({ err, attempt: attempt.id }, "remote recovery result adoption failed"))
-        .finally(() => finishAdoption(result.stopReason === "prompt_not_received"));
+        .finally(() => finishAdoption(true));
     });
     child.on("error", (err) => {
       this.continueLostRemoteTurn(attempt, `replay from the bridge failed (${err instanceof Error ? err.message : String(err)})`);

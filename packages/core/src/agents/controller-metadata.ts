@@ -1,4 +1,4 @@
-import { asLocalAdapter, claudeSessionMetadata, CLAUDE_FAST_MODE, type AgentProfile, type AgentClientMetadata, type AdapterCatalogSource, classifyAndAttach, classifyCodexError, classifyAgyError, classifyClaudeError, classifyCopilotError, classifyGrokError } from "@seam/adapters";
+import { asLocalAdapter, claudeSessionMetadata, CLAUDE_FAST_MODE, CODEX_FAST_MODE, type AgentProfile, type AgentClientMetadata, type AdapterCatalogSource, classifyAndAttach, classifyCodexError, classifyAgyError, classifyClaudeError, classifyCopilotError, classifyGrokError } from "@seam/adapters";
 
 /** ACP client metadata, not a controller-side launch or session-file reader. */
 export function controllerMetadataAdapter(
@@ -25,6 +25,7 @@ export function controllerMetadataAdapter(
     effort: { mechanism: "configOption", configId: "reasoning_effort", levels: ["low", "medium", "high", "xhigh", "max"] },
   } : profile.id === "codex" || profile.id.startsWith("codex-") ? {
     classifyError: (error: unknown) => classifyAndAttach(error, classifyCodexError(error, profile.id)),
+    fastMode: metadata?.fastMode ?? profile.fastMode ?? (profile.id === "codex" ? CODEX_FAST_MODE : undefined),
   } : profile.id === "agy" ? {
     classifyError: (error: unknown) => classifyAndAttach(error, classifyAgyError(error, profile.id)),
   } : profile.id.startsWith("grok") ? {

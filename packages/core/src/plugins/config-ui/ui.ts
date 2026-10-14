@@ -6,7 +6,7 @@ import type { CatalogBinding } from "../../core/model-catalog/service.js";
 import { LOCAL_LOCATION, parseAgentAtLocation } from "../../core/location.js";
 import { configSetRequestError, CONFIG_SET_FIELD_NAMES, type ConfigSetFieldName, type ConfigSetRequest } from "../../core/config-apply-plan.js";
 import { configTarget, configOverrideFields, formatOverrideCounts, type ConfigDefaultField } from "../../core/config-target.js";
-import { FAST_MODE_CONFIG_ID, FAST_MODE_COST_WARNING, FAST_MODE_RESET_NOTICE, isFastModeDisabledByEnv, fastModeEnvRefusal, fastModeAgentRefusal } from "../../core/fast-mode.js";
+import { FAST_MODE_RESET_NOTICE, fastModeCostWarning } from "../../core/fast-mode.js";
 import { catalogEffortChoices } from "../../platforms/discord/catalog-view.js";
 import { INHERIT_VALUE, RIDER_MODAL_MAX, applyPickerValue, authorizeDraftClick, currentRiderText, decodeRiderUpload, editScopeOf, effectiveAgentAtLocation, isDirty, makeCustomId, parseCustomId, renderCancelledHub, renderExpiredHub, renderHub, renderSavedHub, riderDownloadFilename, riderTooLong, snapshotFromDescribe, type DraftAgentCapabilities, type ThreadConfigDraft } from "../../platforms/discord/config-editor.js";
 import type { ComponentAcknowledgementContext, ComponentResponseMode } from "../../platforms/interaction-response.js";
@@ -207,6 +207,7 @@ export class ConfigUi {
       modelHidden: this.ports.catalog.isHidden?.(this.catalogBindingForDraft(draft), this.catalogModelForDraft(draft)),
       effortDisabled: this.effortDisabledFor(draft),
       fastDisabled: this.fastDisabledFor(draft),
+      fastUnavailableReason: this.fastStatusFor(draft).reason,
       canEditChannel: this.ports.canEditChannelPreset(userId,
         channel.parentId
       ),
@@ -215,18 +216,15 @@ export class ConfigUi {
     return this.configEditor.touch(draft.id, { messageId: ref.id }) ?? draft;
   }
 
-  /**
-   * #37: hide the Fast control unless the drafted agent actually has Fast (and
-   * the deployment has not killed it). Offering a button that could only ever
-   * refuse is worse than not offering one.
-   */
+  /** Availability belongs to the live session, not a cached model name. */
   private fastDisabledFor(draft: ThreadConfigDraft): boolean {
-    if (isFastModeDisabledByEnv()) return true;
-    const agentId =
-      draft.overlay.agent === undefined
-        ? draft.snapshot.agent.value
-        : draft.overlay.agent ?? draft.snapshot.withoutThread.agent;
-    return !this.ports.hasFastMode(agentId);
+    return !this.fastStatusFor(draft).available;
+  }
+
+  private fastStatusFor(draft: ThreadConfigDraft) {
+    const binding = this.catalogBindingForDraft(draft);
+    return this.ports.fastModeStatus({ platform: "discord", id: draft.threadId, parentId: draft.parentRef },
+      binding, this.catalogModelForDraft(draft));
   }
 
   private catalogBindingForDraft(draft: ThreadConfigDraft): CatalogBinding {
@@ -295,6 +293,7 @@ export class ConfigUi {
       modelHidden: this.ports.catalog.isHidden?.(this.catalogBindingForDraft(draft), this.catalogModelForDraft(draft)),
       effortDisabled: this.effortDisabledFor(draft),
       fastDisabled: this.fastDisabledFor(draft),
+      fastUnavailableReason: this.fastStatusFor(draft).reason,
       canEditChannel: this.ports.canEditChannelPreset(draft.userId,
         draft.parentRef
       ),
@@ -809,27 +808,20 @@ export class ConfigUi {
       // #37: hard-refuse rather than render a picker whose "on" can never land.
       if (channelScope) return;
       if (this.fastDisabledFor(draft)) {
-        const agentId =
-          draft.overlay.agent === undefined
-            ? draft.snapshot.agent.value
-            : draft.overlay.agent ?? draft.snapshot.withoutThread.agent;
         await evt
-          .followUpEphemeral(
-            isFastModeDisabledByEnv()
-              ? fastModeEnvRefusal()
-              : fastModeAgentRefusal(agentId)
-          )
+          .followUpEphemeral(this.fastStatusFor(draft).reason ?? "The live session has not advertised Fast mode.")
           .catch(() => {});
         return;
       }
       picked = await this.ports.transport.sendChoicePicker!(channel, {
         panel: {
           color: 0x5865f2,
-          title: "⚡ Claude Fast mode",
+          title: `⚡ ${this.catalogBindingForDraft(draft).agentId} Fast mode`,
           description:
-            `${FAST_MODE_COST_WARNING} ${FAST_MODE_RESET_NOTICE} ` +
-            `Availability is decided by the fresh session's advertised \`${FAST_MODE_CONFIG_ID}\` ` +
-            `option, so a model without it is refused on Save rather than silently ignored.`,
+            `${fastModeCostWarning(this.fastStatusFor(draft).descriptor)} ` +
+            (this.fastStatusFor(draft).descriptor?.applicationMode === "live"
+              ? "Applies live to the next turn; the ACP session and conversation are preserved."
+              : FAST_MODE_RESET_NOTICE),
           fields: [
             {
               name: "Current",
@@ -846,8 +838,10 @@ export class ConfigUi {
           },
           {
             value: "on",
-            label: "On — paid usage credits",
-            description: "Lower latency, billed outside subscription limits",
+            label: this.fastStatusFor(draft).descriptor?.applicationMode === "live" ? "On — increased usage" : "On — paid usage credits",
+            description: this.fastStatusFor(draft).descriptor?.applicationMode === "live"
+              ? "Lower latency, increased subscription quota or purchased-credit usage"
+              : "Lower latency, billed outside subscription limits",
           },
         ],
         authorizedUserIds: owner,

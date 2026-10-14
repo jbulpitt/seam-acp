@@ -1190,6 +1190,15 @@ export class ConfigApplyPlan {
       }
     } else if (bound && before) {
       await this.runtime.applySavedSelection(this.store.get(bound.id) ?? bound, before);
+      const current = this.store.get(bound.id) ?? bound;
+      const after = this.router.describeConfig(current);
+      if (after.fastModeDescriptor?.applicationMode === "live" && before.fastMode.value !== after.fastMode.value) {
+        try { await this.runtime.applyLiveFastMode(current, after.fastMode.value, before.fastMode.value, actor); }
+        catch (error) {
+          fastRefusal = error instanceof Error ? error.message : String(error);
+          draft = { ...draft, overlay: { ...draft.overlay, fastMode: before.fastMode.value } };
+        }
+      }
     }
 
     await this.identityEffects.flush(`discord:${draft.threadId}`);

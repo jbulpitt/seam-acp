@@ -364,7 +364,7 @@ describe("#37 contract 3 — unsupported / disabled reject without false confirm
     conn.newOptions = NO_FAST_OPTIONS;
     await rt.newSession({ cwd: "/repo", fastMode: true });
     expect(conn.setCalls).toEqual([]);
-    expect(rt.getFastModeOutcome()?.error).toMatch(/Claude-only serving mode/);
+    expect(rt.getFastModeOutcome()?.error).toMatch(/does not declare a Fast-mode option/);
   });
 });
 
@@ -439,7 +439,7 @@ describe("#37 environment kill switch", () => {
       env: {},
     });
     expect(res.ok).toBe(false);
-    if (!res.ok) expect(res.error).toMatch(/Claude-only/);
+    if (!res.ok) expect(res.error).toMatch(/does not declare a Fast-mode option/);
   });
 });
 
@@ -1041,7 +1041,7 @@ describe("#37 configure_thread", () => {
     });
     expect(res.ok).toBe(false);
     if (res.ok) return;
-    expect(res.error).toMatch(/Claude-only serving mode/);
+    expect(res.error).toMatch(/does not declare a Fast-mode option/);
     expect(h.overlays).toEqual([]);
     expect(h.invalidated).toEqual([]);
   });

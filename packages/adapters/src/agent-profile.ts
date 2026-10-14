@@ -237,9 +237,7 @@ export interface AgentAdapter {
   readonly effort?: EffortDescriptor;
 
   /**
-   * Whether this agent can serve turns in Fast mode (#37), and under which ACP
-   * config id / values. Claude-only today, and only for direct-Anthropic
-   * backends — a Claude harness pointed at another provider has no Fast mode.
+   * Fast-mode option and application policy, if this backend supports it.
    *
    * Declaring this is a claim of *eligibility*, never proof: Fast support
    * varies per model and per wrapper build, so `AgentRuntime` still requires

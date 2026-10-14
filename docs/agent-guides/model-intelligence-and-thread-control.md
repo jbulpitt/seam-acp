@@ -117,7 +117,7 @@ data tools: inspect the candidates first, then apply the selected runtime.
 
 ### `configure_thread(thread, { agent?, cwd?, model?, effort?, role?, disableThreadPrefix?, fastMode?, rebuild? })`
 Change a target thread's agent, execution host, repo/cwd, model, reasoning effort, naming role, naming
-opt-out, and/or Claude Fast mode. Optional `rebuild: true` runs deterministic
+opt-out, and/or Fast mode. Optional `rebuild: true` runs deterministic
 Discord reconstruction after any configuration change and is valid by itself.
 - **`agent` accepts `agent@host`.** For example, `claude@remote-host` selects Claude
   and binds the thread to that bridge. A bare `claude` keeps its existing host.
@@ -170,10 +170,18 @@ Discord reconstruction after any configuration change and is valid by itself.
 - **`disableThreadPrefix` opts a thread out of managed naming.** When true, Seam
   stops maintaining that thread's name prefix and leaves its title alone.
   Uncommon — use it only for a thread whose title a human curates deliberately.
-- **`fastMode` is Claude's paid latency mode.** It is not a model or an effort
-  level. Changing it always forges a fresh session, and enabling it spends paid
-  usage credits outside subscription limits. Seam refuses unsupported agents,
-  deployments, and resolved models rather than silently claiming it applied.
+- **`fastMode` is a per-session opt-in serving mode**, not a model or effort
+  level. Codex's `fast-mode` option applies live: on/off preserves the warm
+  runtime, ACP session and context, but Fast increases subscription quota or
+  purchased-credit usage. Claude's `fast` option still requires a fresh session
+  and spends paid credits outside subscription limits; its deployment kill
+  switch is unchanged. Support comes only from the current live session's
+  advertised option, never a model name or cached catalog. The Discord editor
+  disables Fast and explains why when that option is absent, or no live session
+  has advertised it yet. `configure_thread` uses the same policy for Discord
+  and Google Chat, and the status card shows the observed Fast state. An
+  unconfirmed/provider-rejected Codex change reports the actual cause and
+  restores the previous setting live without discarding context.
 - **`rebuild: true` is deterministic Rebuild, not premium compact.** Seam first
   applies and confirms any requested configuration, then reads the target's
   Discord history, retains up to 60% of the exact destination context window,

@@ -11,6 +11,7 @@ import type { SlashInvocation } from "../slash-registry.js";
 import type { AutocompleteResponder } from "../../platforms/discord/autocomplete.js";
 import type { ConfigDefaultField, OverrideCounts } from "../../core/config-target.js";
 import type { ParentConfigCleanup } from "../../core/channel-config-cleanup.js";
+import type { FastModeDescriptor } from "@seam/adapters";
 
 export interface ConfigInteraction {
   channelRef?: ChannelRef;
@@ -33,7 +34,9 @@ export interface ConfigUiPorts {
   readConfig(channel: ChannelRef): unknown;
   snapshot(channel: ChannelRef): { desc: ConfigDescription; withoutThread: InheritedConfig; channelPins: ChannelPresetPins; threadOverrides?: readonly ConfigDefaultField[] };
   canEditChannelPreset(user: string, parent?: string): boolean;
-  hasFastMode(agent: string): boolean;
+  fastModeStatus(channel: ChannelRef, binding: { agentId: string; location: string }, model: string): {
+    descriptor?: FastModeDescriptor; available: boolean; reason?: string;
+  };
   agentChoices(): Array<{ value: string; label: string; description?: string }>;
   promptRepoPath(channel: ChannelRef, options: { title: string; location: string; authorizedUserIds: ReadonlySet<string>; includeInherit: boolean }): Promise<string | null>;
   saveEditor(draft: ThreadConfigDraft, actor: MutationActor): ReturnType<ConfigApplyPlan["saveEditor"]>;

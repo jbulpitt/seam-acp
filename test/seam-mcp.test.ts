@@ -1429,7 +1429,7 @@ describe("SeamMcpServer", () => {
     expect(body.result.content[0].text).toContain("No report-back turn");
   });
 
-  // --- Claude Fast mode (#37) ----------------------------------------------
+  // --- Descriptor-owned Fast mode -----------------------------------------
 
   it("configure_thread advertises fastMode with cost, reset and non-slug guidance", async () => {
     h = await makeHarness();
@@ -1437,7 +1437,10 @@ describe("SeamMcpServer", () => {
     const tool = body.result.tools.find((t: any) => t.name === "configure_thread");
     const fast = tool.inputSchema.properties.fastMode;
     expect(fast.type).toBe("boolean");
-    expect(fast.description).toMatch(/fresh ACP\s+session/);
+    expect(fast.description).toMatch(/Claude changes forge a fresh ACP\s+session/);
+    expect(fast.description).toMatch(/Codex applies it live/);
+    expect(fast.description).toMatch(/preserving context.*increased subscription quota/);
+    expect(fast.description).not.toContain("Refused for non-Claude agents");
     expect(fast.description).toMatch(/paid usage\s+credits/);
     expect(fast.description).toMatch(/CLAUDE_CODE_DISABLE_FAST_MODE/);
     // Support follows the RESOLVED model; the description must not tell agents
@@ -1446,7 +1449,8 @@ describe("SeamMcpServer", () => {
     expect(fast.description).toMatch(/observed both ways/);
     // Still optional — only `thread` is required.
     expect(tool.inputSchema.required).toEqual(["thread"]);
-    expect(tool.description).toMatch(/Changing fastMode ALWAYS forges a fresh session/);
+    expect(tool.description).toMatch(/Codex Fast changes apply live, keeping the ACP session and context/);
+    expect(tool.description).toMatch(/Claude Fast changes forge a fresh session/);
   });
 
   // --- handoff feedback channel: watchFeedback (#62) ------------------------

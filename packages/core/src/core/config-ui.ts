@@ -11,6 +11,7 @@ import type { SlashInvocation } from "../plugins/slash-registry.js";
 import type { ConfigInteraction, ConfigUiPorts } from "../plugins/config-ui/ports.js";
 import type { ConfigUi } from "../plugins/config-ui/ui.js";
 import { ParentConfigCleanup, type ConfigParentChannel } from "./channel-config-cleanup.js";
+import { checkFastModeEligibility } from "./fast-mode.js";
 
 interface ConfigUiDependencies {
   plugins: PluginHost; config: Config; logger: Logger; store: SessionStore; router: SessionRouter; modelCatalog: ModelCatalogService;
@@ -49,7 +50,20 @@ export function installConfigUi(deps: ConfigUiDependencies) {
     bind: channel => { if (channel.parentId) ensure(channel); },
     readConfig: channel => channel.parentId ? deps.store.readConfig(ensure(channel)) : deps.plan().describeTarget(channel),
     snapshot: channel => deps.plan().snapshot(channel),
-    canEditChannelPreset: deps.canEditChannelPreset, hasFastMode: agent => deps.router.getProfile(agent)?.fastMode !== undefined,
+    canEditChannelPreset: deps.canEditChannelPreset,
+    fastModeStatus: (channel, binding, model) => {
+      const descriptor = deps.router.getProfile(binding.agentId, binding.location)?.fastMode;
+      const eligible = checkFastModeEligibility({ requested: true, agentId: binding.agentId, descriptor });
+      if (!eligible.ok) return { descriptor, available: false, reason: eligible.error };
+      const record = deps.store.getByChannel(channel.platform, channel.id);
+      const described = record && deps.router.describeConfig(record);
+      const runtime = record && deps.router.getRuntime(record.id);
+      if (!runtime) return { descriptor, available: false, reason: `No live ${binding.agentId}@${binding.location} session has advertised Fast mode yet.` };
+      if (described!.agent.value !== binding.agentId || described!.location.value !== binding.location || described!.model.value !== model) {
+        return { descriptor, available: false, reason: "Save the agent/model selection first; Fast availability comes from that live session." };
+      }
+      return { descriptor, ...runtime.getFastModeAvailability() };
+    },
     agentChoices: deps.agentChoices, promptRepoPath: deps.promptRepoPath,
     saveEditor: (draft, actor) => deps.plan().saveEditor(draft, actor, parent => deps.canEditChannelPreset(actor.id!, parent)),
     prepareSet: (channel, request) => deps.plan().prepareConfigSet(ensure(channel), channel, request),

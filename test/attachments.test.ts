@@ -89,18 +89,18 @@ describe("resolveModelVisionRouting", () => {
       viaTool: false,
     });
     expect(resolveModelVisionRouting(undefined, "native")).toEqual({
-      agentHasVision: undefined,
+      agentHasVision: false,
       viaTool: false,
     });
   });
 
-  it("preserves legacy ACP routing for unannotated models", () => {
+  it("preserves advertised ACP routing and stages images when transport capability is unknown", () => {
     expect(resolveModelVisionRouting(true, undefined)).toEqual({
       agentHasVision: true,
       viaTool: false,
     });
     expect(resolveModelVisionRouting(undefined, undefined)).toEqual({
-      agentHasVision: undefined,
+      agentHasVision: false,
       viaTool: false,
     });
   });

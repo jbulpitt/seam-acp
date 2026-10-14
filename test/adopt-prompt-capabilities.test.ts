@@ -1,10 +1,12 @@
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { promises as fs } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { readSessiondProcessIdentity } from "../packages/bridge/src/sessiond-server.js";
 import { SessionStore } from "../packages/core/src/core/session-store.js";
 import { executionIdentity } from "../packages/core/src/core/dispatch/execution-identity.js";
+import { resolveModelVisionRouting } from "../packages/core/src/agents/attachments.js";
+import { Orchestrator } from "../packages/core/src/platforms/discord/orchestrator.js";
 import { savedSessionHost, SAVED_SESSION } from "./helpers/saved-session-recovery.js";
 import { prepareSessionExecutables } from "./helpers/saved-session-executables.js";
 
@@ -97,10 +99,22 @@ describe("adopted warm prompt capabilities", () => {
       else cfg.acpPromptCapabilities = { sessionId: "another-session", capabilities: advertised };
       h.store.upsert({ ...live, configJson: JSON.stringify(cfg) });
       const adopted = await h.makeRouter().getOrStartRuntime(h.store.get(h.record.id)!);
-      await adopted.prompt("continue with legacy image", [attachment("image")]);
+      const hostWriter = vi.fn(async (filename: string, bytes: Buffer) => {
+        const file = path.join(h.root, filename);
+        await fs.writeFile(file, bytes); return file;
+      });
+      const routing = resolveModelVisionRouting(adopted.getPromptCapabilities()?.image, "native");
+      const staged = await (Orchestrator.prototype as any).partitionAndStageAttachments.call(
+        { logger: { warn: vi.fn() } }, [attachment("image")], routing.agentHasVision, routing.viaTool,
+        h.record.id, hostWriter);
+      expect(hostWriter).toHaveBeenCalledOnce();
+      expect(staged.inline).toEqual([]);
+      const file = hostWriter.mock.results[0]!.value;
+      expect(await fs.readFile(await file, "utf8")).toBe("test");
+      await adopted.prompt(`continue with legacy image ${staged.hint}`, staged.inline);
       const requests = await h.requests();
       expect(requests.filter(row => row.method === "session/prompt").at(-1)!.params.prompt)
-        .toEqual(expect.arrayContaining([expect.objectContaining({ type: "resource_link" })]));
+        .toEqual([expect.objectContaining({ type: "text", text: expect.stringContaining(await file) })]);
       expect(adopted.getPromptCapabilities()).toBeUndefined();
       expect(requests.filter(row => row.method === "initialize")).toHaveLength(1);
       expect(requests.filter(row => row.method === "session/load")).toHaveLength(1);

@@ -283,12 +283,11 @@ export interface ConfigDescription {
   /** OR-composed session/thread/channel opt-out from automatic thread naming. */
   disableThreadPrefix: ResolvedSetting<boolean>;
   /**
-   * Claude Fast mode (#37): a per-thread **session-start** dimension, distinct
-   * from model and effort. Thread-preset only (a channel-wide pin would bill
-   * every sibling thread), default `false`. Requesting it does not guarantee it
-   * — the live session must advertise ACP config id `fast`.
+   * Per-session opt-in, distinct from model and effort. Default false;
+   * the live session must advertise the profile's option before it can apply.
    */
   fastMode: ResolvedSetting<boolean>;
+  fastModeDescriptor?: import("@seam/adapters").FastModeDescriptor;
 }
 
 /** Preview inherited or explicitly selected values through the same resolver. */
@@ -775,6 +774,7 @@ export class SessionRouter {
       simpleCardGif,
       disableThreadPrefix,
       fastMode,
+      fastModeDescriptor: this.getProfile(agent.value, location.value)?.fastMode,
       ...(effortIgnoredNote ? { effortIgnoredNote } : {}),
     };
   }

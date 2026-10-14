@@ -35,6 +35,7 @@ import {
   type ClassifyContext,
 } from "../error-classification.js";
 import { providerResponse } from "../session-failure.js";
+import { CODEX_FAST_MODE } from "../fast-mode.js";
 
 /**
  * Codex ACP collapses provider reasons to `Internal error` with `data: null`.
@@ -789,6 +790,7 @@ export function makeCodexProfile(opts: {
     id: profileId,
     displayName: opts.displayName ?? "OpenAI Codex",
     defaultModel: opts.defaultModel,
+    ...(directCodex ? { fastMode: CODEX_FAST_MODE } : {}),
     ...(directCodex ? { async accountUsage(signal?: AbortSignal): Promise<CodexUsageData> {
       try {
         return await probeCodexAccountRateLimits(runtime, signal);

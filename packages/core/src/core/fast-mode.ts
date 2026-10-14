@@ -1,32 +1,4 @@
-/**
- * Claude Fast mode policy (#37) — the one place that knows what Fast *means*
- * for a Seam thread. Wire constants live in `@seam/adapters`; this module owns
- * eligibility, the environment kill switch, refusal copy, and applied-state
- * reporting.
- *
- * Fast is a **serving mode for the already-selected model**, not another model
- * and not an effort level. It trades cost efficiency for latency and is billed
- * against usage credits *outside* subscription limits. It is therefore an
- * explicit, opt-in, per-thread **session-start** dimension: it never rides
- * along on a model pick and there are no synthetic `-fast` slugs.
- *
- * Three rules this module exists to keep honest:
- *
- * 1. **Never infer support from a model slug.** Fast support is a property of
- *    the *live session's* `configOptions`, nothing else. Zero-token probes
- *    (`scripts/claude-fast-mode-probe.mjs`) show why: pinned Opus ids
- *    (`claude-opus-5`, `claude-opus-4-8`) advertise config id `fast` as a
- *    select over `on`/`off`, Sonnet does not, and the `default` **alias** has
- *    been observed BOTH ways — advertising Fast when it resolved to Opus 5, and
- *    not advertising it when it resolved to Sonnet. An alias is not a model, so
- *    nothing here may key off the requested slug.
- * 2. **Apply only to a fresh session.** Enabling Fast inside an established
- *    conversation can charge the whole accumulated context at Fast rates, so a
- *    change of this setting forces a new ACP session before it takes effect.
- * 3. **Never confirm what was not applied.** An unsupported session, an
- *    unsupported agent, or the environment kill switch produces a refusal, not
- *    a green check.
- */
+/** Shared Fast policy: live capability, descriptor-owned reset, observed state. */
 import {
   FAST_MODE_CONFIG_ID,
   FAST_MODE_OFF,
@@ -48,10 +20,16 @@ export {
  */
 export const FAST_MODE_DISABLE_ENV = "CLAUDE_CODE_DISABLE_FAST_MODE";
 
-/** Shown wherever a user turns Fast on. Fast is not covered by the plan. */
+/** Claude's paid-credit warning. Codex uses its own quota/credit notice. */
 export const FAST_MODE_COST_WARNING =
   "Fast mode prioritizes latency over cost efficiency and consumes paid usage " +
   "credits outside your subscription limits.";
+
+export function fastModeCostWarning(descriptor?: FastModeDescriptor): string {
+  return descriptor?.applicationMode === "live"
+    ? "Fast mode prioritizes latency and increases usage. Codex uses more subscription quota or purchased credits."
+    : FAST_MODE_COST_WARNING;
+}
 
 /** Shown wherever changing Fast is about to drop conversation context. */
 export const FAST_MODE_RESET_NOTICE =
@@ -60,8 +38,7 @@ export const FAST_MODE_RESET_NOTICE =
 
 /**
  * What actually happened to Fast on a live session. `applied` is deliberately
- * nullable: `null` means "not determined on this session" (e.g. a resumed
- * session, which Seam never re-enables Fast on), which is different from
+ * nullable: `null` means "not determined on this session", which differs from
  * "determined to be off".
  */
 export interface FastModeOutcome {
@@ -93,8 +70,7 @@ export function fastModeEnvRefusal(): string {
 /** The refusal text for an agent that has no Fast-mode concept at all. */
 export function fastModeAgentRefusal(agentId: string): string {
   return (
-    `Refused: Fast mode is a Claude-only serving mode; agent "${agentId}" does not ` +
-    `support it. Nothing was changed.`
+    `Refused: agent "${agentId}" does not declare a Fast-mode option. Nothing was changed.`
   );
 }
 
@@ -105,8 +81,12 @@ export function fastModeAgentRefusal(agentId: string): string {
 export function fastModeUnsupportedRefusal(
   agentId: string,
   model: string,
-  advertised: ReadonlyArray<string> = []
+  advertised: ReadonlyArray<string> = [],
+  configId = FAST_MODE_CONFIG_ID
 ): string {
+  if (configId !== FAST_MODE_CONFIG_ID) {
+    return `Refused: the live ${agentId}/${model} session does not advertise config id "${configId}" for this model, so Fast mode is unavailable.`;
+  }
   return (
     `Refused: the live ${agentId}/${model} session does not advertise config id ` +
     `"${FAST_MODE_CONFIG_ID}", so Fast mode cannot be enabled for it. ` +
@@ -155,7 +135,7 @@ export function checkFastModeEligibility(input: {
   if (!input.descriptor) {
     return { ok: false, error: fastModeAgentRefusal(input.agentId) };
   }
-  if (isFastModeDisabledByEnv(input.env ?? process.env)) {
+  if (input.descriptor.configId === FAST_MODE_CONFIG_ID && isFastModeDisabledByEnv(input.env ?? process.env)) {
     return { ok: false, error: fastModeEnvRefusal() };
   }
   return { ok: true };
@@ -179,6 +159,7 @@ export function settleFastMode(input: {
   agentId: string;
   model: string;
   advertised?: ReadonlyArray<string>;
+  configId?: string;
 }): FastModeSettlement {
   if (input.outcome?.applied === true) return { ok: true };
   // Rolling the flag back is not enough when we never OBSERVED the session
@@ -190,7 +171,7 @@ export function settleFastMode(input: {
   const observedOff = input.outcome?.applied === false;
   const refusal =
     input.outcome?.error ??
-    fastModeUnsupportedRefusal(input.agentId, input.model, input.advertised ?? []);
+    fastModeUnsupportedRefusal(input.agentId, input.model, input.advertised ?? [], input.configId);
   return {
     ok: false,
     retireSession: !observedOff,
@@ -214,15 +195,9 @@ export type FastModeSettlement =
       retireSession: boolean;
     };
 
-/**
- * Whether a pending change needs a FRESH session before Fast can be trusted.
- *
- * Fast is validated per session AND per model: Opus advertises it, Sonnet does
- * not. So changing the model (or agent, or host) under an active Fast setting
- * has to re-run the capability check on a new session, even though the Fast
- * setting itself did not change.
- */
+/** Claude changes require a fresh session; live descriptors preserve context. */
 export function fastModeNeedsFreshSession(input: {
+  descriptor?: FastModeDescriptor;
   /** Fast state after the pending change. */
   nextFastMode: boolean;
   fastModeChanged: boolean;
@@ -230,6 +205,7 @@ export function fastModeNeedsFreshSession(input: {
   agentChanged?: boolean;
   locationChanged?: boolean;
 }): boolean {
+  if (input.descriptor?.applicationMode === "live") return false;
   if (input.fastModeChanged) return true;
   if (!input.nextFastMode) return false;
   return (
@@ -250,6 +226,7 @@ export function describeFastModeOutcome(
 ): string | undefined {
   if (!outcome) return undefined;
   if (outcome.applied === true) return FAST_MODE_ON;
+  if (!outcome.requested && outcome.applied === null && outcome.error) return "off requested · not applied";
   if (!outcome.requested) return undefined;
   if (outcome.applied === null) return `${FAST_MODE_ON} requested · not applied`;
   return `${FAST_MODE_ON} requested · ${FAST_MODE_OFF} applied`;

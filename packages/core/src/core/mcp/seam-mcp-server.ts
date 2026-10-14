@@ -734,7 +734,7 @@ const TOOLS = [
     name: "configure_thread",
     description:
       "Change a teammate thread's agent (agent@host binds its location), repo/cwd, model, reasoning effort, naming role, automatic-naming " +
-      "opt-out, and/or Claude Fast mode within YOUR channel. Optional rebuild:true then performs " +
+      "opt-out, and/or Fast mode within YOUR channel. Optional rebuild:true then performs " +
       "the same deterministic Discord-history reconstruction as /seamadmin rebuild; rebuild:true " +
       "is also valid by itself. The durable Rebuild card is posted in the target thread. " +
       "An agent or host switch ALWAYS creates a fresh session and drops that thread's conversation context. " +
@@ -743,8 +743,9 @@ const TOOLS = [
       "Model switches follow the adapter-owned catalog: live and reload preserve context, while " +
       "freshSession creates a new ACP session. Read the reported outcome. Effort never resets the ACP session: config-option " +
       "agents update live, while meta/spawn-argument agents (including Claude) reload their runtime " +
-      "with context preserved. Changing fastMode ALWAYS forges a fresh session (Fast is a " +
-      "session-start dimension) and Fast spends paid usage credits outside subscription limits. " +
+      "with context preserved. Codex Fast changes apply live, keeping the ACP session and context, " +
+      "and increase quota/credit usage. Claude Fast changes forge a fresh session and spend paid " +
+      "usage credits outside subscription limits. Support comes from live configOptions. " +
       "The result and target-thread confirmation card report the exact " +
       "effective agent/model/effort/fast, marking every unchanged field explicitly.",
     inputSchema: {
@@ -769,11 +770,12 @@ const TOOLS = [
         fastMode: {
           type: "boolean",
           description:
-            "Optional Claude Fast mode: a latency-over-cost serving mode for the selected model, " +
-            "NOT a model and NOT an effort level. Default off. Changing it forges a fresh ACP " +
-            "session (dropping that thread's context) before it applies, and it bills paid usage " +
-            "credits outside subscription limits. Refused for non-Claude agents, when the " +
-            "deployment sets CLAUDE_CODE_DISABLE_FAST_MODE, or when the live session does not " +
+            "Optional Fast mode: a latency-over-cost serving mode for the selected model, " +
+            "NOT a model and NOT an effort level. Default off. Codex applies it live through " +
+            "fast-mode, preserving context, with increased subscription quota or purchased-credit usage. " +
+            "Claude changes forge a fresh ACP session (dropping context) and bill paid usage " +
+            "credits outside subscription limits. Refused when the agent has no descriptor, when " +
+            "CLAUDE_CODE_DISABLE_FAST_MODE disables Claude, or when the live session does not " +
             "advertise it. Support belongs to the RESOLVED model, not the slug you ask for: " +
             "verified available on claude-opus-5 and claude-opus-4-8, absent on claude-sonnet-5, " +
             "and the `default` alias is resolved by the wrapper at session start, so whether it " +
@@ -1807,7 +1809,7 @@ const INSTRUCTIONS = [
   "  result is dispatched back when it completes; use reportBack:false to skip the report-back.",
   "- forward(to, content, reportBack?): relay a message into another thread (thin handoff, no specialist framing). Use reportBack:false to skip the report-back.",
   "- steer(thread, prompt): redirect a teammate mid-task — inject a new instruction into its live session.",
-  "- configure_thread(thread, agent?, cwd?, model?, effort?, role?, disableThreadPrefix?, fastMode?, rebuild?): reconfigure a teammate in YOUR channel; agent@host binds that host (bare agent keeps the current host), cwd uses the shared repo picker path. Returns exact changed/no-change identity and posts a target confirmation card. rebuild:true then runs deterministic Discord reconstruction with a durable card in the target (and may be used alone). Agent/host switches reset context; repo changes wait for an in-flight turn to finish. `fastMode` is Claude-only, defaults off, always forges a fresh session, and spends paid usage credits.",
+  "- configure_thread(thread, agent?, cwd?, model?, effort?, role?, disableThreadPrefix?, fastMode?, rebuild?): reconfigure a teammate in YOUR channel; agent@host binds that host (bare agent keeps the current host), cwd uses the shared repo picker path. Returns exact changed/no-change identity and posts a target confirmation card. rebuild:true then runs deterministic Discord reconstruction with a durable card in the target (and may be used alone). Agent/host switches reset context; repo changes wait for an in-flight turn to finish. `fastMode` defaults off and requires the current live model's option: Codex applies live, preserving ACP/context and increasing quota/credit usage; Claude forges a fresh session and spends paid usage credits.",
   "- reset_thread_session(thread): deliberately drop a teammate's context and forge a fresh session with its current agent/model.",
   "- migrate_self(agent?, model?, effort?, manifest, rebuild?): migrate YOUR OWN thread after this turn ends. Default: the manifest is the replacement session's first prompt. rebuild:true rebuilds from Discord history first, then fires the manifest as the next live turn. Purpose-agnostic and rollback-safe.",
   "- search_messages(query, threads?, author?, since?, limit?): search live conversation text in your thread or same-channel siblings.",

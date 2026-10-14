@@ -245,7 +245,7 @@ export interface StatusPanel {
   modelEvidence?: string[];
   /** Reasoning effort for this turn, if set (low|medium|high|xhigh|max). */
   effort?: string;
-  /** Claude Fast mode (#37) as it RESOLVED on the live session — `"on"`, or a
+  /** Fast mode as it RESOLVED on the live session — `"on"`, or a
    *  requested/not-applied note. Undefined when Fast is irrelevant to this turn,
    *  so an ordinary card is never cluttered with an "off" badge. */
   fastMode?: string;

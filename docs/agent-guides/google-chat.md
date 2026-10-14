@@ -28,6 +28,13 @@ Chat uses the same agent runtimes as Discord. Its MVP permission policy is
 `always`: tool requests are approved without permission cards. Configure
 allowed users before enabling the integration.
 
+The shared `configure_thread(..., { fastMode })` control also applies to Chat
+session Spaces. Codex toggles its live `fast-mode` option without replacing the
+ACP session; Claude keeps its fresh-session policy. Availability follows the
+current live model's advertised option, and Chat status cards show Fast only
+from the observed runtime state. This does not add a Chat slash command or
+change org launch defaults.
+
 ### Shared spaces
 
 Manually added Spaces remain mention-only outside legacy session threads.

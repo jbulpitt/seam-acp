@@ -41,6 +41,16 @@ function component(customId: string, user = "admin", fields?: Record<string, str
 }
 
 describe("config UI built-in", () => {
+  it("disables Codex Fast until the live current model advertises it, with its actual reason", async () => {
+    const h = await fixture();
+    Object.assign(h.router.getProfile("codex")!, { fastMode: { configId: "fast-mode", onValue: "on", offValue: "off", applicationMode: "live" } });
+    const live = { getFastModeAvailability: () => ({ available: false, reason: 'The live codex/gpt-normal session does not advertise "fast-mode".' }) };
+    vi.spyOn(h.router, "getRuntime").mockReturnValue(live as never);
+    await h.orchestrator.handleSlashInteraction(interaction("edit") as never);
+    const panel = h.panels.at(-1);
+    expect(panel.actions.flat().find((action: any) => action.label === "Fast").disabled).toBe(true);
+    expect(panel.fields.find((field: any) => field.name === "Fast").value).toContain('does not advertise "fast-mode"');
+  });
   it("owns the four slash leaves and persistent button/select/modal namespace", async () => {
     const h = await fixture();
     const group = buildSlashRegistrationBody(h.host.slash).find(c => c.name === "seam")!.options!.find(g => g.name === "config")!;

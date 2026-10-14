@@ -12,7 +12,7 @@ import type {
 } from "../../core/session-router.js";
 import { formatAgentAtLocation } from "../../core/location.js";
 import {
-  FAST_MODE_COST_WARNING,
+  fastModeCostWarning,
   fastModeNeedsFreshSession,
 } from "../../core/fast-mode.js";
 
@@ -72,7 +72,7 @@ export interface InheritedConfig {
   cwd: string;
   permission: PermissionPolicyMode;
   detached: boolean;
-  /** Claude Fast mode (#37). Thread-only, so inheriting always means off. */
+  /** Per-session Fast opt-in; inheriting means off. */
   fastMode: boolean;
   statusCardStyle: StatusCardStyle;
   simpleCardGif: boolean;
@@ -81,6 +81,7 @@ export interface InheritedConfig {
 }
 
 export interface ThreadConfigSnapshot {
+  fastModeDescriptor?: import("@seam/adapters").FastModeDescriptor;
   location: ResolvedSetting<string>;
   agent: ResolvedSetting<string>;
   model: ResolvedSetting<string>;
@@ -125,7 +126,7 @@ export interface DraftOverlay {
   cwd?: string | null;
   rider?: string | null;
   detached?: boolean;
-  /** Claude Fast mode (#37). Raw boolean like `detached`; inherit ⇒ off. */
+  /** Raw Fast boolean; inherit means off. */
   fastMode?: boolean;
   permission?: PermissionPolicyMode | null;
   statusCardStyle?: StatusCardStyle | null;
@@ -175,10 +176,9 @@ export interface DraftAgentCapabilities {
 export interface HubRenderContext {
   modelHidden?: boolean;
   effortDisabled?: boolean;
-  /** True when the drafted agent has no Fast mode (#37) — Claude-only, and only
-   *  for direct-Anthropic backends. Disables the Fast control rather than
-   *  offering one that could only ever refuse. */
+  /** The current live session cannot advertise Fast for this selection. */
   fastDisabled?: boolean;
+  fastUnavailableReason?: string;
   /** When false, the Thread↔Channel scope toggle is hidden. Default: shown if the draft has a parent channel. */
   canEditChannel?: boolean;
 }
@@ -224,6 +224,7 @@ export function snapshotFromDescribe(
     permission: d.permission,
     detached: d.detached,
     fastMode: d.fastMode ?? { value: false, source: "default" },
+    fastModeDescriptor: d.fastModeDescriptor,
     statusCardStyle: d.statusCardStyle ?? { value: "full", source: "default" },
     simpleCardGif: d.simpleCardGif ?? { value: false, source: "default" },
     role: d.role ?? { value: null, source: "default" },
@@ -325,11 +326,7 @@ export function willResetSession(draft: ThreadConfigDraft): boolean {
   return (
     next.location !== s.location.value ||
     next.agent !== s.agent.value ||
-    // #37: Fast is a session-start dimension. Changing it must land on a fresh
-    // session so an accumulated conversation is never repriced mid-flight —
-    // and so must a model/agent/host change while Fast is ON, because Fast is
-    // advertised per model (Opus has it, Sonnet does not) and a Claude model
-    // switch is otherwise live-config on the SAME session.
+    // Fresh-session descriptors must re-check model-dependent capability.
     fastModeWillResetSession(draft)
   );
 }
@@ -339,6 +336,7 @@ export function fastModeWillResetSession(draft: ThreadConfigDraft): boolean {
   const s = draft.snapshot;
   const next = effectiveAfterDraft(draft);
   return fastModeNeedsFreshSession({
+    descriptor: s.fastModeDescriptor,
     nextFastMode: next.fastMode,
     fastModeChanged: next.fastMode !== (s.fastMode?.value === true),
     modelChanged: next.model !== s.model.value,
@@ -347,7 +345,7 @@ export function fastModeWillResetSession(draft: ThreadConfigDraft): boolean {
   });
 }
 
-/** True when saving this draft turns Fast mode ON (the paid-credit direction). */
+/** True when saving this draft turns Fast mode ON. */
 export function willEnableFastMode(draft: ThreadConfigDraft): boolean {
   return (
     effectiveAfterDraft(draft).fastMode &&
@@ -706,7 +704,7 @@ export function renderHub(
         ? "will be `detached`"
         : "will be `attached`";
 
-  const fastLine = channelScope
+  const fastLine = ctx.fastUnavailableReason && !channelScope ? ctx.fastUnavailableReason : channelScope
     ? fieldLine("`per-thread`", "Fast is never pinned channel-wide")
     : fieldLine(
         fastCurrent,
@@ -714,8 +712,8 @@ export function renderHub(
         o.fastMode === undefined
           ? undefined
           : o.fastMode
-            ? "will be `on` — fresh session, paid credits"
-            : "will be `off` — fresh session"
+            ? s.fastModeDescriptor?.applicationMode === "live" ? "will be `on` — live, increased usage" : "will be `on` — fresh session, paid credits"
+            : s.fastModeDescriptor?.applicationMode === "live" ? "will be `off` — live, same context" : "will be `off` — fresh session"
       );
 
   const riderThread = o.rider === undefined ? s.rider.thread : o.rider ?? undefined;
@@ -766,7 +764,7 @@ export function renderHub(
         : "⚠ Saving will reset the ACP session (host/agent change)"
     );
   }
-  if (willEnableFastMode(draft)) footerParts.push(`⚡ ${FAST_MODE_COST_WARNING}`);
+  if (willEnableFastMode(draft)) footerParts.push(`⚡ ${fastModeCostWarning(s.fastModeDescriptor)}`);
   if (!dirty) footerParts.push("no changes yet");
   if (s.effortIgnoredNote) footerParts.push(s.effortIgnoredNote);
   if (s.locked && channelScope) footerParts.push("channel is locked — admin-only");
@@ -829,7 +827,7 @@ export function renderHub(
         customId: makeCustomId(id, "fast"),
         label: "Fast",
         style: "secondary",
-        // Thread-only (a channel pin would bill every sibling) and Claude-only.
+        // Per-session only, and only when the live model offers the option.
         disabled: threadOnlyDisabled || ctx.fastDisabled === true,
       },
     ],

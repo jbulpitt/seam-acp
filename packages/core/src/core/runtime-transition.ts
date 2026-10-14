@@ -20,9 +20,9 @@ import {
 } from "./config-mutation.js";
 import type { ConfigDescription, ConfigResolution, SessionInvalidationOptions } from "./session-router.js";
 import {
-  FAST_MODE_COST_WARNING,
   FAST_MODE_CONFIG_ID,
   FAST_MODE_ON,
+  fastModeCostWarning,
   checkFastModeEligibility,
   fastModeNeedsFreshSession,
   fastModeRetirementFailure,
@@ -42,11 +42,7 @@ export interface ConfigureThreadInput {
   role?: string;
   /** Thread-local automatic naming opt-out. False re-enables future exact passes. */
   disableThreadPrefix?: boolean;
-  /**
-   * Claude Fast mode (#37). `true` is refused outright for agents without Fast
-   * or when the environment kill switch is set — never silently ignored.
-   * Changing it always forges a fresh session before Fast is applied.
-   */
+  /** Fast defaults off; Codex applies live, Claude uses a fresh session. */
   fastMode?: boolean;
 }
 
@@ -112,7 +108,7 @@ export interface ThreadConfigurationIdentity {
   /** Effective naming role, or `auto` when no role is active. */
   role: string;
   disableThreadPrefix: boolean;
-  /** Claude Fast mode (#37): the state that is actually in force. */
+  /** Fast setting confirmed by the live session. */
   fastMode: boolean;
 }
 
@@ -142,6 +138,7 @@ export type ResetThreadSessionOutcome =
   | { ok: false; error: string };
 
 export interface SessionControlRuntime {
+  setFastMode?(requested: boolean): Promise<void>;
   getSessionInfo(): { sessionId: string; availableModels: ReadonlyArray<{ modelId: string }> } | undefined;
   getConfigSelectValues(configId: string): ReadonlyArray<string>;
   /** #37: what Fast actually resolved to on the live session, if determined. */
@@ -241,6 +238,23 @@ export class RuntimeTransition {
 
   async applyPermissionMode(record: SessionRecord): Promise<void> {
     await this.settings!.router.applyPermissionMode(record);
+  }
+
+  /** Revert a failed live Fast change without discarding the conversation. */
+  async applyLiveFastMode(record: SessionRecord, requested: boolean, previous: boolean, actor: MutationActor,
+    runtime?: SessionControlRuntime): Promise<void> {
+    const live = runtime ?? await this.deps.router.getOrStartRuntime(record);
+    try {
+      await live.setFastMode!(requested);
+    } catch (error) {
+      let rollbackError: string | undefined;
+      try { await live.setFastMode!(previous); }
+      catch (cause) { rollbackError = cause instanceof Error ? cause.message : String(cause); }
+      const reverted = this.applyTargetIdentity(this.deps.store.get(record.id) ?? record, { fastMode: previous }, actor);
+      if (!reverted.ok) rollbackError = [rollbackError, reverted.error].filter(Boolean).join("; ");
+      if (rollbackError) throw new Error(`${error instanceof Error ? error.message : String(error)}; Fast rollback failed: ${rollbackError}. Actual serving state could not be confirmed.`, { cause: error });
+      throw error;
+    }
   }
 
   /** Apply an editor's already-audited selection to the retained runtime. */
@@ -672,9 +686,7 @@ export class RuntimeTransition {
       nextFastMode = false;
     }
     const fastModeChanged = nextFastMode !== (before.fastMode?.value ?? false);
-    // Shared rule (#37): Fast is validated per session AND per model, so a
-    // model/agent change under an active Fast setting needs a fresh session
-    // even though the Fast setting itself did not change.
+    // Descriptor policy owns Fast's reset, independently of model application.
     const reset = detectSessionReset({
       previousAgentId,
       nextAgentId,
@@ -682,6 +694,7 @@ export class RuntimeTransition {
       modelChanged,
       modelApplicationMode: catalogModel?.applicationMode ?? "reload",
       fastModeChanged: fastModeNeedsFreshSession({
+        descriptor: profile.fastMode,
         nextFastMode,
         fastModeChanged,
         modelChanged,
@@ -871,6 +884,12 @@ export class RuntimeTransition {
     const fallbackNotice = runtime.getLastModelFallbackNotice?.();
     if (fallbackNotice && (modelChanged || runtimeReloaded || reset.sessionReset)) warnings.push(fallbackNotice);
 
+    if (fastModeChanged && profile.fastMode?.applicationMode === "live" && !reset.sessionReset) {
+      try { await this.applyLiveFastMode(this.deps.store.get(target.id) ?? target, nextFastMode, before.fastMode.value, actor, runtime); }
+      catch (error) { return { ok: false, error: error instanceof Error ? error.message : String(error) }; }
+      if (nextFastMode) warnings.push(fastModeCostWarning(profile.fastMode));
+    }
+
     // Config-option agents may advertise a model-dependent subset. Validate
     // against the live session before claiming success. Claude never enters
     // this branch: its effort is `_meta` and was applied by the reload above.
@@ -905,7 +924,8 @@ export class RuntimeTransition {
         outcome: runtime.getFastModeOutcome?.(),
         agentId: nextAgentId,
         model: nextModel,
-        advertised: runtime.getConfigSelectValues(FAST_MODE_CONFIG_ID),
+        advertised: runtime.getConfigSelectValues(profile.fastMode?.configId ?? FAST_MODE_CONFIG_ID),
+        configId: profile.fastMode?.configId,
       });
       if (!settled.ok) {
         warnings.push(settled.refusal);
@@ -933,7 +953,7 @@ export class RuntimeTransition {
           }
         }
       } else {
-        warnings.push(FAST_MODE_COST_WARNING);
+        warnings.push(fastModeCostWarning(profile.fastMode));
       }
     }
 

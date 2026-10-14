@@ -42,9 +42,12 @@ export function describeChoiceOption(label: string, index: number, numbered: boo
 }
 
 /** Keep whole numbered options together; publish overflow before the clickable message. */
-export function choiceBodyChunks(options: ReadonlyArray<{ label: string }>): string[] {
+export function choiceBodyChunks(
+  options: ReadonlyArray<{ label: string; description?: string }>,
+  always = false
+): string[] {
   const chunks: string[] = [];
-  for (const entry of choiceOptionList(options)) {
+  for (const entry of choiceOptionList(options, always)) {
     const last = chunks.at(-1);
     if (last && last.length + entry.length + 2 <= 2000) chunks[chunks.length - 1] = `${last}\n\n${entry}`;
     else chunks.push(entry);

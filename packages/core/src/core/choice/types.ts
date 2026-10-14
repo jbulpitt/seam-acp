@@ -53,10 +53,13 @@ export interface ChoiceOption {
   target?: ChoiceTarget;
 }
 
-/** Full numbered text when labels outgrow compact controls. Frozen options stay unchanged. */
-export function choiceOptionList(options: ReadonlyArray<Pick<ChoiceOption, "label">>): string[] {
-  return options.some((option) => option.label.length > 80)
-    ? options.map((option, index) => `${index + 1}. ${option.label}`)
+/** Full numbered text; elicitations always include descriptions. Frozen options stay unchanged. */
+export function choiceOptionList(
+  options: ReadonlyArray<{ label: string; description?: string }>,
+  always = false
+): string[] {
+  return always || options.some((option) => option.label.length > 80)
+    ? options.map((option, index) => `${index + 1}. ${option.label}${option.description ? ` — ${option.description}` : ""}`)
     : [];
 }
 

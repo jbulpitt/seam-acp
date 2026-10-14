@@ -1690,6 +1690,7 @@ class AgyAgent implements Agent {
       const errorKind = classification?.errorKind ?? agyKindFromCode(failure.code);
       const safeEvidence = {
         code: failure.code,
+        ...(failure.overflow ? { overflow: failure.overflow } : {}),
         ...(classification?.exitCode !== undefined ? { exitCode: classification.exitCode } : {}),
         ...(classification?.signal !== undefined ? { signal: classification.signal } : {}),
         ...(classification?.sourceKind ? { sourceKind: classification.sourceKind } : {}),
@@ -1702,7 +1703,7 @@ class AgyAgent implements Agent {
         : "";
       throw RequestError.internalError(
         agyData(errorKind, safeEvidence),
-        `native AGY ${cause}${childExit}`,
+        `native AGY ${cause}${childExit}${failure.overflow ? `: ${failure.detail}` : ""}`,
       );
     }
   }

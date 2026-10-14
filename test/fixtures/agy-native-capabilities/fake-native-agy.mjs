@@ -355,7 +355,7 @@ const server = http.createServer(async (request, response) => {
     // A working stream must never substitute this deliberately different stdout.
     if (!schemaFile) process.stdout.write("DO NOT USE STDOUT\n");
     if (prompt === "r5-malformed") { response.end(Buffer.from([0, 0, 0, 0, 1, 123])); return; }
-    if (prompt === "r5-oversized-frame") { response.write(Buffer.from([0, 0, 128, 0, 1])); return; }
+    if (prompt === "r5-oversized-frame") { response.write(Buffer.from([0, 4, 0, 0, 1])); return; }
     for (const update of trace.updates) {
       await writeFragmented(response, envelope(0, { update }));
     }

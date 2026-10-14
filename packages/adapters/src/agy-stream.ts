@@ -327,8 +327,8 @@ async function* readConnectEnvelopes(
   let payload: Uint8Array | undefined;
   let payloadBytes = 0;
   let flag = 0;
-  // A bogus length prefix must not retain an unbounded stream awaiting a frame.
-  const maxFrameBytes = 8 * 1024 * 1024;
+  // Resumed cascades send the historical trajectory in their initial frame.
+  const maxFrameBytes = 64 * 1024 * 1024;
   try {
     for (;;) {
       const { value, done } = await reader.read();
@@ -348,7 +348,9 @@ async function* readConnectEnvelopes(
           if (headerBytes < 5) continue;
           flag = header[0]!;
           const len = new DataView(header.buffer).getUint32(1);
-          if (len > maxFrameBytes) throw agyFailure("output_overflow");
+          if (len > maxFrameBytes) throw agyFailure("output_overflow", undefined, {
+            overflow: { limit: "StreamAgentStateUpdates frame", limitBytes: maxFrameBytes, observedBytes: len },
+          });
           if (flag !== 0 && flag !== 2) throw agyFailure("protocol_error");
           payload = new Uint8Array(len);
           payloadBytes = 0;
@@ -463,7 +465,9 @@ async function readAgyLog(file: string): Promise<string> {
   try {
     const buffer = Buffer.alloc(AGY_METADATA_BYTES + 1);
     const { bytesRead } = await handle.read(buffer, 0, buffer.length, 0);
-    if (bytesRead > AGY_METADATA_BYTES) throw agyFailure("output_overflow");
+    if (bytesRead > AGY_METADATA_BYTES) throw agyFailure("output_overflow", undefined, {
+      overflow: { limit: "startup log", limitBytes: AGY_METADATA_BYTES, observedBytes: bytesRead },
+    });
     return buffer.subarray(0, bytesRead).toString("utf8");
   } finally { await handle.close(); }
 }
@@ -478,7 +482,9 @@ export async function readAgyJsonResponse(response: Response): Promise<unknown> 
       const { done, value } = await reader.read();
       if (done) break;
       bytes += value.length;
-      if (bytes > AGY_METADATA_BYTES) throw agyFailure("output_overflow");
+      if (bytes > AGY_METADATA_BYTES) throw agyFailure("output_overflow", undefined, {
+        overflow: { limit: "HTTP metadata", limitBytes: AGY_METADATA_BYTES, observedBytes: bytes },
+      });
       chunks.push(value);
     }
     try { return JSON.parse(Buffer.concat(chunks).toString("utf8")); }

@@ -80,6 +80,7 @@ import type {
 } from "../chat-adapter.js";
 import type { PanelButton, StructuredPanel } from "../../core/types.js";
 import { clampPanelForDiscord } from "../../core/panel-limits.js";
+import { parseElicitationCustomId } from "../../core/elicitation/types.js";
 import {
   CHOICE_CUSTOM_ID_PREFIX,
   CHOICE_CUSTOM_TEXT_MAX,
@@ -2235,7 +2236,10 @@ export class DiscordAdapter implements ChatAdapter {
     card: ElicitationCardPost
   ): Promise<MessageRef> {
     const ch = await this.fetchSendableChannel(channel.id);
+    const chunks = choiceBodyChunks(card.choiceOptions ?? [], true);
+    for (const content of chunks.slice(0, -1)) await ch.send({ content, allowedMentions: { parse: [] } });
     const sent = await ch.send({
+      ...(chunks.length ? { content: chunks.at(-1) } : {}),
       embeds: [DiscordAdapter.buildEmbed(card.panel)],
       components: DiscordAdapter.buildElicitationComponents(card),
       allowedMentions: { parse: [] },
@@ -2247,7 +2251,7 @@ export class DiscordAdapter implements ChatAdapter {
     const ch = await this.fetchSendableChannel(message.channel.id);
     const msg = await ch.messages.fetch(message.id);
     await msg.edit({
-      content: "",
+      content: choiceBodyChunks(card.choiceOptions ?? [], true).at(-1) ?? "",
       embeds: [DiscordAdapter.buildEmbed(card.panel)],
       components: DiscordAdapter.buildElicitationComponents(card),
       allowedMentions: { parse: [] },
@@ -2266,10 +2270,12 @@ export class DiscordAdapter implements ChatAdapter {
         .setMaxValues(Math.max(1, Math.min(card.select.max, card.select.options.length)))
         .setDisabled(card.select.disabled ?? false)
         .addOptions(
-          card.select.options.slice(0, 25).map((option) => ({
-            label: option.label.slice(0, 100),
-            value: option.value.slice(0, 100),
-            ...(option.description ? { description: option.description.slice(0, 100) } : {}),
+          card.select.options.slice(0, 25).map((option, index) => ({
+            ...describeChoiceOption(option.label, index, !!card.choiceOptions?.length, DISCORD_SELECT_LABEL_MAX),
+            value: option.value,
+            ...(option.description ? {
+              description: describeChoiceOption(option.description, index, false, DISCORD_SELECT_LABEL_MAX).label,
+            } : {}),
           }))
         );
       rows.push(new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(select));
@@ -2277,8 +2283,12 @@ export class DiscordAdapter implements ChatAdapter {
     if (card.buttons?.length) {
       const row = new ActionRowBuilder<ButtonBuilder>();
       for (const button of card.buttons.slice(0, 5)) {
+        const action = button.customId ? parseElicitationCustomId(button.customId) : null;
         const built = new ButtonBuilder()
-          .setLabel(button.label.slice(0, 80))
+          .setLabel(describeChoiceOption(
+            button.label, action?.kind === "choice" ? action.index : 0,
+            action?.kind === "choice", DISCORD_BUTTON_LABEL_MAX
+          ).label)
           .setStyle(
             button.style === "link"
               ? ButtonStyle.Link

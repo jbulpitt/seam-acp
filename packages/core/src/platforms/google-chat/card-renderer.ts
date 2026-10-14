@@ -1,6 +1,8 @@
 import type { PanelButton, StructuredLayout, StructuredPanel } from "../../core/types.js";
 import type { ChoiceCardPost, ElicitationCardPost } from "../chat-adapter.js";
 import { choiceOptionList } from "../../core/choice/types.js";
+import { parseElicitationCustomId } from "../../core/elicitation/types.js";
+import { describeChoiceOption, DISCORD_BUTTON_LABEL_MAX, DISCORD_SELECT_LABEL_MAX } from "../discord/choice-picker.js";
 import { formatGoogleChatCardText } from "./card-text.js";
 import { googleChatStatusPanel } from "./status-panel.js";
 
@@ -99,12 +101,16 @@ export function renderGoogleChatChoiceCard(card: ChoiceCardPost): GoogleChatCard
 
 export function renderGoogleChatElicitationCard(card: ElicitationCardPost, cardId: string): GoogleChatCardsMessage {
   const controls: GoogleChatCardWidget[] = [];
+  const fullOptions = choiceOptionList(card.choiceOptions ?? [], true);
+  if (fullOptions.length) controls.push(paragraph(fullOptions.join("\n\n")));
   if (card.select && !card.select.disabled) {
     controls.push({ selectionInput: {
       name: "elicitationSelection", label: card.select.placeholder,
       type: card.select.max > 1 ? "CHECK_BOX" : "DROPDOWN",
-      items: card.select.options.map((option) => ({
-        text: option.description ? `${option.label} — ${option.description}` : option.label,
+      items: card.select.options.map((option, index) => ({
+        text: card.choiceOptions?.length
+          ? describeChoiceOption(option.label, index, true, DISCORD_SELECT_LABEL_MAX).label
+          : option.description ? `${option.label} — ${option.description}` : option.label,
         value: option.value,
       })),
       onChangeAction: action(GOOGLE_CHAT_COMPONENT_ACTION, {
@@ -118,7 +124,11 @@ export function renderGoogleChatElicitationCard(card: ElicitationCardPost, cardI
       return { text: item.label, type: "OUTLINED", onClick: { openLink: { url: item.url } }, disabled: item.disabled };
     }
     if (item.customId === undefined) throw new TypeError(`Button "${item.label}" has no customId`);
-    return button(item.label, action(GOOGLE_CHAT_COMPONENT_ACTION, { customId: item.customId }), item.disabled, item.style);
+    const component = parseElicitationCustomId(item.customId);
+    const text = component?.kind === "choice"
+      ? describeChoiceOption(item.label, component.index, true, DISCORD_BUTTON_LABEL_MAX).label
+      : item.label;
+    return button(text, action(GOOGLE_CHAT_COMPONENT_ACTION, { customId: item.customId }), item.disabled, item.style);
   });
   if (buttons?.length) controls.push(buttonList(buttons));
   return panelMessage(card.panel, cardId, controls);

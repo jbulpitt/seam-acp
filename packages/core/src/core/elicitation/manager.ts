@@ -13,6 +13,7 @@ import type {
 } from "../../platforms/chat-adapter.js";
 import type { SessionRecord } from "../types.js";
 import type { SessionStore } from "../session-store.js";
+import { CHOICE_LABEL_MAX } from "../choice/types.js";
 import { durableApprovalRequest, isStoredMcpToolApproval } from "./approval-policy.js";
 import {
   ELICITATION_MAX_FIELDS,
@@ -121,15 +122,15 @@ function validateOptions(
   fieldName: string
 ): Validation<NonNullable<ReturnType<typeof enumOptions>>> {
   if (!options || options.length < 1 || options.length > ELICITATION_MAX_OPTIONS) {
-    return { ok: false, error: `${fieldName} must declare 1-${ELICITATION_MAX_OPTIONS} choices.` };
+    return { ok: false, error: `${fieldName} must declare 1-${ELICITATION_MAX_OPTIONS} choices (Discord's option-count limit).` };
   }
   const values = new Set<string>();
   for (const option of options) {
-    if (!text(option.label, 100) || !text(option.value, 100)) {
-      return { ok: false, error: `${fieldName} has a choice label/value outside Discord's 100-character limit.` };
-    }
-    if (option.description && !text(option.description, 100)) {
-      return { ok: false, error: `${fieldName} has a choice description outside Discord's 100-character limit.` };
+    for (const kind of ["label", "value", "description"] as const) {
+      if (kind === "description" && !option.description) continue;
+      if (!text(option[kind], CHOICE_LABEL_MAX)) {
+        return { ok: false, error: `${fieldName} has a choice ${kind} that must be nonempty printable text within Seam's ${CHOICE_LABEL_MAX}-character limit.` };
+      }
     }
     if (values.has(option.value)) {
       return { ok: false, error: `${fieldName} has duplicate choice values.` };
@@ -141,7 +142,7 @@ function validateOptions(
 
 export function validateFormRequest(request: FormRequest): Validation<ValidatedForm> {
   if (Buffer.byteLength(JSON.stringify(request), "utf8") > ELICITATION_MAX_WIRE_BYTES) {
-    return { ok: false, error: "The form request is too large." };
+    return { ok: false, error: `The form request exceeds Seam's ${ELICITATION_MAX_WIRE_BYTES}-byte wire limit.` };
   }
   if (!text(request.message, ELICITATION_MAX_MESSAGE) || !request.message.trim()) {
     return { ok: false, error: `The request message must be 1-${ELICITATION_MAX_MESSAGE} characters.` };
@@ -295,7 +296,7 @@ export function validateFormRequest(request: FormRequest): Validation<ValidatedF
 
 export function validateUrlRequest(request: UrlRequest): Validation<URL> {
   if (Buffer.byteLength(JSON.stringify(request), "utf8") > ELICITATION_MAX_WIRE_BYTES) {
-    return { ok: false, error: "The URL request is too large." };
+    return { ok: false, error: `The URL request exceeds Seam's ${ELICITATION_MAX_WIRE_BYTES}-byte wire limit.` };
   }
   if (!text(request.message, ELICITATION_MAX_MESSAGE) || !request.message.trim()) {
     return { ok: false, error: `The request message must be 1-${ELICITATION_MAX_MESSAGE} characters.` };
@@ -1115,8 +1116,8 @@ export class ElicitationManager {
         ? statusText[row.status] ?? "Settled"
         : `Only <@${row.authorizedUserId}> can answer · expires in 15 minutes`,
     };
-    if (!request || terminal) {
-      if (row.terminalDetail) panel.fields.push({ name: "Status", value: row.terminalDetail });
+    if (terminal && row.terminalDetail) panel.fields.push({ name: "Status", value: row.terminalDetail });
+    if (!request || (terminal && request.mode === "url")) {
       return { panel };
     }
     if (request.mode === "url") {
@@ -1145,10 +1146,18 @@ export class ElicitationManager {
       }
       form = validated.value;
     }
+    const choiceOptions = form.fields.flatMap(field =>
+      (enumOptions(field.schema) ?? []).map(({ label, description }) => ({
+        label: form.fields.length > 1 ? `${field.title}: ${label}` : label,
+        ...(description ? { description } : {}),
+      }))
+    );
+    const card = { panel, choiceOptions };
+    if (terminal) return card;
     const completed = new Set(parseStored<number[]>(row.completedPagesJson, []));
     if (form.directDecision?.kind === "approve") {
       return {
-        panel,
+        ...card,
         buttons: [
           { label: "Allow", style: "success", customId: elicitationCustomId("allow", row.id) },
           { label: "Cancel", style: "danger", customId: elicitationCustomId("cancel", row.id) },
@@ -1171,7 +1180,7 @@ export class ElicitationManager {
     }
     if (form.directDecision?.kind === "boolean") {
       return {
-        panel,
+        ...card,
         buttons: [
           { label: "Yes", style: "success", customId: elicitationCustomId("bool", row.id, "1") },
           { label: "No", style: "secondary", customId: elicitationCustomId("bool", row.id, "0") },
@@ -1186,7 +1195,7 @@ export class ElicitationManager {
     if (form.directDecision?.kind === "single" &&
         form.directDecision.options.length <= (form.directDecision.field.required ? 4 : 3)) {
       return {
-        panel,
+        ...card,
         buttons: [
           ...form.directDecision.options.map((option, index) => ({
             label: option.label,
@@ -1204,7 +1213,7 @@ export class ElicitationManager {
     if (form.directDecision &&
         (form.directDecision.kind === "single" || form.directDecision.kind === "multi")) {
       return {
-        panel,
+        ...card,
         select: {
           customId: elicitationCustomId("select", row.id),
           placeholder: form.directDecision.field.title,
@@ -1226,7 +1235,7 @@ export class ElicitationManager {
       };
     }
     return {
-      panel,
+      ...card,
       buttons: [
         { label: completed.has(row.currentPage) ? "Edit answers" : "Answer", style: "primary",
           customId: elicitationCustomId("answer", row.id) },

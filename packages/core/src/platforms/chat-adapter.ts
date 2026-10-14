@@ -335,6 +335,8 @@ export interface ChatAdapter {
  * never echo into the public Discord thread. */
 export interface ElicitationCardPost {
   panel: StructuredPanel;
+  /** Original display text, not answer values; retained when controls close. */
+  choiceOptions?: ReadonlyArray<{ label: string; description?: string }>;
   buttons?: ReadonlyArray<{
     customId?: string;
     url?: string;

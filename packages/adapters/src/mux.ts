@@ -948,7 +948,9 @@ export function makeMux(opts: {
         const through = outputCursor.get(slot);
         if (through) void sendCmd("ackOutput", { slot, throughSeq: through }).catch(() => {});
       }).catch((error) => {
-        if (slots.get(slot) === entry && !entry.killed) child.emit("error", error);
+        if (slots.get(slot) !== entry || entry.killed) return;
+        if (child.listenerCount("error") > 0) child.emit("error", error);
+        else console.error(`[mux:${opts.id}] replayOutput failed for slot ${slot}:`, error);
       });
     });
     return child;

@@ -147,7 +147,10 @@ describe("ordinary elicitation lifecycle", () => {
       // Production boot has no transient author entry for this surviving request.
       await next.recoverElicitations();
       expect(h.store.getElicitation(row.id)?.status).toBe("open");
-      await next.sweepUnownedSlots("fixture");
+      vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+      next.sweepUnownedSlots("fixture");
+      await vi.advanceTimersByTimeAsync(90_000);
+      vi.useRealTimers();
       await until(() => !!newRouter.getRuntime(h.record.id));
       expect(newRouter.getRuntime(h.record.id)?.getSlot()).toBe(slot);
       expect(cards).toHaveLength(1);
@@ -187,6 +190,7 @@ describe("ordinary elicitation lifecycle", () => {
       expect(cards).toHaveLength(1);
       expect(edits.at(-1)?.buttons).toEqual([]);
     } finally {
+      vi.useRealTimers();
       previous?.suspendForRestart(); next?.suspendForRestart(); await h.close();
     }
   }, 25_000);

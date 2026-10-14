@@ -7,6 +7,7 @@ if (process.env.FAKE_AGENT_PIDS) fs.appendFileSync(process.env.FAKE_AGENT_PIDS, 
 const send = (message) => process.stdout.write(`${JSON.stringify({ jsonrpc: "2.0", ...message })}\n`);
 let buffer = "";
 let clientReply;
+let formReplyPending = false;
 let currentModeId = "agent";
 const modes = () => process.env.FAKE_AGENT_REQUIRE_MODE ? { modes: { currentModeId, availableModes: [
   { id: "agent", name: "Auto review" }, { id: "agent-full-access", name: "Full access" },
@@ -24,6 +25,16 @@ process.stdin.on("data", (chunk) => {
     }
     if (message.id === "fixture-client-reply" && "result" in message && clientReply) {
       clientReply(); clientReply = undefined; continue;
+    }
+    if (message.id === "fixture-form-reply" && "result" in message) {
+      fs.appendFileSync(process.env.FAKE_AGENT_REQUESTS, `${JSON.stringify({ pid: process.pid, method: "elicitation/response", params: message.result })}\n`);
+      if (clientReply) { clientReply(); clientReply = undefined; }
+      formReplyPending = false;
+      continue;
+    }
+    if (message.method === "session/cancel" && formReplyPending) {
+      send({ method: "$/cancel_request", params: { requestId: "fixture-form-reply" } });
+      continue;
     }
     const update = (text) => send({ method: "session/update", params: { sessionId: message.params.sessionId,
       update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text } } } });
@@ -105,7 +116,14 @@ process.stdin.on("data", (chunk) => {
           update("resumed ok");
           send({ id: message.id, result: { stopReason: "end_turn" } });
         };
-        if (text.includes("client reply")) {
+        if (text.includes("form question")) {
+          formReplyPending = true;
+          clientReply = finish;
+          send({ id: "fixture-form-reply", method: "elicitation/create", params: {
+            mode: "form", sessionId: message.params.sessionId, message: "Continue this work?",
+            requestedSchema: { type: "object", properties: { proceed: { type: "boolean" } }, required: ["proceed"] },
+          } });
+        } else if (text.includes("client reply")) {
           clientReply = finish;
           send({ id: "fixture-client-reply", method: "session/request_permission", params: {
             sessionId: message.params.sessionId, toolCall: { toolCallId: "fixture-call", title: "Fixture" },

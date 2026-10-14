@@ -55,6 +55,10 @@ vi.mock("../packages/core/src/agents/agent-runtime.js", async importOriginal => 
     }
     async setModel(model: string) { this.modelOverride = model; }
     async setConfigOption(_id: string, value: string) { this.effortOverride = value; }
+    fast = false;
+    getFastModeOutcome() { return { requested: this.fast, applied: this.fast }; }
+    getConfigSelectValues(id: string) { return id === "fast-mode" ? ["off", "on"] : []; }
+    async setFastMode(value: boolean) { this.fast = value; }
   } };
 });
 
@@ -67,6 +71,7 @@ const profiles = ["claude", "codex", "ollama-cloud", "copilot", "agy"].map(id =>
   effort: id === "copilot" || id === "codex"
     ? { mechanism: "configOption", configId: "effort", levels: ["low", "high"] }
     : { mechanism: "meta", levels: ["low", "high"] },
+  ...(id === "codex" ? { fastMode: { configId: "fast-mode", onValue: "on", offValue: "off", applicationMode: "live" } } : {}),
 })) as unknown as AgentProfile[];
 let dir: string;
 let store: SessionStore;
@@ -127,6 +132,20 @@ async function fixture(agent = "claude") {
 }
 
 describe("warm config editor Save", () => {
+  it("applies Codex Fast on/off to the same warm runtime and ACP, with a no-op untouched", async () => {
+    const h = await fixture("codex");
+    expect((await h.save({ fastMode: true })).ok).toBe(true);
+    expect(await h.next()).toBe(h.warm);
+    expect((h.warm as any).fast).toBe(true);
+    expect(store.get(h.record.id)?.acpSessionId).toBe("existing-context");
+    expect((h.warm as any).disposed).toBe(false);
+    expect((await h.save({ fastMode: false })).ok).toBe(true);
+    expect(await h.next()).toBe(h.warm);
+    expect((h.warm as any).fast).toBe(false);
+    expect(store.get(h.record.id)?.acpSessionId).toBe("existing-context");
+    expect((await h.save({ fastMode: false })).ok).toBe(true);
+    expect(await h.next()).toBe(h.warm);
+  });
   it.each([
     ["claude", { agent: "codex", model: "new", effort: "high" }, "codex", "new", "high", "fresh-codex"],
     ["codex", { model: "new" }, "codex", "new", "low", "fresh-codex"],

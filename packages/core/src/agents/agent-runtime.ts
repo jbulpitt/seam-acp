@@ -760,8 +760,10 @@ export class AgentRuntime {
       const context =
         `remote agent supervisor exited ${phase} on host '${remoteExit.bridgeId}' `
         + `(code=${code}, signal=${signal})`;
+      // Keep the child diagnostic ahead of context in bounded status text.
+      const reason = remoteExit.reason ?? this.stderrRing.join("\n").trim().split("\n").at(-1);
       const error = new Error(
-        remoteExit.reason ? `${remoteExit.reason}; ${context}` : `${context}; the bridge reported no reason`
+        reason ? `${reason}; ${context}` : `${context}; the bridge reported no reason`
       );
       attachErrorClassification(error, {
         errorKind: "agent_exit",

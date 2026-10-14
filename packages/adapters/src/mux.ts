@@ -653,6 +653,8 @@ export function makeMux(opts: {
                 // consumer sees the discontinuity in the right order rather
                 // than discovering it after acting on what followed.
                 if (reply?.gap) opts.onOutputGap?.(slot, reply.gap);
+                // Session snapshots are current state, not historical completions.
+                const sessionFrame = reply?.frames?.findLast(frame => frame.type === "session" && frame.session);
                 for (const frame of reply?.frames ?? []) {
                   if (frame.type === "data" && typeof frame.data === "string") {
                     if (typeof frame.seq === "number") outputCursor.set(slot, frame.seq);
@@ -669,7 +671,7 @@ export function makeMux(opts: {
                     live.fake.emit("remoteRecoveryResult", frame.recoveryResult);
                   } else if (frame.type === "session" && frame.session) {
                     if (typeof frame.seq === "number") outputCursor.set(slot, frame.seq);
-                    live.fake.emit("remoteSession", frame.session);
+                    if (frame === sessionFrame) live.fake.emit("remoteSession", frame.session);
                   } else if (frame.type === "exit") {
                     applyRemoteExit(slot, live, frame);
                   }
@@ -923,6 +925,7 @@ export function makeMux(opts: {
         const live = slots.get(slot);
         if (!live || live.killed) return;
         if (reply?.gap) opts.onOutputGap?.(slot, reply.gap);
+        const sessionFrame = reply?.frames?.findLast(frame => frame.type === "session" && frame.session);
         for (const frame of reply?.frames ?? []) {
           if (frame.type === "data" && typeof frame.data === "string") {
             if (typeof frame.seq === "number") outputCursor.set(slot, frame.seq);
@@ -936,7 +939,7 @@ export function makeMux(opts: {
             live.fake.emit("remoteRecoveryResult", frame.recoveryResult);
           } else if (frame.type === "session" && frame.session) {
             if (typeof frame.seq === "number") outputCursor.set(slot, frame.seq);
-            live.fake.emit("remoteSession", frame.session);
+            if (frame === sessionFrame) live.fake.emit("remoteSession", frame.session);
           } else if (frame.type === "exit") {
             applyRemoteExit(slot, live, frame);
           }

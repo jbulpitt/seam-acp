@@ -96,7 +96,7 @@ function harness(facts: () => { refreshTokenExpiresAt: number | null } | undefin
       assertAgentAllowedForChannel() {},
       assertAgentAllowedForRecord() {},
       isBusy: () => false,
-      getOrStartRuntime: async () => runtime,
+      getOrStartRuntime: async () => { runtime.markActivity(); return runtime; },
       describeConfig: () => described,
     }) as never,
     adapter: {
@@ -236,7 +236,7 @@ describe("automatic reauth recovery", () => {
       await vi.advanceTimersByTimeAsync(1);
       await h.orch.reconcileRemoteRecoveries(); await settleContinuations(h);
       expect(h.prompt).toHaveBeenCalledTimes(before + 1);
-      expect(h.store.turnAttempts.get(id)).toMatchObject({ state: "suspended",
+      expect(h.store.turnAttempts.get(id), `after ${wait}ms: ${JSON.stringify(h.store.turnAttempts.get(id)?.outcome)}`).toMatchObject({ state: "suspended",
         stalledReason: expect.stringContaining("reauth-waiting:") });
       expect(h.store.listOpenChoiceCards("discord").map(row => row.id)).toEqual([card.id]);
       expect(h.messages).toHaveLength(notices);

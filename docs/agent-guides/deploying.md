@@ -52,6 +52,12 @@ slots by persisted ACP/session identity instead of cancelling them or spawning
 a second writer. Normal idle-timeout retirement is unchanged. Reconnect cleanup
 retains known sessions and only reaps identified orphans after its existing grace.
 
+Ordinary form and URL questions stay with their adapter child too. Controller
+detach does not cancel them; adoption rebinds the original request to the same
+saved card. User/provider cancellation, expiry and a vanished owner remain
+terminal. Update bridges before the controller for changes to this replay path;
+already-running adapter children keep their old code.
+
 On production, the command now waits for a deploy verdict, correlated to the
 old controller's PID/start identity and the requested commit. It checks the new
 identity, `/health`, `seam-acp ready`, and every level 50/60 log between boot and

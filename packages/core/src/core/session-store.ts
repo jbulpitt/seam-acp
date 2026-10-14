@@ -1276,6 +1276,17 @@ export class SessionStore {
     return row ? mapElicitation(row) : null;
   }
 
+  requestElicitations(sessionRecordId: string): ElicitationRow[] {
+    return this.db.prepare<[string], ElicitationDbRow>(
+      "SELECT * FROM elicitations WHERE session_record_id = ? AND source_kind = 'request' ORDER BY created_utc DESC"
+    ).all(sessionRecordId).map(mapElicitation);
+  }
+
+  bindElicitationRequest(id: string, correlation: string, nowUtc: string): void {
+    this.db.prepare("UPDATE elicitations SET request_correlation = ?, updated_utc = ? WHERE id = ? AND status = 'open'")
+      .run(correlation, nowUtc, id);
+  }
+
   getCodexAsyncElicitation(sessionRecordId: string, correlation: string): ElicitationRow | null {
     const row = this.db
       .prepare<[string, string], ElicitationDbRow>(
@@ -1435,7 +1446,8 @@ export class SessionStore {
     id: string,
     detail: string,
     nowUtc: string,
-    leaseToken?: string
+    leaseToken?: string,
+    valuesJson = "{}"
   ): ElicitationRow | null {
     return this.db.transaction(() => {
       const before = this.db
@@ -1447,17 +1459,17 @@ export class SessionStore {
       const changed = this.db
         .prepare(
           `UPDATE elicitations
-              SET status = 'accepted', values_json = '{}', terminal_detail = ?,
+              SET status = 'accepted', values_json = ?, terminal_detail = ?,
                   lease_token = NULL, lease_expires_utc = NULL, updated_utc = ?
             WHERE id = ? AND status = 'open'
               AND (? IS NULL OR lease_token = ?)`
         )
-        .run(detail, nowUtc, id, leaseToken ?? null, leaseToken ?? null).changes;
+        .run(valuesJson, detail, nowUtc, id, leaseToken ?? null, leaseToken ?? null).changes;
       return changed === 1
         ? mapElicitation({
             ...before,
             status: "accepted",
-            values_json: "{}",
+            values_json: valuesJson,
             terminal_detail: detail,
             lease_token: null,
             lease_expires_utc: null,

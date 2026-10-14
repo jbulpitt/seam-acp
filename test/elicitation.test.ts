@@ -313,6 +313,18 @@ describe("ACP v1 elicitation validation and capability", () => {
 });
 
 describe("Discord elicitation lifecycle", () => {
+  it("keeps the real ACP cancellation cause instead of treating it as transport detach", async () => {
+    const controller = new AbortController();
+    const result = manager.create(record, form({ value: { type: "string" } }), {
+      requestId: 201, signal: controller.signal,
+    });
+    await tick();
+    const row = pendingRow();
+    controller.abort(new Error("Provider withdrew the question."));
+    await expect(result).resolves.toEqual({ action: "cancel" });
+    expect(store.getElicitation(row.id)).toMatchObject({ status: "cancelled", terminalDetail: expect.stringContaining("Provider withdrew the question.") });
+  });
+
   it("renders Allow/Cancel for empty-schema MCP tool approval forms and accepts without persist", async () => {
     const result = manager.create(
       record,

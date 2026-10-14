@@ -1,4 +1,4 @@
-import type { RequestPermissionRequest, RequestPermissionResponse } from "@agentclientprotocol/sdk";
+import type { CreateElicitationRequest, CreateElicitationResponse, RequestPermissionRequest, RequestPermissionResponse } from "@agentclientprotocol/sdk";
 
 export interface PermissionIdentity {
   requestId: string | number | null;
@@ -7,15 +7,28 @@ export interface PermissionIdentity {
   ownerPid?: number;
 }
 
+export interface ElicitationIdentity {
+  method: "elicitation/create";
+  requestId: string | number | null;
+  sessionId: string;
+  ownerPid?: number;
+}
+
+export type PendingRequestIdentity = PermissionIdentity | ElicitationIdentity;
+export type PendingResponse = RequestPermissionResponse | CreateElicitationResponse;
+
 export interface PermissionSnapshot {
   state: "pending" | "answered" | "gone";
   pid: number;
+  detail?: string;
+  response?: PendingResponse;
+  cancelled?: boolean;
 }
 
-type Pending = PermissionIdentity & {
-  request: RequestPermissionRequest;
-  response?: RequestPermissionResponse;
-};
+type Pending = { requestId: string | number | null; sessionId: string; response?: PendingResponse; cancelled?: string } & (
+  | { method: "session/request_permission"; request: RequestPermissionRequest; toolCallId: string }
+  | { method: "elicitation/create"; request: CreateElicitationRequest }
+);
 
 /** The agent's original requests stay with its child, not a controller connection. */
 export class PendingPermissions {
@@ -25,7 +38,7 @@ export class PendingPermissions {
 
   constructor(private readonly write: (line: string) => boolean, private readonly pid = process.pid) {}
 
-  observeOutput(line: string): void {
+  observeOutput(line: string, acpSessionId?: string): void {
     const frame = this.frame(line);
     if (!frame) return;
     if (frame.method && this.isId(frame.id)) {
@@ -36,8 +49,18 @@ export class PendingPermissions {
       const request = frame.params as RequestPermissionRequest;
       this.requests.set(this.key(frame.id), {
         requestId: frame.id, sessionId: request.sessionId,
-        toolCallId: request.toolCall.toolCallId, request,
+        method: "session/request_permission", toolCallId: request.toolCall.toolCallId, request,
       });
+    } else if (frame.method === "elicitation/create" && this.isId(frame.id)) {
+      const request = frame.params as CreateElicitationRequest;
+      const sessionId = "sessionId" in request && typeof request.sessionId === "string" ? request.sessionId : acpSessionId;
+      if (sessionId) this.requests.set(this.key(frame.id), {
+        method: "elicitation/create", requestId: frame.id, sessionId, request,
+      });
+    } else if (frame.method === "$/cancel_request") {
+      const params = frame.params as { requestId?: string | number | null; reason?: string };
+      const request = this.requests.get(this.key(params.requestId ?? null));
+      if (request?.method === "elicitation/create") request.cancelled = params.reason || "ACP request was cancelled.";
     } else if (this.isId(frame.id) && !frame.method) {
       const session = this.prompts.get(this.key(frame.id));
       if (session) {
@@ -49,7 +72,7 @@ export class PendingPermissions {
     }
   }
 
-  /** Drop only a replayed response to a permission already answered here. */
+  /** Drop only a replayed response to a request already answered here. */
   observeInput(line: string): boolean {
     const frame = this.frame(line);
     if (!frame) return true;
@@ -60,43 +83,50 @@ export class PendingPermissions {
       if (this.answered.has(this.key(frame.id))) return false;
       const request = this.requests.get(this.key(frame.id));
       if (request && frame.result) {
-        request.response = frame.result as RequestPermissionResponse;
+        request.response = frame.result as PendingResponse;
         this.answered.add(this.key(frame.id));
       }
     }
     return true;
   }
 
-  status(identity: PermissionIdentity): PermissionSnapshot {
+  status(identity: PendingRequestIdentity): PermissionSnapshot {
     const request = this.find(identity);
-    return { state: request ? request.response ? "answered" : "pending" : "gone", pid: this.pid };
+    return { state: request && !request.cancelled ? request.response ? "answered" : "pending" : "gone", pid: this.pid,
+      ...(request?.response ? { response: request.response } : {}),
+      ...(request?.cancelled ? { cancelled: true } : {}),
+      ...(!request || request.cancelled ? { detail: request?.cancelled ?? "The original agent request is no longer pending." } : {}) };
   }
 
   /** Output acknowledgement does not answer a client request. */
   unanswered(sessionId: string): string[] {
-    return [...this.requests.values()].filter(request => request.sessionId === sessionId && !request.response)
+    return [...this.requests.values()].filter(request => request.sessionId === sessionId && !request.response && !request.cancelled)
       .map(request => `${JSON.stringify({ jsonrpc: "2.0", id: request.requestId,
-        method: "session/request_permission", params: request.request })}\n`);
+        method: request.method, params: request.request })}\n`);
   }
 
-  answer(identity: PermissionIdentity, response: RequestPermissionResponse): PermissionSnapshot {
+  answer(identity: PendingRequestIdentity, response: PendingResponse): PermissionSnapshot {
     const request = this.find(identity);
-    if (!request || request.response) return this.status(identity);
-    const outcome = response.outcome;
-    if (outcome.outcome === "selected" &&
-      !request.request.options.some(option => option.optionId === outcome.optionId)) {
-      throw new Error("The selected permission option was not offered by the agent.");
+    if (!request || request.response || request.cancelled) return this.status(identity);
+    if (request.method === "session/request_permission") {
+      const outcome = (response as RequestPermissionResponse).outcome;
+      if (outcome.outcome === "selected" &&
+        !request.request.options.some(option => option.optionId === outcome.optionId)) {
+        throw new Error("The selected permission option was not offered by the agent.");
+      }
     }
     const line = `${JSON.stringify({ jsonrpc: "2.0", id: request.requestId, result: response })}\n`;
-    if (!this.write(line)) throw new Error("The pending permission's agent stdin is closed.");
+    if (!this.write(line)) throw new Error("The pending request's agent stdin is closed.");
     request.response = response;
     this.answered.add(this.key(request.requestId));
     return this.status(identity);
   }
 
-  private find(identity: PermissionIdentity): Pending | undefined {
+  private find(identity: PendingRequestIdentity): Pending | undefined {
     const request = this.requests.get(this.key(identity.requestId));
-    return request && request.sessionId === identity.sessionId && request.toolCallId === identity.toolCallId &&
+    return request && request.sessionId === identity.sessionId &&
+      ("method" in identity ? request.method === identity.method
+        : request.method === "session/request_permission" && request.toolCallId === identity.toolCallId) &&
       (identity.ownerPid === undefined || identity.ownerPid === this.pid) ? request : undefined;
   }
 

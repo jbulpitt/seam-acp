@@ -85,6 +85,22 @@ export type ElicitationValues = Record<string, ElicitationContentValue>;
 export interface ElicitationRequestContext {
   requestId: string | number | null;
   signal: AbortSignal;
+  isDetached?: () => boolean;
+  owner?: { location: string; slot: number };
+}
+
+export interface ElicitationOwner {
+  location: string;
+  slot: number;
+  ownerPid?: number;
+}
+
+export interface ElicitationOwnerState {
+  state: "pending" | "answered" | "gone";
+  pid: number;
+  detail?: string;
+  response?: CreateElicitationResponse;
+  cancelled?: boolean;
 }
 
 export type ElicitationHandler = (

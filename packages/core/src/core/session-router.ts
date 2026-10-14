@@ -1574,9 +1574,12 @@ export class SessionRouter {
         return { outcome: { outcome: "cancelled" } };
       },
       elicitationHandler: async (request, context) => {
+        const slot = this.runtimes.get(record.id)?.getSlot();
         return handleElicitationWithPermissionPolicy({
           request,
-          context,
+          context: { ...context, ...(slot !== undefined ? {
+            owner: { location: this.describeConfig(record).location.value, slot },
+          } : {}) },
           mode: permissionMode(),
           elicitUser: this.elicitUser,
           record: this.store.get(record.id) ?? record,

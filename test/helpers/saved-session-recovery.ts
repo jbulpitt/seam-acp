@@ -90,6 +90,8 @@ export async function savedSessionHost(options: {
         case "armRung1Recovery": result = await slots.armRecovery(p.slot, p); break;
         case "disarmRung1Recovery": result = await slots.disarmRecovery(p.slot, p.submissionId); break;
         case "reconcileRung1Recovery": result = await slots.reconcileRecovery(p.slot, p); break;
+        case "permissionStatus": result = await slots.permissionControl(p.slot, "permission_status", p.permission); break;
+        case "answerPermission": result = await slots.permissionControl(p.slot, "answer_permission", p.permission, p.response); break;
         default: throw new Error(`unexpected fixture command: ${frame.action}`);
       }
       this.deliver({ type: "cmd_reply", cmdId: frame.cmdId, payload: result });
@@ -137,11 +139,11 @@ export async function savedSessionHost(options: {
     routers.push(router);
     return router;
   }
-  function makeOrchestrator(router: SessionRouter) {
+  function makeOrchestrator(router: SessionRouter, adapterOverrides: Record<string, unknown> = {}) {
     const adapter = { sendMessage: async (channel: unknown, text: string) => {
       notices.push({ channel, text }); return { channel, id: "fixture-message" };
     },
-      editPanel: async () => {}, deleteMessage: async () => {} };
+      editPanel: async () => {}, deleteMessage: async () => {}, ...adapterOverrides };
     const orch = new Orchestrator({ logger, store, router, modelCatalog: catalog,
       adapter: adapter as any, renderer: discordRenderer as any,
       ...(options.recoverySleep ? { recoverySleep: options.recoverySleep } : {}),

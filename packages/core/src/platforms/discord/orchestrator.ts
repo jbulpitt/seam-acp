@@ -1085,12 +1085,14 @@ export class Orchestrator {
         if (!identity.owner || identity.requestId === undefined) return undefined;
         const mux = this.bridgeHub?.muxFor(identity.owner.location);
         if (!mux) throw new Error(`bridge ${JSON.stringify(identity.owner.location)} is not connected`);
-        return await mux.sendCmd(response ? "answerPermission" : "permissionStatus", {
+        const result = await mux.sendCmd(response ? "answerPermission" : "permissionStatus", {
           slot: identity.owner.slot, permission: {
             method: "elicitation/create", requestId: identity.requestId, sessionId: row.acpSessionId,
             ...(identity.owner.ownerPid ? { ownerPid: identity.owner.ownerPid } : {}),
           }, ...(response ? { response } : {}),
         }) as import("../../core/elicitation/types.js").ElicitationOwnerState;
+        // Older children have no ordinary-request cache; unknown is not gone.
+        return result.state === "gone" && result.pid > 0 && result.detail === undefined ? undefined : result;
       },
     });
     this.router.setElicitationHandlers({

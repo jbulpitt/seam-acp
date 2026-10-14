@@ -728,8 +728,8 @@ export class ElicitationManager {
     }
     if (this.owner && this.requestIdentity(row).owner) {
       const owner = await this.owner(row);
-      if (owner?.state === "gone") {
-        if (previous) await this.cancelOne(row.id, "interrupted", owner.detail ?? "The original agent request is no longer pending.");
+      if (owner?.state === "gone" && previous) {
+        await this.cancelOne(row.id, owner.cancelled ? "cancelled" : "interrupted", owner.detail ?? "The original agent request is no longer pending.");
         return { action: "cancel" };
       }
       if (owner?.state === "answered" && owner.response) return owner.response;
@@ -811,6 +811,18 @@ export class ElicitationManager {
     if (row.status !== "open") {
       await event.replyEphemeral("That input request has already been settled.").catch(() => {});
       return;
+    }
+    if (row.source === "request" && this.owner) {
+      const owner = await this.owner(row);
+      if (!owner && !this.waiters.has(row.id)) {
+        throw new Error("The original elicitation request has not reattached; its card remains open.");
+      }
+      if (owner?.state === "gone") {
+        await this.cancelOne(row.id, owner.cancelled ? "cancelled" : "interrupted",
+          owner.detail ?? "The original agent request is no longer pending.");
+        await event.replyEphemeral(owner.detail ?? "The original agent request is no longer pending.");
+        return;
+      }
     }
     if (row.answerMessageId) {
       await event.replyEphemeral("That answer is already queued for the originating conversation.").catch(() => {});

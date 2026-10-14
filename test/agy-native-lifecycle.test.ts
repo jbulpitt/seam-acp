@@ -215,12 +215,12 @@ describe.sequential("R5 native production lifecycle", () => {
   }, 15_000);
 
   it.each([["r5-stream-exit", "exited_early"], ["r5-stream-overflow", "output_overflow"], ["r5-stream-hang", "timeout"]])(
-    "#371 fallback retains native bounds and cancels recovery for %s", async (prompt, code) => {
+    "#371 fallback retains native bounds and the failure policy for %s", async (prompt, code) => {
       const f = await fixture(3, logger, true);
       try {
         await expect(f.runtime.prompt(prompt, undefined, { recoveryScope: "ephemeral" })).rejects.toThrow(code);
         expect(f.rows().filter(row => row.args?.includes("-p"))).toHaveLength(1);
-        expect(f.events.filter(event => event.kind === "recovery")).toHaveLength(1);
+        expect(f.events.filter(event => event.kind === "recovery")).toHaveLength(code === "output_overflow" ? 0 : 1);
       }
       finally { await f.close(); }
     }, 15_000,

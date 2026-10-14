@@ -1369,9 +1369,16 @@ export class SessionRouter {
   private makeAttachedRuntime(record: SessionRecord, plan: RuntimeSpawnPlan,
     child: Parameters<AgentRuntime["attachRecovery"]>[0], acpSessionId: string, retained?: { busy: boolean }): AgentRuntime {
     const runtime = this.makeRuntime(record, plan, plan.model, plan.effort);
-    const modes = this.store.readConfig(this.store.get(record.id) ?? record).codexModes;
+    const cfg = this.store.readConfig(this.store.get(record.id) ?? record);
+    const modes = cfg.codexModes;
+    const capabilities = cfg.acpPromptCapabilities;
     runtime.attachRecovery(child, acpSessionId, modes?.sessionId === acpSessionId ? modes : undefined,
-      Date.parse(record.updatedUtc), retained);
+      Date.parse(record.updatedUtc), retained,
+      capabilities?.sessionId === acpSessionId ? capabilities.capabilities ?? undefined : undefined);
+    if (capabilities?.sessionId !== acpSessionId) {
+      this.logger.warn({ sessionId: record.id, acpSessionId },
+        "retained session has no recorded prompt capabilities; attachments use the existing file fallback");
+    }
     return runtime;
   }
 
@@ -1662,10 +1669,13 @@ export class SessionRouter {
     // original request has no cursor; keep its existing persistence behavior.
     const { runtime, sessionId } = acquired;
     try {
-      const cfg = this.store.readConfig(record);
+      const cfg = this.store.readConfig(this.store.get(record.id) ?? record);
       const clearCursor = runtime.modelOverride === plan.model && cfg.modelAcquisition !== undefined;
-      if (record.acpSessionId !== sessionId || clearCursor) {
+      const capabilities = { sessionId, capabilities: runtime.getPromptCapabilities() ?? null };
+      const capabilitiesChanged = JSON.stringify(cfg.acpPromptCapabilities) !== JSON.stringify(capabilities);
+      if (record.acpSessionId !== sessionId || clearCursor || capabilitiesChanged) {
         if (clearCursor) delete cfg.modelAcquisition;
+        cfg.acpPromptCapabilities = capabilities;
         const updated = { ...record, acpSessionId: sessionId,
           configJson: JSON.stringify(cfg), updatedUtc: new Date().toISOString() };
         this.store.upsert(updated, { source: "SessionRouter.startRuntime", cause: "acquired provider session" });

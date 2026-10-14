@@ -196,7 +196,9 @@ export class ConfigApplyPlan {
   }
 
   async resolveRequestedRepoPath(location: string, requested: string): Promise<string> {
-    const root = this.bridgeHub?.get(location)?.host.workspaceRoot ?? this.config.REPOS_ROOT;
+    const root = this.bridgeHub?.get(location)?.host.workspaceRoot ??
+      (location === "local" ? this.config.REPOS_ROOT : undefined);
+    if (!root) throw new Error(`Host \`${location}\` did not report a workspace root.`);
     if (!path.isAbsolute(requested)) {
       const workspaces = await this.bridgeHub?.listWorkspaces(location) ?? [];
       const matched = workspaces.find(workspace => path.basename(workspace.path) === requested || workspace.path === requested);
@@ -510,19 +512,24 @@ export class ConfigApplyPlan {
     if (json === null && supplied.some(field => values[field] === "inherit" || values[field] === "__inherit__" ||
       (["effort", "card", "gif"].includes(field) && values[field] === "default") || (field === "role" && values[field] === "auto"))) {
       const changes: ThreadPresetChanges = {};
+      const requestedAgent = parseAgentAtLocation(values.agent ?? "");
+      const location = requestedAgent.explicit ? requestedAgent.location : resolveThreadLocation(this.config, channel.id);
       let permission: PermissionPolicyMode | undefined;
       for (const field of supplied) {
         const value = values[field]!.trim();
         const clear = value === "inherit" || value === "__inherit__" || (["effort", "card", "gif"].includes(field) && value === "default") || (field === "role" && value === "auto");
         if (field === "agent") {
-          const parsed = parseAgentAtLocation(value);
+          const parsed = requestedAgent;
           changes.agent = clear ? null : parsed.agentId;
           changes.location = clear ? null : parsed.explicit ? parsed.location : null;
           if (!supplied.includes("model")) changes.model = null;
           if (!supplied.includes("effort")) changes.effort = null;
         } else if (field === "repo") {
-          changes.cwd = clear ? null : await this.settings!.resolveRequestedRepoPath!(channel, value, resolveThreadLocation(this.config, channel.id));
-          const location = resolveThreadLocation(this.config, channel.id);
+          try {
+            changes.cwd = clear ? null : await this.settings!.resolveRequestedRepoPath!(channel, value, location);
+          } catch (err) {
+            return { ok: false, message: `Invalid repo: ${err instanceof Error ? err.message : String(err)}` };
+          }
           const root = this.bridgeHub?.get(location)?.host.workspaceRoot;
           if (changes.cwd && root && !isWithinRoot(changes.cwd, root)) return { ok: false, message: `Repo \`${changes.cwd}\` is outside host \`${location}\` workspace root (\`${root}\`).` };
         } else if (field === "card") {

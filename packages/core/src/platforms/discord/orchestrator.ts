@@ -5168,7 +5168,9 @@ export class Orchestrator {
       status.setState("Failed");
       status.setAction(this.renderer.trimShort(isSessionGoneError(err) ? "Session lost — please resend your message." : errMsg, 120));
       if (humanAttempt && humanOutcomeOwned && !humanDelivered) {
-        await this.adapter.sendMessage(channel, "The turn failed before its response was delivered.");
+        await this.adapter.sendMessage(channel, `The turn failed before its response was delivered.${
+          readErrorClassification(err)?.errorKind === "output_overflow" ? ` ${errMsg}` : ""
+        }`);
         // A captured successful output must remain deliverable even if a
         // later Discord/status operation failed.
         humanDelivered = this.store.turnAttempts.get(humanAttempt.id)?.outcome?.status === "failed";

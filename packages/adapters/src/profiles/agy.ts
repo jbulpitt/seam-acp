@@ -95,6 +95,7 @@ function agyKindFromCode(code: string): AdapterErrorKind {
     case "cancelled":
       return "cancelled";
     case "output_overflow":
+      return "output_overflow";
     case "protocol_error":
     case "not_settled":
     default:
@@ -1701,9 +1702,13 @@ class AgyAgent implements Agent {
       const childExit = classification?.exitCode !== undefined || classification?.signal !== undefined
         ? ` (child exit code=${classification.exitCode ?? "none"}, signal=${classification.signal ?? "none"})`
         : "";
+      const overflow = failure.overflow;
+      const message = overflow
+        ? `native AGY ${cause}: ${overflow.limit} ${(overflow.observedBytes / 1_048_576).toFixed(1)} MiB exceeds ${(overflow.limitBytes / 1_048_576).toFixed(1)} MiB limit`
+        : `native AGY ${cause}${childExit}`;
       throw RequestError.internalError(
         agyData(errorKind, safeEvidence),
-        `native AGY ${cause}${childExit}${failure.overflow ? `: ${failure.detail}` : ""}`,
+        message,
       );
     }
   }

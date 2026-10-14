@@ -32,6 +32,7 @@ export const ADAPTER_ERROR_KINDS = [
   "session_gone",
   "connection_closed",
   "protocol_error",
+  "output_overflow",
   "agent_exit",
   "host_oom",
   "overloaded",

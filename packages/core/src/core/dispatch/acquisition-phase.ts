@@ -55,7 +55,7 @@ export function isRetryableBootAcquisitionError(err: unknown): boolean {
     if ((current as { acquisitionRecoveryExhausted?: unknown }).acquisitionRecoveryExhausted === true) return false;
     const classification = readErrorClassification(current);
     if (classification && ["quota_exhausted", "auth_required", "auth_expired", "model_not_found",
-      "invalid_request", "permission_denied", "context_length", "capability_absent", "cancelled", "session_gone"].includes(classification.errorKind)) return false;
+      "invalid_request", "permission_denied", "context_length", "capability_absent", "cancelled", "session_gone", "output_overflow"].includes(classification.errorKind)) return false;
     const typed = current as { code?: unknown; name?: unknown; message?: unknown; cause?: unknown };
     if (typed.code === "session_load_timeout" || typed.name === "SessionLoadTimeoutError") return true;
     // #427: recognise the transport's own verdict structurally rather than by

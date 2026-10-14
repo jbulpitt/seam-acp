@@ -753,6 +753,27 @@ describe("#250 human turn production pipeline, synthetic transport only", () => 
     // claimed turn active with no visible refusal until a future restart.
   });
 
+  it("shows the complete native overflow cause in the Failed card and follow-up without retrying", async () => {
+    const h = setup();
+    const message = "Internal error: native AGY output_overflow: StreamAgentStateUpdates frame 64.0 MiB exceeds 64.0 MiB limit";
+    const overflow = { limit: "StreamAgentStateUpdates frame", limitBytes: 67_108_864, observedBytes: 67_108_865 };
+    h.runtime.prompt.mockRejectedValueOnce(Object.assign(new Error(message), {
+      data: { agentId: "agy", errorKind: "output_overflow", code: "output_overflow", overflow },
+    }));
+
+    await h.run();
+
+    expect(h.runtime.prompt).toHaveBeenCalledTimes(1);
+    expect(h.adapter.editPanel).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+      title: "Failed", fields: expect.arrayContaining([{ name: "Action", value: message, inline: true }]),
+    }));
+    expect(h.adapter.sendMessage).toHaveBeenCalledWith(expect.anything(),
+      `The turn failed before its response was delivered. ${message}`);
+    expect(h.adapter.sendMessage.mock.calls.filter(([, text]) => text.includes("Retrying"))).toEqual([]);
+    expect(h.store.turnAttempts.get("inbound-1")).toMatchObject({ state: "completed", deliveryDone: true,
+      outcome: { status: "failed", error: message } });
+  });
+
   it("captured output beats cutoff while delivery is held and never pays for a second turn", async () => {
     const h = setup();
     let release!: () => void; let entered!: () => void;

@@ -76,8 +76,8 @@ describe.sequential("R5 native production lifecycle", () => {
       const error = await f.runtime.prompt("r5-oversized-frame", undefined, { recoveryScope: "ephemeral" }).catch(error => error);
       expect(error.data).toMatchObject({ code: "output_overflow", errorKind: "output_overflow",
         overflow: { limit: "StreamAgentStateUpdates frame", observedBytes: 64 * 1024 * 1024 + 1, limitBytes: 64 * 1024 * 1024 } });
-      expect(error.message).toContain("StreamAgentStateUpdates frame");
-      expect(error.message).toContain(String(64 * 1024 * 1024 + 1));
+      expect(error.message).toBe("Internal error: native AGY output_overflow: StreamAgentStateUpdates frame 64.0 MiB exceeds 64.0 MiB limit");
+      expect(error.message.length).toBeLessThanOrEqual(120);
       expect(error.message).not.toContain(f.root);
       expect(error.message).not.toContain("synthetic-password");
       expect(f.events.filter(event => event.kind === "recovery")).toEqual([]);

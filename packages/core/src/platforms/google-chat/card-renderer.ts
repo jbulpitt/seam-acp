@@ -1,5 +1,6 @@
 import type { PanelButton, StructuredLayout, StructuredPanel } from "../../core/types.js";
 import type { ChoiceCardPost, ElicitationCardPost } from "../chat-adapter.js";
+import { choiceOptionList } from "../../core/choice/types.js";
 import { formatGoogleChatCardText } from "./card-text.js";
 import { googleChatStatusPanel } from "./status-panel.js";
 
@@ -59,6 +60,8 @@ export function renderGoogleChatLayout(layout: StructuredLayout, cardId: string)
 
 export function renderGoogleChatChoiceCard(card: ChoiceCardPost): GoogleChatCardsMessage {
   const controls: GoogleChatCardWidget[] = [];
+  const fullLabels = choiceOptionList(card.options);
+  if (fullLabels.length) controls.push(paragraph(fullLabels.join("\n\n")));
   if (!card.hideButtons) {
     if (card.select) {
       if (!card.disabled) {

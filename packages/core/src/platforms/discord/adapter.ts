@@ -83,6 +83,7 @@ import { clampPanelForDiscord } from "../../core/panel-limits.js";
 import {
   CHOICE_CUSTOM_ID_PREFIX,
   CHOICE_CUSTOM_TEXT_MAX,
+  choiceOptionList,
   makeChoiceConfirmId,
   makeChoiceCustomId,
   makeChoiceModalId,
@@ -97,9 +98,13 @@ import {
 import { sanitizeSpeakerName } from "../../core/agent-conventions.js";
 import {
   DISCORD_BUTTONS_PER_ROW,
+  DISCORD_BUTTON_LABEL_MAX,
+  DISCORD_SELECT_LABEL_MAX,
+  choiceBodyChunks,
   choicePickerLayout,
   choicePickerPageCaption,
   describeMultiSelectMenu,
+  describeChoiceOption,
   finalizeChoicePick,
   sliceChoicePage,
 } from "./choice-picker.js";
@@ -229,6 +234,7 @@ export function buildChoiceCardComponents(
         spec.options.map((o) => ({
           label: o.label,
           value: o.value,
+          ...(o.description ? { description: o.description } : {}),
           ...(o.default ? { default: true } : {}),
         }))
       );
@@ -253,12 +259,13 @@ export function buildChoiceCardComponents(
     allowCustom: customs.length > 0,
   });
   const rows: ActionRowBuilder<ButtonBuilder | StringSelectMenuBuilder>[] = [];
+  const numbered = choiceOptionList(card.options).length > 0;
 
   if (layout.useButtons) {
     const buttons = card.options.map((o, i) =>
       new ButtonBuilder()
         .setCustomId(makeChoiceCustomId(card.choiceId, i))
-        .setLabel(o.label.slice(0, 80))
+        .setLabel(describeChoiceOption(o.label, i, numbered, DISCORD_BUTTON_LABEL_MAX).label)
         .setStyle(o.kind === "custom" ? ButtonStyle.Primary : ButtonStyle.Secondary)
         .setDisabled(disabled)
     );
@@ -276,7 +283,7 @@ export function buildChoiceCardComponents(
       .setDisabled(disabled)
       .addOptions(
         prompts.map(({ o, i }) => ({
-          label: o.label.slice(0, 100),
+          ...describeChoiceOption(o.label, i, numbered, DISCORD_SELECT_LABEL_MAX),
           value: String(i),
         }))
       );
@@ -286,7 +293,7 @@ export function buildChoiceCardComponents(
         new ActionRowBuilder<ButtonBuilder>().addComponents(
           new ButtonBuilder()
             .setCustomId(makeChoiceCustomId(card.choiceId, i))
-            .setLabel(o.label.slice(0, 80))
+            .setLabel(describeChoiceOption(o.label, i, numbered, DISCORD_BUTTON_LABEL_MAX).label)
             .setStyle(ButtonStyle.Primary)
             .setDisabled(disabled)
         )
@@ -2209,7 +2216,9 @@ export class DiscordAdapter implements ChatAdapter {
     const ch = await this.fetchSendableChannel(channel.id);
     const embed = DiscordAdapter.buildEmbed(card.panel);
     const components = DiscordAdapter.buildChoiceComponents(card);
-    const sent = await ch.send({ embeds: [embed], components });
+    const chunks = choiceBodyChunks(card.options);
+    for (const content of chunks.slice(0, -1)) await ch.send({ content });
+    const sent = await ch.send({ ...(chunks.length ? { content: chunks.at(-1) } : {}), embeds: [embed], components });
     return { channel, id: sent.id, ...discordMessageLink(ch.guildId, channel.id, sent.id) };
   }
 
@@ -2218,7 +2227,7 @@ export class DiscordAdapter implements ChatAdapter {
     const msg = await ch.messages.fetch(message.id);
     const embed = DiscordAdapter.buildEmbed(card.panel);
     const components = DiscordAdapter.buildChoiceComponents(card);
-    await msg.edit({ content: "", embeds: [embed], components });
+    await msg.edit({ content: choiceBodyChunks(card.options).at(-1) ?? "", embeds: [embed], components });
   }
 
   async sendElicitationCard(

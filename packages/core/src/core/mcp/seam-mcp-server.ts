@@ -1600,7 +1600,7 @@ const TOOLS = [
         },
         options: {
           type: "array",
-          description: '1–25 options: { label, kind: "prompt"|"custom", payload?, target? }. prompt requires payload.',
+          description: '1–25 options: { label, kind: "prompt"|"custom", payload?, target? }. Labels may be up to 500 characters and are returned in full; prompt requires payload.',
         },
         select: {
           type: "object",

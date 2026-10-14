@@ -172,7 +172,9 @@ describe("#631 slots nobody owns", () => {
       const killed: number[] = [];
       const mux = {
         sendCmd: async () => ({ health: [
-          { slot: 1, alive: true }, { slot: 2, alive: true }, { slot: 3, alive: true }, { slot: 4, alive: false },
+          { slot: 1, alive: true }, { slot: 2, alive: true },
+          { slot: 3, alive: true, session: { agentId: "claude", acpSessionId: "orphan-acp", busy: false, updatedUtc: new Date().toISOString() } },
+          { slot: 4, alive: false },
         ] }),
         isBound: (slot: number) => slot === 1,
         sendFrame: (frame: { slot: number }) => killed.push(frame.slot),

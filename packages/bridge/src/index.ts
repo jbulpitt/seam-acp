@@ -230,6 +230,10 @@ async function makeSlotManager(opts: {
       wsSend({ slot: frame.slot, type: "recovery_result", recoveryResult: frame.recoveryResult, seq: frame.seq });
       return;
     }
+    if (frame.type === "session" && frame.session) {
+      wsSend({ slot: frame.slot, type: "session", session: frame.session, seq: frame.seq });
+      return;
+    }
     if (frame.type !== "exit") return;
     probes.close(frame.slot);
     const payload = stderrRegistry.exitPayload(frame.slot, frame.code ?? null, frame.signal ?? null);

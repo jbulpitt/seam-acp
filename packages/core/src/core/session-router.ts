@@ -6,6 +6,8 @@ import {
   type AgentClientMetadata,
   type CatalogModelEvidence,
   type ThreadIdentity,
+  type BridgeSlotHealth,
+  isRemoteRecoverySnapshot,
 } from "@seam/adapters";
 import type { Logger } from "../lib/logger.js";
 import type { SessionStore, SessionBindingChange } from "./session-store.js";
@@ -40,7 +42,7 @@ import { planModelFallbacks, type ModelFallbackPlan } from "./model-fallback.js"
 import type { ModelMetadataStore } from "./model-metadata/store.js";
 import { matchesContextBudget, validContextUsage } from "./context-budget.js";
 import { acquireWithModelFallback, matchingModelAcquisition } from "./model-acquisition.js";
-import { executionIdentity } from "./dispatch/execution-identity.js";
+import { executionIdentity, parseExecutionIdentity } from "./dispatch/execution-identity.js";
 
 export class DefaultAgentUnavailableError extends Error {
   constructor(message: string) {
@@ -1131,7 +1133,7 @@ export class SessionRouter {
     return ids.length;
   }
 
-  /** Dispose all runtimes (graceful shutdown / SIGTERM).
+  /** Detach all runtimes (graceful shutdown / SIGTERM).
    *  #76: MUST NOT clear turn-resume markers — shutdown is the event
    *  resume exists for. */
   async disposeAll(): Promise<void> {
@@ -1317,16 +1319,59 @@ export class SessionRouter {
     record: SessionRecord,
     child: Parameters<AgentRuntime["attachRecovery"]>[0],
     acpSessionId: string,
+    retained?: { busy: boolean },
   ): AgentRuntime {
     if (this.runtimes.has(record.id) || this.creationLocks.has(record.id) || this.retirements.has(record.id)) {
       throw new Error("thread runtime is already owned by this controller");
     }
+    const runtime = this.makeAttachedRuntime(record, this.planRuntimeSpawn(record), child, acpSessionId, retained);
+    this.runtimes.set(record.id, runtime);
+    return runtime;
+  }
+
+  /** Undefined means an older child has not supplied its session identity. */
+  retainedSlotSession(location: string, slot: BridgeSlotHealth): SessionRecord | null | undefined {
+    let identity = slot.session;
+    if (!identity && isRemoteRecoverySnapshot(slot.recovery)) {
+      const attempt = this.store.turnAttempts.findByRemoteSlot(location, slot.slot);
+      const execution = attempt && parseExecutionIdentity(attempt.identity);
+      if (attempt?.spec.session === "live" && execution && execution.location === location
+        && attempt.remoteRecovery?.acpSessionId === slot.recovery.acpSessionId) {
+        identity = { agentId: execution.agent, acpSessionId: slot.recovery.acpSessionId,
+          threadId: attempt.spec.target, busy: !["succeeded", "exhausted"].includes(slot.recovery.phase),
+          updatedUtc: slot.recovery.updatedUtc };
+      } else return this.store.findByAcpSessionId(slot.recovery.acpSessionId)
+        .some(record => this.describeConfig(record).location.value === location) ? undefined : null;
+    }
+    if (!identity) return undefined;
+    return this.store.findByAcpSessionId(identity.acpSessionId).find(record => {
+      const described = this.describeConfig(record);
+      return described.agent.value === identity.agentId && described.location.value === location
+        && (!identity.threadId || record.channelRef === identity.threadId);
+    }) ?? null;
+  }
+
+  rebindRetainedSlot(record: SessionRecord, slot: BridgeSlotHealth): AgentRuntime | undefined {
+    const cached = this.runtimes.get(record.id);
+    if (cached || this.creationLocks.has(record.id) || this.retirements.has(record.id)) return cached;
     const plan = this.planRuntimeSpawn(record);
+    const mux = this.executionBridge?.muxForSession(record.id);
+    if (!mux?.adopt || mux.isBound?.(slot.slot)) return undefined;
+    const busy = slot.session?.busy ?? !!(slot.recovery && !["succeeded", "exhausted"].includes(slot.recovery.phase));
+    const child = mux.adopt(slot.slot, { allowAppTraffic: true, afterSeq: slot.outputAckedThrough });
+    try {
+      const runtime = this.adoptRecoveryRuntime(record, child, record.acpSessionId, { busy });
+      this.logger.info({ sessionId: record.id, location: plan.location, slot: slot.slot }, "reattached retained session");
+      return runtime;
+    } catch (error) { child.detach?.(); throw error; }
+  }
+
+  private makeAttachedRuntime(record: SessionRecord, plan: RuntimeSpawnPlan,
+    child: Parameters<AgentRuntime["attachRecovery"]>[0], acpSessionId: string, retained?: { busy: boolean }): AgentRuntime {
     const runtime = this.makeRuntime(record, plan, plan.model, plan.effort);
     const modes = this.store.readConfig(this.store.get(record.id) ?? record).codexModes;
     runtime.attachRecovery(child, acpSessionId, modes?.sessionId === acpSessionId ? modes : undefined,
-      Date.parse(record.updatedUtc));
-    this.runtimes.set(record.id, runtime);
+      Date.parse(record.updatedUtc), retained);
     return runtime;
   }
 
@@ -1552,6 +1597,17 @@ export class SessionRouter {
 
   private async startRuntime(record: SessionRecord, recovery?: { resumeSessionId: string }): Promise<AgentRuntime> {
     const plan = this.planRuntimeSpawn(record);
+    const mux = this.executionBridge?.muxForSession(record.id);
+    if (record.acpSessionId && mux?.adopt && plan.bridgeHealth?.sendCmd) {
+      const reply = await plan.bridgeHealth.sendCmd("listSlots", {}) as { health?: BridgeSlotHealth[] };
+      const slot = reply.health?.find(row => row.alive && this.retainedSlotSession(plan.location, row)?.id === record.id);
+      if (slot) {
+        const child = mux.adopt(slot.slot, { allowAppTraffic: true, afterSeq: slot.outputAckedThrough });
+        const busy = slot.session?.busy ?? !!(slot.recovery && !["succeeded", "exhausted"].includes(slot.recovery.phase));
+        try { return this.makeAttachedRuntime(record, plan, child, record.acpSessionId, { busy }); }
+        catch (error) { child.detach(); throw error; }
+      }
+    }
     const identity = { agentId: plan.agentId, location: plan.location, requestedModel: plan.model,
       effort: plan.effort, cwd: plan.cwd, acpSessionId: recovery?.resumeSessionId ?? record.acpSessionId };
     const matched = matchingModelAcquisition(this.store.readConfig(record).modelAcquisition, identity);
@@ -1750,13 +1806,8 @@ export class SessionRouter {
     // Claim retirement synchronously before dispose yields. getOrStartRuntime
     // sees the barrier and cannot overlap a new process with the old one.
     this.runtimes.delete(sessionId);
-    // Durable bridge ownership outlives the local prompt, including parks.
-    const detach = reason === "shutdown" && (rt.hasDelegatedTurnInFlight()
-      || (["active", "suspended"] as const).some(state => this.store.turnAttempts.list(state).some(attempt =>
-        attempt.spec.session === "live" && attempt.spec.target === this.store.get(sessionId)?.channelRef
-        && attempt.remoteRecovery?.acpSessionId === rt.getSessionInfo()?.sessionId
-        && attempt.remoteRecovery?.slot !== undefined && attempt.remoteRecovery.slot === rt.getSlot())));
-    if (detach) this.logger.info({ sessionId }, "shutdown: leaving the owned turn on its bridge");
+    const detach = reason === "shutdown";
+    if (detach) this.logger.info({ sessionId }, "shutdown: detaching the retained session from this controller");
     let retirement!: Promise<void>;
     retirement = (detach ? rt.detach() : rt.dispose())
       .catch((err) => {

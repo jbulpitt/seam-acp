@@ -122,11 +122,10 @@ function start(config: AdapterChildBootstrap): void {
     },
     publishOutput: (_slot, data) => publish({ v: ADAPTER_CHILD_PROTOCOL_VERSION, type: "data", data }),
     write: (_slot, line) => writeAgent(line),
-    publishSnapshot: (_slot, snapshot) => publish({
-      v: ADAPTER_CHILD_PROTOCOL_VERSION,
-      type: "recovery",
-      recovery: snapshot,
-    }),
+    publishSnapshot: (_slot, snapshot) => {
+      publish({ v: ADAPTER_CHILD_PROTOCOL_VERSION, type: "recovery", recovery: snapshot });
+      publishSession();
+    },
     publishResult: (_slot, result) => {
       publish({
         v: ADAPTER_CHILD_PROTOCOL_VERSION,
@@ -136,6 +135,40 @@ function start(config: AdapterChildBootstrap): void {
       resumeRecord.clear();
     },
   });
+
+  // A loaded warm session need not have a delegated turn/recovery record.
+  let acpSessionId = config.resume?.load.sessionId;
+  const sessionRequests = new Map<unknown, string | undefined>();
+  const promptRequests = new Set<unknown>();
+  const publishSession = (): void => {
+    if (!acpSessionId) return;
+    const snapshot = recovery.snapshot(config.slot);
+    publish({ v: ADAPTER_CHILD_PROTOCOL_VERSION, type: "session", session: {
+      agentId: config.config.agentId ?? "copilot", acpSessionId,
+      ...(config.config.threadIdentity ? { threadId: config.config.threadIdentity.threadId } : {}),
+      busy: promptRequests.size > 0 || !!(snapshot && !["succeeded", "exhausted"].includes(snapshot.phase)),
+      updatedUtc: new Date().toISOString(),
+    } });
+  };
+  const observeSession = (line: string, input: boolean): void => {
+    let message;
+    try { message = JSON.parse(line); } catch { return; }
+    if (input) {
+      if (message.method === "session/new" || message.method === "session/load") {
+        sessionRequests.set(message.id, message.params?.sessionId);
+      } else if (message.method === "session/prompt") {
+        promptRequests.add(message.id);
+        publishSession();
+      }
+    } else if ("result" in message || "error" in message) {
+      if (sessionRequests.has(message.id)) {
+        const id = sessionRequests.get(message.id) ?? message.result?.sessionId;
+        sessionRequests.delete(message.id);
+        if (!message.error && typeof id === "string") { acpSessionId = id; publishSession(); }
+      }
+      if (promptRequests.delete(message.id)) publishSession();
+    }
+  };
 
   // #631: relaunched after a host restart. Bring the agent back to the same
   // session, then continue the interrupted turn under its original request id.
@@ -191,6 +224,7 @@ function start(config: AdapterChildBootstrap): void {
   child.stdout?.on("data", (chunk: Buffer | string) => {
     for (const line of agentOutput.push(chunk.toString())) {
       const decision = recovery.observeOutput(config.slot, line);
+      observeSession(line, false);
       if (resumeOutput(line)) continue;
       resumeRecord.observeOutput(line);
       permissions.observeOutput(line);
@@ -268,6 +302,7 @@ function start(config: AdapterChildBootstrap): void {
       publish({ v: ADAPTER_CHILD_PROTOCOL_VERSION, type: "control_result", requestId: message.requestId,
         ok: true, result: recovery.reconcile(config.slot, message, resuming !== undefined) });
     } else if (message.type === "report_recovery") {
+      publishSession();
       const snapshot = recovery.snapshot(config.slot);
       if (snapshot) publish({ v: ADAPTER_CHILD_PROTOCOL_VERSION, type: "recovery", recovery: snapshot });
       const result = recovery.terminalResult(config.slot);
@@ -295,6 +330,7 @@ function start(config: AdapterChildBootstrap): void {
           ? { from: config.config.requestedCwd, to: config.config.cwd } : undefined);
       if (!permissions.observeInput(line)) continue;
       recovery.observeInput(config.slot, line);
+      observeSession(line, true);
       resumeRecord.observeInput(line);
       resumeRecord.record(recovery.resumable(config.slot));
       if (!writeAgent(line)) exitWithRefusal("agent stdin is closed; input could not be delivered");

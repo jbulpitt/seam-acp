@@ -27,6 +27,7 @@ vi.mock("../packages/core/src/agents/agent-runtime.js", async (importOriginal) =
       busy = false;
       lastActivityAtMs = Date.now();
       disposed = false;
+      detached = false;
       disposeWait?: Promise<void>;
       loadCalls: Array<{ sessionId: string }> = [];
       newCalls = 0;
@@ -56,6 +57,7 @@ vi.mock("../packages/core/src/agents/agent-runtime.js", async (importOriginal) =
         if (this.disposeWait) await this.disposeWait;
         this.disposed = true;
       }
+      async detach(): Promise<void> { this.detached = true; }
     },
   };
 });

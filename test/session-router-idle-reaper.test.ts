@@ -164,7 +164,7 @@ describe("SessionRouter shared session fork (#631)", () => {
 });
 
 describe("SessionRouter shutdown (#631)", () => {
-  it("leaves a delegated in-flight turn running and disposes idle runtimes", async () => {
+  it("detaches both delegated in-flight turns and idle runtimes", async () => {
     const running = makeRecord();
     const idle = { ...makeRecord(), id: "discord:idle-2", channelRef: "idle-2", acpSessionId: "acp-durable-2" };
     const store = makeStore(running);
@@ -175,13 +175,13 @@ describe("SessionRouter shutdown (#631)", () => {
     runtimeState.instances[0]!.delegated = true;
     await router.disposeAll();
     expect(runtimeState.instances[0]).toMatchObject({ detached: true, disposed: false });
-    expect(runtimeState.instances[1]).toMatchObject({ detached: false, disposed: true });
+    expect(runtimeState.instances[1]).toMatchObject({ detached: true, disposed: false });
   });
 
   const cleanups: Array<() => void> = [];
   afterEach(() => { for (const cleanup of cleanups.splice(0).reverse()) cleanup(); });
 
-  it.each(["active", "suspended", "completed", "cancelled"] as const)("retires an idle runtime according to its %s bridge-owned attempt", async state => {
+  it.each(["active", "suspended", "completed", "cancelled"] as const)("detaches an idle runtime with a %s bridge-owned attempt", async state => {
     const dir = mkdtempSync(path.join(tmpdir(), "seam-owned-shutdown-"));
     cleanups.push(() => rmSync(dir, { recursive: true, force: true }));
     const store = new SessionStore(path.join(dir, "test.db"));
@@ -205,8 +205,7 @@ describe("SessionRouter shutdown (#631)", () => {
     runtimeState.instances[0]!.slot = 65;
     expect(runtimeState.instances[0]!.delegated).toBe(false);
     await router.disposeAll();
-    const retained = state === "active" || state === "suspended";
-    expect(runtimeState.instances[0]).toMatchObject({ detached: retained, disposed: !retained });
+    expect(runtimeState.instances[0]).toMatchObject({ detached: true, disposed: false });
     expect(store.turnAttempts.get("owned")).toMatchObject({ state, generation: 1,
       remoteRecovery: { slot: 65, submissionId: "owned-submission" } });
   });

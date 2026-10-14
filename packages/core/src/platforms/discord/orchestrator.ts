@@ -64,6 +64,7 @@ import type {
 import { AgentRuntime, type AgentEventHandler, type PromptOutcome } from "../../agents/agent-runtime.js";
 import {
   isRemoteRecoverySnapshot,
+  type BridgeSlotHealth,
   attachErrorClassification,
   readErrorClassification,
   resolveError,
@@ -3366,25 +3367,7 @@ export class Orchestrator {
     );
   }
 
-  /**
-   * Phase two of shutdown (#174), run AFTER `router.disposeAll()`.
-   *
-   * Disposal is not passive: killing an agent rejects its in-flight turn, and
-   * those rejections run cleanup that settles cards, releases queues, and
-   * registers fresh post-turn continuations. A single `setImmediate` yield is
-   * not a barrier for that — the work can span multiple awaits and I/O.
-   *
-   * It waits for exactly what phase 1 waits for, deliberately: phase 1 may have
-   * TIMED OUT, and `disposeAll()` is then the thing that forces those wedged
-   * turns to finish. A phase-2 barrier that watched less than phase 1 would be
-   * blind to precisely the work disposal just released. That is not
-   * hypothetical — an ISOLATED dispatch has no channel queue and no tracked
-   * continuation (see `dispatchInjectTurn`; it is counted in `activeTurns` and
-   * lives in the watcher's own queue), so a phase 2 built from
-   * `channelQueues` + continuations alone would return with the done-file
-   * unwritten and close the store on top of it. That is the original #174 race,
-   * one phase later.
-   */
+  /** Join all callbacks released by controller transport detach before closing resources. */
   async drainAfterDispose(opts: { timeoutMs?: number; clock?: DeadlineClock } = {}): Promise<QuiesceOutcome> {
     return this.runBoundedDrain(
       "post-dispose",
@@ -7198,13 +7181,6 @@ export class Orchestrator {
     for (let attempt = 1; ; attempt++) {
       assertCurrent();
       try {
-        const savedSessionId = resumeSessionId ?? record.acpSessionId;
-        if (savedSessionId && this.bridgeHub?.muxFor && this.router.hasRuntime(record.id) === false) {
-          const described = this.router.describeConfig(record);
-          await this.retireUnownedSessionSlots(described.location.value,
-            savedSessionId, described.agent.value, assertCurrent);
-          assertCurrent();
-        }
         const runtime = await (resumeSessionId
           ? this.router.getOrStartRuntime(record, { resumeSessionId }, assertCurrent)
           : this.router.getOrStartRuntime(record, undefined, assertCurrent));
@@ -15879,28 +15855,32 @@ export class Orchestrator {
     }
   }
 
-  /**
-   * #631: slots now outlive controllers, so a slot nobody owns would run and
-   * hold memory forever: a detached turn whose attempt ended elsewhere, or a
-   * slot relaunched after a restart for a turn that was since cancelled. A
-   * minute and a half after a bridge is ready (after adoption has had its
-   * chance), stop every live slot this controller neither has bound nor has a
-   * suspended delegated turn for.
-   */
+  /** Rebind retained sessions; reap only proven orphans after adoption's grace. */
   sweepUnownedSlots(location: string): void {
     setTimeout(() => {
       const mux = this.bridgeHub?.muxFor(location);
       if (!mux) return;
       void (async () => {
-        const reply = await mux.sendCmd("listSlots", {}) as { health?: Array<{ slot?: unknown; alive?: unknown }> };
+        const reply = await mux.sendCmd("listSlots", {}) as { health?: BridgeSlotHealth[] };
         for (const row of reply.health ?? []) {
           if (row.alive !== true || typeof row.slot !== "number") continue;
           if (this.slotHasTurnOwner(location, row.slot)) continue;
-          this.logger.warn({ location, slot: row.slot }, "stopping a slot no turn owns");
+          const record = this.router.retainedSlotSession(location, row);
+          if (record) {
+            this.router.rebindRetainedSlot(record, row);
+            continue;
+          }
+          if (record === undefined) {
+            this.logger.warn({ location, slot: row.slot, cause: "the retained slot's complete ACP/session identity is unavailable" },
+              "retaining a slot whose session owner is unknown");
+            continue;
+          }
+          this.logger.warn({ location, slot: row.slot, cause: "no session record matches this slot's ACP, agent and host identity" },
+            "stopping an orphaned slot");
           mux.sendFrame({ slot: row.slot, type: "kill" });
         }
         await this.retireReconciledDeadSlots(location, reply.health ?? []);
-      })().catch((err) => this.logger.debug({ err, location }, "unowned-slot sweep skipped"));
+      })().catch((err) => this.logger.warn({ err, location }, "retained-session reconciliation failed"));
     }, 90_000).unref?.();
   }
 
@@ -15936,15 +15916,16 @@ export class Orchestrator {
     if (!sessionId) return;
     const mux = this.bridgeHub?.muxFor?.(location);
     if (!mux) return;
-    const reply = await mux.sendCmd("listSlots", {}) as { health?: Array<{
-      slot: number; alive?: boolean; recovery?: unknown;
-    }> };
+    const reply = await mux.sendCmd("listSlots", {}) as { health?: BridgeSlotHealth[] };
     assertCurrent();
     for (const row of reply.health ?? []) {
       if (row.alive !== true || !isRemoteRecoverySnapshot(row.recovery)
         || row.recovery.acpSessionId !== sessionId
         || !["succeeded", "exhausted"].includes(row.recovery.phase)
         || this.slotHasTurnOwner(location, row.slot)) continue;
+      const record = this.router.retainedSlotSession(location, row);
+      if (record) { this.router.rebindRetainedSlot(record, row); continue; }
+      if (record === undefined) continue;
       this.logger.info({ location, slot: row.slot, sessionId }, "retiring an unowned session writer before load");
       const stopped = await this.stopLingeringSlot(location, row.slot, () => {
         assertCurrent();

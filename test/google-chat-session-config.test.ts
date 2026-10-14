@@ -19,6 +19,7 @@ vi.mock("../packages/core/src/agents/agent-runtime.js", async importOriginal => 
   return { ...actual, AgentRuntime: class {
     busy = false;
     disposed = false;
+    detached = false;
     sessionId = "";
     lastActivityAtMs = Date.now();
     modelOverride?: string;
@@ -38,6 +39,7 @@ vi.mock("../packages/core/src/agents/agent-runtime.js", async importOriginal => 
     getSessionInfo() { return { sessionId: this.sessionId, currentModelId: this.modelOverride }; }
     hasDelegatedTurnInFlight() { return false; }
     async dispose() { this.disposed = true; }
+    async detach() { this.detached = true; }
     async setModel(model: string) { this.modelOverride = model; }
     async setConfigOption(_id: string, value: string) { this.effortOverride = value; }
     getConfigSelectValues() { return ["low", "high", "provider-special"]; }

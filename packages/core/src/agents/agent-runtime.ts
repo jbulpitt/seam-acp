@@ -485,6 +485,7 @@ export class AgentRuntime {
   /** True while a `session/prompt` is awaiting a response — lets the abort path
    *  tell whether a graceful cancel actually ended the turn before escalating. */
   private promptInFlight = false;
+  private retainedPromptCompletion?: Promise<void>;
   private providerReplyGate?: CodexReplyGate;
   private sessionFailuresSupported = false;
   /** The bridge owns this in-flight turn's result (#467); set while it runs. */
@@ -683,13 +684,30 @@ export class AgentRuntime {
 
   /** Reattach the application side while the bridge retains prompt ownership. */
   attachRecovery(child: ReturnType<AgentProfile["spawn"]>, sessionId: string,
-    modes?: Pick<SessionInfo, "availableModes" | "currentModeId">, lastActivityAtMs?: number): void {
+    modes?: Pick<SessionInfo, "availableModes" | "currentModeId">, lastActivityAtMs?: number,
+    retained?: { busy: boolean }): void {
     if (this.connection || this.child) throw new Error("runtime is already attached");
     this.child = child;
     this.sessionId = sessionId;
     this.sessionInfo = { sessionId, availableModels: [], availableModes: [], ...modes };
-    this.promptInFlight = true;
-    this.delegatedTurn = true;
+    this.promptInFlight = retained?.busy ?? true;
+    this.delegatedTurn = retained === undefined;
+    if (retained?.busy) {
+      this.retainedPromptCompletion = new Promise<void>(resolve => {
+        const finish = () => {
+          this.promptInFlight = false;
+          this.retainedPromptCompletion = undefined;
+          child.removeListener("remoteSession", settled);
+          child.removeListener("exit", finish);
+          resolve();
+        };
+        const settled = (session: { acpSessionId: string; busy: boolean }) => {
+          if (session.acpSessionId === sessionId && !session.busy) finish();
+        };
+        child.on("remoteSession", settled);
+        child.once("exit", finish);
+      });
+    }
     if (lastActivityAtMs !== undefined && Number.isFinite(lastActivityAtMs)) this.lastActivityMs = lastActivityAtMs;
 
     Object.assign(child, { remoteRung1Recovery: true });
@@ -1323,6 +1341,7 @@ export class AgentRuntime {
     attachments?: ReadonlyArray<MessageAttachment>,
     opts?: PromptOptions
   ): Promise<PromptOutcome> {
+    await this.retainedPromptCompletion;
     const conn = this.requireConnection();
     const sid = this.requireSessionId();
     await this.applyPermissionMode();
@@ -2154,12 +2173,13 @@ export class AgentRuntime {
 
   /**
    * Release this controller's side and leave the agent running. Used at
-   * controller shutdown for a delegated turn: the bridge keeps the turn going
+   * controller shutdown: the bridge keeps the session and any turn going
    * and captures its result, and the next controller adopts it (#631). No
    * cancel and no kill reach the agent.
    */
   async detach(): Promise<void> {
     this.detached = true;
+    this.recoveryAbort?.abort();
     const child = this.child as { detach?: () => void } | undefined;
     child?.detach?.();
     this.transportConnection?.close();

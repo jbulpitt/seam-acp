@@ -59,6 +59,8 @@ export type MuxSpawnedProcess = ChildProcessByStdio<Writable, Readable, Readable
 
 /** Subset of makeMux() used to spawn a remote slot. */
 export interface MuxHandle {
+  adopt?: (slot: number, options: { allowAppTraffic: boolean; afterSeq?: number }) => MuxSpawnedProcess & { detach(): void };
+  isBound?: (slot: number) => boolean;
   spawn(opts?: {
     holdStdinUntilReady?: boolean;
   }): MuxSpawnedProcess;

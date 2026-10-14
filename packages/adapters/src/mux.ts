@@ -77,19 +77,15 @@ const MAX_CONSECUTIVE_PARSE_FAILURES = 3;
  * The bridge's spawn handler does pure config work and launches nothing, so a
  * 30s wait there was never measuring slowness.
  */
-/**
- * What the bridge directly observes about one slot (#442).
- *
- * Deliberately has no `midTurn`. The bridge is a byte mux: it forwards frames
- * and never parses ACP, so it cannot see a `session/prompt` begin or end. It
- * would have to INFER mid-turn from "stdin arrived and stdout has not", which
- * is the mistake the manifesto names — when the authoritative fact exists
- * somewhere, do not re-derive it somewhere else. seam-acp holds that fact.
- *
- * So the bridge reports what it can see, and `lastStdinMsAgo` is the piece
- * that makes the seam-acp-side judgement possible: silence since input is
- * suspicious, silence with no input is just idle.
- */
+/** ACP identity reported by the surviving adapter child, not inferred from silence. */
+export interface BridgeSessionSnapshot {
+  agentId: string;
+  acpSessionId: string;
+  threadId?: string;
+  busy: boolean;
+  updatedUtc: string;
+}
+
 export interface BridgeSlotHealth {
   slot: number;
   alive: boolean;
@@ -99,6 +95,7 @@ export interface BridgeSlotHealth {
   lastStdinMsAgo: number | null;
   /** Child-owner facts, never inferred from socket state or silence (#467). */
   recovery?: RemoteRecoverySnapshot;
+  session?: BridgeSessionSnapshot;
   /** Highest stdout frame acknowledged by the prior controller. */
   outputAckedThrough?: number;
 }
@@ -166,6 +163,7 @@ interface MuxMsg {
     | "event"
     | "recovery"
     | "recovery_result"
+    | "session"
     | "ping"
     | "pong"
     | "bridge_hello";
@@ -191,6 +189,7 @@ interface MuxMsg {
   name?: string;
   recovery?: RemoteRecoverySnapshot;
   recoveryResult?: RemoteRecoveryResult;
+  session?: BridgeSessionSnapshot;
 }
 
 interface SlotEntry {
@@ -644,6 +643,7 @@ export function makeMux(opts: {
                   hostOom?: RemoteHostOomEvidence;
                   recovery?: RemoteRecoverySnapshot;
                   recoveryResult?: RemoteRecoveryResult;
+                  session?: BridgeSessionSnapshot;
                 }>;
                 gap?: { afterSeq: number; firstAvailableSeq: number; droppedFrames: number };
               }) => {
@@ -653,6 +653,8 @@ export function makeMux(opts: {
                 // consumer sees the discontinuity in the right order rather
                 // than discovering it after acting on what followed.
                 if (reply?.gap) opts.onOutputGap?.(slot, reply.gap);
+                // Session snapshots are current state, not historical completions.
+                const sessionFrame = reply?.frames?.findLast(frame => frame.type === "session" && frame.session);
                 for (const frame of reply?.frames ?? []) {
                   if (frame.type === "data" && typeof frame.data === "string") {
                     if (typeof frame.seq === "number") outputCursor.set(slot, frame.seq);
@@ -667,6 +669,9 @@ export function makeMux(opts: {
                   } else if (frame.type === "recovery_result" && isRemoteRecoveryResult(frame.recoveryResult)) {
                     if (typeof frame.seq === "number") outputCursor.set(slot, frame.seq);
                     live.fake.emit("remoteRecoveryResult", frame.recoveryResult);
+                  } else if (frame.type === "session" && frame.session) {
+                    if (typeof frame.seq === "number") outputCursor.set(slot, frame.seq);
+                    if (frame === sessionFrame) live.fake.emit("remoteSession", frame.session);
                   } else if (frame.type === "exit") {
                     applyRemoteExit(slot, live, frame);
                   }
@@ -755,6 +760,9 @@ export function makeMux(opts: {
       } else if (msg.type === "recovery_result" && isRemoteRecoveryResult(msg.recoveryResult)) {
         if (typeof msg.seq === "number") outputCursor.set(msg.slot, msg.seq);
         entry.fake.emit("remoteRecoveryResult", msg.recoveryResult);
+      } else if (msg.type === "session" && msg.session) {
+        if (typeof msg.seq === "number") outputCursor.set(msg.slot, msg.seq);
+        entry.fake.emit("remoteSession", msg.session);
       } else if (msg.type === "exit") {
         applyRemoteExit(msg.slot, entry, msg);
       }
@@ -891,6 +899,7 @@ export function makeMux(opts: {
     if (slots.has(slot)) throw new Error(`slot ${slot} is already bound in this controller`);
     nextSlot = Math.max(nextSlot, slot + 1);
     const child = bindSlot(slot, undefined, false, options.allowAppTraffic === true);
+    const entry = slots.get(slot)!;
     const afterSeq = Number.isSafeInteger(options.afterSeq) && options.afterSeq! >= 0
       ? options.afterSeq!
       : 0;
@@ -898,8 +907,7 @@ export function makeMux(opts: {
     // Replay begins after this function returns, so the caller can attach its
     // result listener first. A missing/old bridge refuses this adoption only.
     queueMicrotask(() => {
-      const entry = slots.get(slot);
-      if (!entry || entry.killed) return;
+      if (slots.get(slot) !== entry || entry.killed) return;
       void sendCmd("replayOutput", { slot, afterSeq }).then((reply: {
         frames?: Array<{
           seq?: number;
@@ -910,12 +918,15 @@ export function makeMux(opts: {
           hostOom?: RemoteHostOomEvidence;
           recovery?: RemoteRecoverySnapshot;
           recoveryResult?: RemoteRecoveryResult;
+          session?: BridgeSessionSnapshot;
         }>;
         gap?: { afterSeq: number; firstAvailableSeq: number; droppedFrames: number };
       }) => {
         const live = slots.get(slot);
-        if (!live || live.killed) return;
+        // A detached replay cannot affect a later binding of this slot.
+        if (live !== entry || live.killed) return;
         if (reply?.gap) opts.onOutputGap?.(slot, reply.gap);
+        const sessionFrame = reply?.frames?.findLast(frame => frame.type === "session" && frame.session);
         for (const frame of reply?.frames ?? []) {
           if (frame.type === "data" && typeof frame.data === "string") {
             if (typeof frame.seq === "number") outputCursor.set(slot, frame.seq);
@@ -927,6 +938,9 @@ export function makeMux(opts: {
           } else if (frame.type === "recovery_result" && isRemoteRecoveryResult(frame.recoveryResult)) {
             if (typeof frame.seq === "number") outputCursor.set(slot, frame.seq);
             live.fake.emit("remoteRecoveryResult", frame.recoveryResult);
+          } else if (frame.type === "session" && frame.session) {
+            if (typeof frame.seq === "number") outputCursor.set(slot, frame.seq);
+            if (frame === sessionFrame) live.fake.emit("remoteSession", frame.session);
           } else if (frame.type === "exit") {
             applyRemoteExit(slot, live, frame);
           }
@@ -934,7 +948,7 @@ export function makeMux(opts: {
         const through = outputCursor.get(slot);
         if (through) void sendCmd("ackOutput", { slot, throughSeq: through }).catch(() => {});
       }).catch((error) => {
-        child.emit("error", error);
+        if (slots.get(slot) === entry && !entry.killed) child.emit("error", error);
       });
     });
     return child;

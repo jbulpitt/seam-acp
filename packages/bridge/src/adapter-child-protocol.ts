@@ -1,6 +1,7 @@
 import type {
   RemoteRecoveryResult,
   RemoteRecoverySnapshot,
+  BridgeSessionSnapshot,
 } from "@seam/adapters";
 import type { SlotSpawnConfig } from "./rpc.js";
 import type { PermissionIdentity } from "./pending-permissions.js";
@@ -79,6 +80,11 @@ export type AdapterChildInput =
 export type AdapterChildOutput =
   | {
       v: typeof ADAPTER_CHILD_PROTOCOL_VERSION;
+      type: "session";
+      session: BridgeSessionSnapshot;
+    }
+  | {
+      v: typeof ADAPTER_CHILD_PROTOCOL_VERSION;
       type: "data";
       data: string;
     }
@@ -121,6 +127,9 @@ export function parseAdapterChildOutput(line: string): AdapterChildOutput | unde
     const value = JSON.parse(line) as Partial<AdapterChildOutput>;
     if (value.v !== ADAPTER_CHILD_PROTOCOL_VERSION) return undefined;
     if (value.type === "data" && typeof value.data === "string") return value as AdapterChildOutput;
+    if (value.type === "session" && value.session && typeof value.session.acpSessionId === "string") {
+      return value as AdapterChildOutput;
+    }
     if (value.type === "recovery" && value.recovery && typeof value.recovery === "object") {
       return value as AdapterChildOutput;
     }

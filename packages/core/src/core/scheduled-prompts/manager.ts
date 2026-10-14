@@ -14,6 +14,7 @@ import type { ScheduledPrompt } from "./types.js";
 import { scheduledOccurrenceKey, type ScheduledOccurrenceKey, type ScheduledExecutionIdentity } from "./occurrence-store.js";
 import { legacyAttachmentQuarantine, legacyAttachmentStatus } from "./quarantine.js";
 import type { Logger } from "../../lib/logger.js";
+import { isAwaitingReauth, reauthWaitingStatus } from "../reauth-negotiation.js";
 
 export interface ScheduledPromptManagerOpts {
   store: SessionStore;
@@ -227,7 +228,15 @@ export class ScheduledPromptManager {
       const intent = this.store.scheduledOccurrences.reserve(occurrence, current);
       admitted = intent !== null;
       onAdmittedOrSkipped?.(); // committed intent or intentional durable overlap skip
-      if (!intent) { this.patchRow(id, { lastStatus: "skipped: still running" }); return; }
+      if (!intent) {
+        const pending = this.store.scheduledOccurrences.pending().find(row => row.scheduleId === id);
+        const attempt = pending && this.store.turnAttempts.get(pending.id);
+        if (attempt?.state === "suspended" && isAwaitingReauth(attempt.stalledReason)) {
+          this.patchRow(id, { lastStatus: reauthWaitingStatus(attempt, current.timezone) });
+          await this.onFire(id, pending!);
+        } else this.patchRow(id, { lastStatus: "skipped: still running" });
+        return;
+      }
       if (intent.settled) return;
       const prepared = this.store.scheduledOccurrences.prepare(occurrence, intent.row, this.resolveExecution);
       if (!prepared) { this.patchRow(id, { lastStatus: "retained: scheduled identity unavailable" }); return; }

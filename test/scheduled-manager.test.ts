@@ -49,6 +49,7 @@ function makeStore(row: ScheduledPrompt) {
   const upserts: ScheduledPrompt[] = [];
   const store = {
     scheduledOccurrences: scheduledAdmissionFixture(),
+    turnAttempts: { get: () => null },
     getScheduled: (id: string) => (id === row.id ? { ...row } : null),
     upsertScheduled: (s: ScheduledPrompt) => {
       upserts.push(s);

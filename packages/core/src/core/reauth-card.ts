@@ -6,10 +6,8 @@
  * interrupted. The option payload names the attempt. It is not a prompt, and
  * it does not carry the device code or the original brief.
  *
- * There is no auto-fire. Continuing before someone accepts would send the
- * parked turn before authentication. A watch is not armed: `workProgress`
- * already says whether work is executing, and a watch that fired this accept
- * would continue the turn on a timer.
+ * Automatic checks use the same recorded-session continuation as the button.
+ * A failed check keeps this human card open; it does not enqueue another turn.
  */
 import type { ChoiceSpec } from "./choice/types.js";
 import { parkedTurnPayload } from "./parked-turn-card.js";

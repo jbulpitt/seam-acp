@@ -649,7 +649,10 @@ async function main(): Promise<void> {
   });
   orchestrator.setBridgeHub(bridgeHub);
   stopBridgeUpdates = await installBridgeUpdater(bridgeHub, logger);
-  stopPermissionBridgeRecovery = bridgeHub.onBridgeReady(location => orchestrator.recoverPermissionCards(location));
+  stopPermissionBridgeRecovery = bridgeHub.onBridgeReady(location => {
+    orchestrator.recoverPermissionCards(location);
+    void orchestrator.recoverReauth(location).catch(err => logger.warn({ err, location }, "reauth check deferred"));
+  });
   // Slots outlive controllers; rebind sessions before reaping true orphans.
   bridgeHub.onBridgeReady((location) => orchestrator.sweepUnownedSlots(location));
   stopCatalogBridgeRefresh = bridgeHub.onBridgeReady((location) => {

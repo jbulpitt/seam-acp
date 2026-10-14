@@ -7,9 +7,8 @@
  * prefix. Resume text is the existing recovery story, so the original prompt
  * is not sent again.
  *
- * #450 publishes the card and calls `acceptReauthWait`. This module does not
- * post a card, arm a timer, or insert an elicitation row: creating one posts
- * a card, and boot settles an ordinary elicitation row as interrupted.
+ * The card and automatic checks both call `acceptReauthWait`. Checks use the
+ * existing reconciliation tick; this module owns neither timers nor prompts.
  */
 import { DispatchSuspendedError } from "./dispatch/attempt-store.js";
 import {
@@ -29,6 +28,7 @@ const REASON_MAX = 500;
 export const REAUTH_WAITING_TEXT = `${REAUTH_WAITING_PREFIX} provider authentication expired`;
 export const REAUTH_COMPLETED_TEXT =
   `${REAUTH_COMPLETED_PREFIX} provider authentication was completed outside this turn`;
+export const REAUTH_CHECKING_TEXT = `${REAUTH_COMPLETED_PREFIX} rechecking provider sign-in`;
 
 export type ReauthDecision =
   | { action: "retry"; reason: string }
@@ -125,6 +125,16 @@ export function isAwaitingReauth(reason: string | null | undefined): reason is s
   return typeof reason === "string" && reason.startsWith(REAUTH_WAITING_PREFIX);
 }
 
+export function reauthWaitingSince(attempt: { stalledReason?: string | null; stalledUtc?: string | null; updatedUtc: string }): string {
+  return attempt.stalledReason?.match(/(?:^|\s)since=(\S+)/)?.[1] ?? attempt.stalledUtc ?? attempt.updatedUtc;
+}
+
+export function reauthWaitingStatus(attempt: { stalledReason?: string | null; stalledUtc?: string | null; updatedUtc: string }, timezone: string): string {
+  const time = new Intl.DateTimeFormat("en-US", { timeZone: timezone, hour: "2-digit", minute: "2-digit", hourCycle: "h23",
+    timeZoneName: "short" }).format(new Date(reauthWaitingSince(attempt)));
+  return `waiting for provider sign-in since ${time}`;
+}
+
 /** Facts #450 can read off the stalled reason. Null when this is not a wait. */
 export function parseReauthWait(reason: string | null | undefined): {
   url?: string;
@@ -174,11 +184,12 @@ export function reauthWaitNotice(park: ReauthPark, context?: ReauthNoticeContext
   if (park.loopbackRejected) {
     lines.push("The failure offered a loopback callback on the wrong host. That address is not the link to open.");
   }
+  lines.push("Seam also rechecks automatically after bridge reconnects and with growing backoff.");
   lines.push(context
     ? `After signing in, use ‘Authentication is done — continue’. ${context.promptStarted === false
       ? "The pending prompt has not been sent; it will be sent once."
       : "The original prompt will not be replayed."}`
-    : "The parked attempt continues only after authentication is accepted.");
+    : "The parked attempt continues after sign-in, automatically or using the button.");
   return lines.join("\n");
 }
 
@@ -213,10 +224,13 @@ export function acceptReauthWait(
   store: ReauthAttemptStore,
   attemptId: string,
   now: Date = new Date(),
+  automatic = false,
 ): RecoveryRender | null {
   const before = store.get(attemptId);
   if (!before || before.state !== "suspended" || !isAwaitingReauth(before.stalledReason)) return null;
-  store.markStalled(attemptId, REAUTH_COMPLETED_TEXT);
+  store.markStalled(attemptId, automatic
+    ? `${REAUTH_CHECKING_TEXT} since=${reauthWaitingSince({ ...before, updatedUtc: before.updatedUtc ?? now.toISOString() })}`
+    : REAUTH_COMPLETED_TEXT);
   const after = store.get(attemptId);
   if (!after?.stalledReason?.startsWith(REAUTH_COMPLETED_PREFIX)) return null;
   const facts = recoveryFactsFromAttempt(after, now);

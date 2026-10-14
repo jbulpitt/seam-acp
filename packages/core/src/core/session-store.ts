@@ -2901,6 +2901,10 @@ export class SessionStore {
     this.db.prepare("UPDATE choice_cards SET message_id = ? WHERE id = ?").run(messageId, id);
   }
 
+  setChoiceBody(id: string, body: string): void {
+    this.db.prepare("UPDATE choice_cards SET body=? WHERE id=?").run(body, id);
+  }
+
   listOpenChoiceCards(platform: string, channelRef?: string): ChoiceCard[] {
     return this.db
       .prepare<string[], ChoiceRow>(
@@ -2990,6 +2994,11 @@ export class SessionStore {
       .prepare("UPDATE choice_cards SET status = 'cancelled' WHERE id = ? AND channel_ref = ? AND status = 'open'")
       .run(id, channelRef);
     return info.changes > 0;
+  }
+
+  completeChoiceCard(id: string, channelRef: string, note: string): boolean {
+    return this.db.prepare(`UPDATE choice_cards SET status='exhausted', body=body || char(10) || ?
+      WHERE id=? AND channel_ref=? AND status='open'`).run(note, id, channelRef).changes > 0;
   }
 
   getChoiceCardByIngestHash(tokenHash: string): ChoiceCard | null {

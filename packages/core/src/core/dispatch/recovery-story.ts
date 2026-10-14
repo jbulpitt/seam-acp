@@ -45,6 +45,7 @@ export interface RecoveryStoryFacts {
   cwd?: string;
   location?: string;
   promptStarted?: boolean;
+  authenticationCheck?: boolean;
   errorKind?: string;
   /** Ladder rung this continuation is actually executing. */
   rung?: number;
@@ -130,6 +131,7 @@ export function recoveryFactsFromAttempt(
   const provider = providerLabel(source.providerIdentity);
   return {
     cause,
+    ...(recorded?.startsWith(`${REAUTH_COMPLETED_PREFIX} rechecking`) ? { authenticationCheck: true } : {}),
     ...(cause === "process_restart" && recorded ? { recordedReason: recorded } : {}),
     ...(gapSeconds !== undefined ? { gapSeconds } : {}),
     ...(agentId ? { agentId } : {}),
@@ -179,7 +181,8 @@ function formatGap(seconds: number): string {
 function situation(facts: RecoveryStoryFacts): string[] {
   const lines: string[] = [];
   if (facts.cause === "reauthentication") {
-    lines.push("Authentication was completed outside this turn.");
+    lines.push(facts.authenticationCheck ? "Rechecking provider sign-in by continuing this session."
+      : "Authentication was completed outside this turn.");
   } else if (facts.cause === "classified_retry") {
     const kind = facts.errorKind && TOKEN.test(facts.errorKind) ? facts.errorKind : "unclassified";
     const agent = ident(facts.agentId);

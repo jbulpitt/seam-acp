@@ -22,6 +22,7 @@ vi.mock("../packages/core/src/agents/agent-runtime.js", async importOriginal => 
     readonly slot = TestRuntime.nextSlot++;
     busy = false;
     disposed = false;
+    detached = false;
     lastActivityAtMs = Date.now();
     modelOverride?: string;
     effortOverride?: string;
@@ -41,6 +42,7 @@ vi.mock("../packages/core/src/agents/agent-runtime.js", async importOriginal => 
     getConfigSelectValues() { return []; }
     markActivity() { this.lastActivityAtMs = Date.now(); }
     async dispose() { this.disposed = true; }
+    async detach() { this.detached = true; }
     async setModel(model: string) { this.modelOverride = model; }
     async setConfigOption(_id: string, value: string) { this.effortOverride = value; }
     async prompt() {

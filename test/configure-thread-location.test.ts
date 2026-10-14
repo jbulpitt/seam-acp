@@ -24,6 +24,7 @@ vi.mock("../packages/core/src/agents/agent-runtime.js", async importOriginal => 
   return { ...actual, AgentRuntime: class {
     busy = false;
     disposed = false;
+    detached = false;
     sessionId = "";
     cwd = "";
     lastActivityAtMs = Date.now();
@@ -42,6 +43,7 @@ vi.mock("../packages/core/src/agents/agent-runtime.js", async importOriginal => 
     getConfigSelectValues() { return ["default", "low", "high"]; }
     hasDelegatedTurnInFlight() { return false; }
     async dispose() { this.disposed = true; }
+    async detach() { this.detached = true; }
     async setModel(model: string) { this.modelOverride = model; }
     async setConfigOption() {}
     async prompt() {
@@ -130,6 +132,11 @@ async function fixture(separateHostRoots = false) {
     stops.push(async () => { const closed = once(socket, "close"); socket.terminate(); await closed; });
     socket.on("message", async raw => {
       const frame = JSON.parse(raw.toString());
+      if (frame.type === "cmd" && frame.action === "listSlots") {
+        socket.send(JSON.stringify({ v: PROTOCOL_VERSION, type: "cmd_reply", cmdId: frame.cmdId,
+          payload: { slots: [], health: [] } }));
+        return;
+      }
       if (frame.type !== "rpc") return;
       rpcs.push({ host, method: frame.method, params: frame.params });
       try {

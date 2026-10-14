@@ -22,6 +22,7 @@ vi.mock("../packages/core/src/agents/agent-runtime.js", async importOriginal => 
     modelOverride?: string;
     effortOverride?: string;
     busy = false;
+    detached = false;
     sessionId = "";
     lastActivityAtMs = Date.now();
     async start() {}
@@ -33,6 +34,7 @@ vi.mock("../packages/core/src/agents/agent-runtime.js", async importOriginal => 
     supportsSessionLoad() { return true; }
     markActivity() { this.lastActivityAtMs = Date.now(); }
     async dispose() {}
+    async detach() { this.detached = true; }
     async setModel(model: string) { this.modelOverride = model; }
     async setConfigOption() {}
   } };

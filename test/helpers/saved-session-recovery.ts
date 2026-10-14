@@ -128,9 +128,10 @@ export async function savedSessionHost(options: {
   const catalog = fixtureModelCatalog([profile]);
   const routers: SessionRouter[] = [];
   const notices: Array<{ channel: unknown; text: string }> = [];
-  function makeRouter() {
+  function makeRouter(additionalThreads: readonly string[] = []) {
     const router = new SessionRouter({ logger, store, profiles: [profile], modelCatalog: catalog,
-      defaultAgentId: "codex", defaultModel: "default", threadPresets: new Map([[record.channelRef, { location: "fixture" }]]),
+      defaultAgentId: "codex", defaultModel: "default",
+      threadPresets: new Map([record.channelRef, ...additionalThreads].map(thread => [thread, { location: "fixture" }])),
       seamMcp: { registry: {} as any, getPort: () => undefined, isBridgeSession: () => true,
         bindSessionLocation: () => {}, muxForSession: () => mux } });
     routers.push(router);

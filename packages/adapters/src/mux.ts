@@ -899,6 +899,7 @@ export function makeMux(opts: {
     if (slots.has(slot)) throw new Error(`slot ${slot} is already bound in this controller`);
     nextSlot = Math.max(nextSlot, slot + 1);
     const child = bindSlot(slot, undefined, false, options.allowAppTraffic === true);
+    const entry = slots.get(slot)!;
     const afterSeq = Number.isSafeInteger(options.afterSeq) && options.afterSeq! >= 0
       ? options.afterSeq!
       : 0;
@@ -906,8 +907,7 @@ export function makeMux(opts: {
     // Replay begins after this function returns, so the caller can attach its
     // result listener first. A missing/old bridge refuses this adoption only.
     queueMicrotask(() => {
-      const entry = slots.get(slot);
-      if (!entry || entry.killed) return;
+      if (slots.get(slot) !== entry || entry.killed) return;
       void sendCmd("replayOutput", { slot, afterSeq }).then((reply: {
         frames?: Array<{
           seq?: number;
@@ -923,7 +923,8 @@ export function makeMux(opts: {
         gap?: { afterSeq: number; firstAvailableSeq: number; droppedFrames: number };
       }) => {
         const live = slots.get(slot);
-        if (!live || live.killed) return;
+        // A detached replay cannot affect a later binding of this slot.
+        if (live !== entry || live.killed) return;
         if (reply?.gap) opts.onOutputGap?.(slot, reply.gap);
         const sessionFrame = reply?.frames?.findLast(frame => frame.type === "session" && frame.session);
         for (const frame of reply?.frames ?? []) {
@@ -947,7 +948,7 @@ export function makeMux(opts: {
         const through = outputCursor.get(slot);
         if (through) void sendCmd("ackOutput", { slot, throughSeq: through }).catch(() => {});
       }).catch((error) => {
-        child.emit("error", error);
+        if (slots.get(slot) === entry && !entry.killed) child.emit("error", error);
       });
     });
     return child;

@@ -96,7 +96,7 @@ function interaction(
   return { i, replies, edits, order };
 }
 
-function makeHarness(opts?: { channelPreset?: ChannelPreset }) {
+function makeHarness(opts?: { channelPreset?: ChannelPreset; remote?: { root?: string } }) {
   const harnessDir = path.join(dir, `harness-${++harnessSequence}`);
   fs.mkdirSync(harnessDir, { recursive: true });
   const presetsFile = path.join(harnessDir, "channel-presets.json");
@@ -156,7 +156,13 @@ function makeHarness(opts?: { channelPreset?: ChannelPreset }) {
     store,
     renderer: { codeBlock: (value: string) => value } as any,
   });
-  orch.setBridgeHub(localBridgeHub(profiles, reposRoot));
+  const hub = localBridgeHub(profiles, reposRoot);
+  if (opts?.remote) {
+    const getLocal = hub.get.bind(hub);
+    hub.get = location => location === "macbook-air"
+      ? { ...getLocal("local")!, host: { workspaceRoot: opts.remote!.root } } as any : getLocal(location);
+  }
+  orch.setBridgeHub(hub);
   const identityEffects = (orch as any).identityEffects;
   const realFlush = identityEffects.flush.bind(identityEffects);
   const flushIdentity = vi.spyOn(identityEffects, "flush").mockImplementation(realFlush);
@@ -544,6 +550,36 @@ describe("/seam config set named parameters", () => {
 });
 
 describe("configured /seam new (#294)", () => {
+  it.each([
+    { effort: "default" }, { card: "default" }, { gif: "default" }, { role: "auto" }, { effort: "low" },
+  ])("validates and binds the requested host's repo with $effort $card $gif $role", async clearing => {
+    const remoteRoot = "/Users/jessebulpitt/Projects";
+    const h = makeHarness({ remote: { root: remoteRoot } });
+    try {
+      const call = interaction({ name: "barclays", agent: "codex@macbook-air", model: "gpt-5.4",
+        repo: `${remoteRoot}/barclays`, ...clearing });
+      await acknowledgedHandler(call.i, () => (h.orch as any).cmdNew(call.i));
+      expect(call.edits.at(-1)).toMatch(/Created and configured thread/);
+      expect(h.created).toHaveLength(1);
+      const record = h.store.get(`discord:${NEW_THREAD}`)!;
+      expect(h.router.describeConfig(record)).toMatchObject({ agent: { value: "codex" },
+        location: { value: "macbook-air" }, cwd: { value: `${remoteRoot}/barclays` } });
+      expect(record.acpSessionId).toBe("");
+    } finally { h.store.close(); }
+  });
+
+  it("reports the requested remote host's missing hello root before creating a thread", async () => {
+    const h = makeHarness({ remote: {} });
+    try {
+      const call = interaction({ name: "barclays", agent: "codex@macbook-air", model: "gpt-5.4",
+        effort: "default", repo: "/Users/jessebulpitt/Projects/barclays" });
+      await acknowledgedHandler(call.i, () => (h.orch as any).cmdNew(call.i));
+      expect(call.edits.at(-1)).toContain("Host `macbook-air` did not report a workspace root.");
+      expect(h.created).toHaveLength(0);
+      expect(h.store.get(`discord:${NEW_THREAD}`)).toBeNull();
+    } finally { h.store.close(); }
+  });
+
   it("reaches the same durable end state as create followed by config set", async () => {
     const fields = {
       agent: "codex@local",

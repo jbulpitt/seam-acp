@@ -25,6 +25,7 @@ import {
 } from "./claude-catalog.js";
 import type { SessionSummary, SessionSummaryLine } from "../session-manager.js";
 import { CLAUDE_FAST_MODE } from "../fast-mode.js";
+import { redactProbeText } from "../probe-process.js";
 import {
   classifyAndAttach,
   classifyWith,
@@ -884,6 +885,7 @@ export interface ClaudeUsageBucket {
 }
 
 export interface ClaudeUsageData {
+  error?: string;
   login: string | null;
   subscriptionType: string | null;
   rateLimitTier: string | null;
@@ -921,6 +923,10 @@ export async function fetchClaudeUsage(
     extraUsage: null,
   };
   let accessToken: string | null = null;
+  let sensitiveValues: string[] = [];
+  const messageOf = (error: unknown): string => redactProbeText(
+    error instanceof Error ? error.message : String(error), undefined, sensitiveValues,
+  );
   const candidates = [
     path.join(dir, ".credentials.json"),
     path.join(dir, "credentials.json"),
@@ -938,9 +944,16 @@ export async function fetchClaudeUsage(
       result.rateLimitTier = pickStringField(oauth ?? {}, ["rateLimitTier"]) ?? null;
       const tok = pickStringField(oauth ?? {}, ["accessToken"]);
       if (tok) accessToken = tok;
+      sensitiveValues = [tok, pickStringField(oauth ?? {}, ["refreshToken"])]
+        .filter((value): value is string => Boolean(value));
+      if (accessToken) delete result.error;
+      else result.error = `Claude usage: no OAuth access token in ${file}`;
       break;
-    } catch {
-      /* try next */
+    } catch (error) {
+      // JSON parser messages can quote credential contents.
+      const detail = error instanceof SyntaxError ? "invalid JSON" : messageOf(error);
+      const cause = `Claude usage: could not read ${file}: ${detail}`;
+      result.error = result.error ? `${result.error}; ${cause}` : cause;
     }
   }
   if (!result.login) {
@@ -977,12 +990,19 @@ export async function fetchClaudeUsage(
               currency: typeof extra.currency === "string" ? extra.currency : "USD",
             };
           }
+          delete result.error;
           break;
         }
+        let detail = await res.text().catch(messageOf);
+        try {
+          const body = JSON.parse(detail);
+          detail = body?.error?.message ?? body?.message ?? detail;
+        } catch { /* retain the non-JSON response */ }
+        result.error = `Claude usage endpoint returned ${res.status}: ${messageOf(detail || res.statusText)}`;
         // Only 429/408/5xx are worth retrying; other 4xx (auth) won't recover.
         if (res.status !== 429 && res.status !== 408 && res.status < 500) break;
-      } catch {
-        /* network failure / timeout — retry, then fall back to credential-only data */
+      } catch (error) {
+        result.error = `Claude usage: ${messageOf(error)}`;
       }
       if (attempt < 2) {
         await new Promise((resolve) => setTimeout(resolve, 300 * (attempt + 1)));

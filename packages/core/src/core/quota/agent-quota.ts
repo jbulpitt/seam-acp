@@ -158,7 +158,7 @@ export function mapClaudeQuota(
   return {
     ...identity,
     ok,
-    ...(!ok ? { error: "Claude quota data unavailable" } : {}),
+    ...(!ok ? { error: data.error ?? "Claude quota data unavailable" } : {}),
     plan: data.subscriptionType ?? data.rateLimitTier,
     ...normalizeQuotaWindows(
       {

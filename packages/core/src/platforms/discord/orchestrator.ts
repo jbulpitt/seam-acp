@@ -16356,8 +16356,10 @@ export class Orchestrator {
   private async recoverInboundOutput(): Promise<void> {
     for (const a of this.store.turnAttempts.list("cancelled")) {
       if (a.source !== "inbound") continue;
+      const row = this.store.getInbound(a.id.slice("inbound-".length));
+      if (row?.state !== "pending" && row?.state !== "running") continue;
       await this.renderPersistedTerminalAttemptCard(a);
-      this.store.settleInboundExecution(a.id.slice("inbound-".length));
+      this.store.settleInboundExecution(row.messageId);
       await finishLiveTurn(this.config.DATA_DIR, { id: a.id, status: "cancelled",
         channelRef: a.spec.target, finishedUtc: new Date().toISOString(), reason: "durable cancellation" });
     }

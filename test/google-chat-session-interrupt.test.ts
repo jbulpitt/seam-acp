@@ -7,6 +7,7 @@ import { pino } from "pino";
 import { GoogleChatAdapter } from "../packages/core/src/platforms/google-chat/adapter.js";
 import { Orchestrator } from "../packages/core/src/platforms/discord/orchestrator.js";
 import { SessionStore } from "../packages/core/src/core/session-store.js";
+import { readLiveMarker, writeLiveMarker } from "../packages/core/src/core/dispatch/turn-resume.js";
 import { discordRenderer } from "../packages/core/src/platforms/discord/renderer.js";
 import { fixtureModelCatalog } from "./model-catalog-fixture.js";
 import { testSessionRouter } from "./helpers/session-fixture.js";
@@ -166,7 +167,7 @@ describe("Google Chat session Space priority interrupts", () => {
     const restarted = h.make();
     restarted.setBridgeHub({ muxFor: () => mux, slotHealthFor: () => [], onBridgeReady: () => () => {} } as any);
     await restarted.recoverInterruptedTurns();
-    expect(mux.adopt).toHaveBeenCalledOnce();
+    await vi.waitFor(() => expect(mux.adopt).toHaveBeenCalledOnce());
     child.emit("remoteRecoveryResult", { version: 1, submissionId: "submission-B", acpSessionId: "same-acp",
       status: "completed", text: "B_RECOVERED", stopReason: "end_turn", finishedUtc: new Date().toISOString() });
     await (restarted as any).queueOnChannel(root.id, async () => {});
@@ -179,7 +180,7 @@ describe("Google Chat session Space priority interrupts", () => {
     expect(child.kill).not.toHaveBeenCalled();
   });
 
-  it("settles a superseded prompted card after a crash between admission and live finalization", async () => {
+  it("settles a superseded prompted card once after a crash before live finalization", async () => {
     const h = fixture(), now = new Date().toISOString();
     const admit = (id: string) => h.store.admitInbound({ messageId: id, platform: root.platform,
       channelRef: root.id, deliveryChannel: id === "A" ? reply : root, sessionRecordId: h.record.id,
@@ -189,13 +190,18 @@ describe("Google Chat session Space priority interrupts", () => {
       "fixture", "previous-boot", "inbound");
     h.store.turnAttempts.bind(attempt, "same-acp"); h.store.turnAttempts.startPrompt(attempt);
     h.store.turnAttempts.bindStatusCard(attempt, { channelId: reply.id, messageId: "old-card" });
+    await writeLiveMarker(h.record.repoPath, { id: attempt.id, kind: "live", channelRef: root.id,
+      sessionRecordId: h.record.id, inboundMessageId: "A", acpSessionId: "same-acp", startedUtc: now, promptStarted: true });
     admit("B");
     expect(h.store.getInbound("A")?.state).toBe("completed");
     const restarted = h.make();
     await (restarted as any).recoverInboundOutput();
-    expect(h.output.editPanel).toHaveBeenCalledWith({ channel: { platform: "google-chat", id: reply.id }, id: "old-card" },
+    expect(h.output.editPanel).toHaveBeenCalledExactlyOnceWith({ channel: { platform: "google-chat", id: reply.id }, id: "old-card" },
       expect.objectContaining({ title: expect.not.stringContaining("Working"),
         fields: expect.arrayContaining([expect.objectContaining({ name: "Action", value: expect.stringContaining("Cancelled") })]) }));
+    expect(await readLiveMarker(h.record.repoPath, attempt.id)).toBeNull();
+    await (restarted as any).recoverInboundOutput();
+    expect(h.output.editPanel).toHaveBeenCalledOnce();
     expect(h.runtime.prompt).not.toHaveBeenCalled();
     expect(h.store.getInbound("B")?.state).toBe("pending");
   });

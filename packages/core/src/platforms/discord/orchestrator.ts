@@ -16040,7 +16040,8 @@ export class Orchestrator {
     const inboundChannels = new Set(inbound.map(row => row.channelRef));
     for (const row of inbound) {
       const a = this.store.turnAttempts.get(inboundAttemptId(row.messageId));
-      if (a?.state === "completed" || a?.state === "cancelled") {
+      if (a?.state === "cancelled") continue;
+      if (a?.state === "completed") {
         await this.renderPersistedTerminalAttemptCard(a);
         this.store.settleInboundExecution(row.messageId);
         continue;
@@ -16354,10 +16355,13 @@ export class Orchestrator {
 
   /** Deliver the captured winner, never re-enter a provider. */
   private async recoverInboundOutput(): Promise<void> {
+    const unfinished = new Set((await listLiveMarkers(this.config.DATA_DIR)).map(marker => marker.id));
     for (const a of this.store.turnAttempts.list("cancelled")) {
       if (a.source !== "inbound") continue;
+      const row = this.store.getInbound(a.id.slice("inbound-".length));
+      if (!row || (row.state !== "pending" && row.state !== "running" && !unfinished.has(a.id))) continue;
       await this.renderPersistedTerminalAttemptCard(a);
-      this.store.settleInboundExecution(a.id.slice("inbound-".length));
+      this.store.settleInboundExecution(row.messageId);
       await finishLiveTurn(this.config.DATA_DIR, { id: a.id, status: "cancelled",
         channelRef: a.spec.target, finishedUtc: new Date().toISOString(), reason: "durable cancellation" });
     }

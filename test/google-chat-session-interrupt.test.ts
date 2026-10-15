@@ -166,7 +166,7 @@ describe("Google Chat session Space priority interrupts", () => {
     const restarted = h.make();
     restarted.setBridgeHub({ muxFor: () => mux, slotHealthFor: () => [], onBridgeReady: () => () => {} } as any);
     await restarted.recoverInterruptedTurns();
-    expect(mux.adopt).toHaveBeenCalledOnce();
+    await vi.waitFor(() => expect(mux.adopt).toHaveBeenCalledOnce());
     child.emit("remoteRecoveryResult", { version: 1, submissionId: "submission-B", acpSessionId: "same-acp",
       status: "completed", text: "B_RECOVERED", stopReason: "end_turn", finishedUtc: new Date().toISOString() });
     await (restarted as any).queueOnChannel(root.id, async () => {});

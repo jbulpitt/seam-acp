@@ -440,6 +440,7 @@ export class DiscordAdapter implements ChatAdapter {
 
   private readonly client: Client;
   private readonly logger: Logger;
+  private statusEditSequence = 0;
   private readonly config: Config;
   private readonly slashHandler: SlashHandler;
   private readonly autocompleteHandler?: AutocompleteHandler;
@@ -1922,26 +1923,43 @@ export class DiscordAdapter implements ChatAdapter {
     message: MessageRef,
     panel: StructuredPanel
   ): Promise<void> {
-    const ch = await this.fetchSendableChannel(message.channel.id);
-    const embed = DiscordAdapter.buildEmbed(panel);
-    const payload: {
-      content: string;
-      embeds: EmbedBuilder[];
-      components?: ReturnType<typeof DiscordAdapter.buildActionRows>;
-      files?: AttachmentBuilder[];
-      attachments?: [];
-    } = {
-      content: "",
-      embeds: [embed],
-    };
-    if (panel.actions !== undefined) {
-      payload.components = DiscordAdapter.buildActionRows(panel.actions);
+    const sequence = panel.status ? ++this.statusEditSequence : undefined;
+    const terminal = panel.status?.state === "Done" || panel.status?.state === "Failed"
+      ? { sequence, channelId: message.channel.id, messageId: message.id, targetState: panel.status.state }
+      : undefined;
+    if (terminal) this.logger.info(terminal, "status card terminal PATCH intent");
+    try {
+      const ch = await this.fetchSendableChannel(message.channel.id);
+      const embed = DiscordAdapter.buildEmbed(panel);
+      const payload: {
+        content: string;
+        embeds: EmbedBuilder[];
+        components?: ReturnType<typeof DiscordAdapter.buildActionRows>;
+        files?: AttachmentBuilder[];
+        attachments?: [];
+      } = {
+        content: "",
+        embeds: [embed],
+      };
+      if (panel.actions !== undefined) {
+        payload.components = DiscordAdapter.buildActionRows(panel.actions);
+      }
+      if (panel.files !== undefined) {
+        payload.files = panel.files.map((f) => new AttachmentBuilder(f.data, { name: f.filename }));
+        payload.attachments = [];
+      }
+      const ack = await ch.messages.edit(message.id, payload);
+      if (terminal) {
+        this.logger.info({ ...terminal, ack: {
+          messageId: ack.id, channelId: ack.channelId, editedTimestamp: ack.editedTimestamp,
+          stateLabel: ack.embeds[0]?.title ?? ack.embeds[0]?.author?.name ?? null,
+          color: ack.embeds[0]?.color ?? null,
+        } }, "status card terminal PATCH acknowledged");
+      }
+    } catch (err) {
+      if (terminal) this.logger.warn({ ...terminal, err }, "status card terminal PATCH failed");
+      throw err;
     }
-    if (panel.files !== undefined) {
-      payload.files = panel.files.map((f) => new AttachmentBuilder(f.data, { name: f.filename }));
-      payload.attachments = [];
-    }
-    await ch.messages.edit(message.id, payload);
   }
 
   async sendLayout(

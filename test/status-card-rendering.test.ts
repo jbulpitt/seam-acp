@@ -15,8 +15,12 @@ describe("rebound status-card rendering", () => {
       const weight = [embed.title, embed.description, embed.author?.name, embed.footer?.text,
         ...embed.fields.flatMap(field => [field.name, field.value])].join("").length;
       expect(weight).toBeLessThanOrEqual(6000);
+      return { id: _id, channelId: "thread", editedTimestamp: 1234, embeds: [embed] };
     });
-    const adapter = Object.create(DiscordAdapter.prototype) as DiscordAdapter;
+    const logger = { child: vi.fn(), info: vi.fn(), warn: vi.fn() };
+    logger.child.mockReturnValue(logger);
+    const adapter = new DiscordAdapter({ config: {} as never, logger: logger as never,
+      slashHandler: vi.fn() });
     Object.defineProperty(adapter, "fetchSendableChannel", { value: async () => ({ messages: { edit } }) });
     const ref = { channel: { platform: "discord", id: "thread" }, id: "original" };
     const panel = new DispatchStatusPanel(discordRenderer, TurnStatus.restore(status.snapshot()), {

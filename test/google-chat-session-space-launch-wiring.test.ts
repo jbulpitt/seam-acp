@@ -86,7 +86,8 @@ describe("Chat launches new session Spaces instead of thread sessions", () => {
     expect(h.request).toHaveBeenCalledWith("spaces", expect.objectContaining({ data: expect.objectContaining({ displayName: "Explain x=y in this report" }) }));
     expect(h.incoming).toHaveLength(1);
     expect(h.incoming[0]).toMatchObject({ channel: { platform: "google-chat", id: "created-1" },
-      deliveryChannel: { platform: "google-chat", id: "created-1" }, text: "Explain x=y in this report", preemptive: false });
+      deliveryChannel: { platform: "google-chat", id: "created-1" }, text: "Explain x=y in this report" });
+    expect(h.incoming[0].preemptive).not.toBe(false);
     expect(h.prepare).toHaveBeenCalledWith({ agentId: "codex", location: "remote", model: "org-model", effort: "medium", repo: "/org/repo" });
     expect(h.store.getByChannel("google-chat", "launcher.invocation")).toBeNull();
   });

@@ -102,8 +102,8 @@ describe("one Google Chat session root with native per-prompt delivery", () => {
 
   it("uses the edited status root's readable content, not cardsV2 JSON, without a history call", async () => {
     const h = fixture();
-    const ref = await h.adapter.sendPanel(channel, { title: "Working", description: "First report", fields: [] });
-    await h.adapter.editPanel(ref, { title: "Done", description: "Completed report", fields: [] });
+    const ref = await h.adapter.sendPanel(channel, { title: "Working", description: "First report", fields: [], color: 0 });
+    await h.adapter.editPanel(ref, { title: "Done", description: "Completed report", fields: [], color: 0 });
     await h.receive("reply", true, "workspace", "new-output");
     expect(h.incoming[0].text).toContain("Completed report");
     expect(h.incoming[0].text).not.toContain("cardsV2");

@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { pino } from "pino";
 import { SessionStore } from "../packages/core/src/core/session-store.js";
+import { finishLiveTurn, readLiveMarker, turnDirs, writeLiveMarker } from "../packages/core/src/core/dispatch/turn-resume.js";
 import { Orchestrator } from "../packages/core/src/platforms/discord/orchestrator.js";
 import { discordRenderer } from "../packages/core/src/platforms/discord/renderer.js";
 import { fixtureModelCatalog } from "./model-catalog-fixture.js";
@@ -15,13 +16,13 @@ afterEach(async () => {
   vi.restoreAllMocks();
 });
 
-function fixture(states: Array<"pending" | "running" | "completed" | "missing">) {
+async function fixture(states: Array<"pending" | "running" | "completed" | "missing">) {
   const dir = mkdtempSync(path.join(tmpdir(), "seam-cancelled-boot-"));
   const db = path.join(dir, "seam.db"), now = new Date().toISOString();
   let store = new SessionStore(db);
   store.upsert({ id: "google-chat:home", platform: "google-chat", channelRef: "home", parentRef: null,
     agentId: "codex", acpSessionId: "same-acp", repoPath: dir, configJson: "{}", createdUtc: now, updatedUtc: now });
-  states.forEach((state, i) => {
+  for (const [i, state] of states.entries()) {
     const messageId = String(i);
     if (state !== "missing") {
       store.admitInbound({ messageId, platform: "google-chat", channelRef: "home", sessionRecordId: "google-chat:home",
@@ -34,8 +35,13 @@ function fixture(states: Array<"pending" | "running" | "completed" | "missing">)
     store.turnAttempts.startPrompt(attempt);
     store.turnAttempts.bindStatusCard(attempt, { channelId: "home.topic", messageId: `card-${messageId}` });
     expect(store.turnAttempts.cancel(attempt.id)).toBe(true);
-    if (state === "completed") store.settleInboundExecution(messageId);
-  });
+    await writeLiveMarker(dir, { id: attempt.id, kind: "live", channelRef: "home", sessionRecordId: "google-chat:home",
+      inboundMessageId: messageId, acpSessionId: "same-acp", startedUtc: now, promptStarted: true });
+    if (state === "completed") {
+      store.settleInboundExecution(messageId);
+      expect(await finishLiveTurn(dir, { id: attempt.id, status: "cancelled", channelRef: "home", finishedUtc: now })).toBe(true);
+    }
+  }
   store.close();
   store = new SessionStore(db);
   const editPanel = vi.fn(async () => {});
@@ -52,15 +58,16 @@ function fixture(states: Array<"pending" | "running" | "completed" | "missing">)
     host.suspendForRestart(); host.stopSentinelWatcher();
     store.close(); rmSync(dir, { recursive: true, force: true });
   });
-  return { store, host, editPanel, render, settle };
+  return { dir, store, host, editPanel, render, settle };
 }
 
 describe("cancelled inbound boot recovery", () => {
   it("does not render or settle 413 historical cancelled attempts on repeated boots", async () => {
-    const h = fixture(Array.from({ length: 413 }, () => "completed" as const));
+    const h = await fixture(Array.from({ length: 413 }, () => "completed" as const));
     expect(h.store.turnAttempts.list("cancelled")).toHaveLength(413);
     const history = Array.from({ length: 413 }, (_, i) => h.store.getInbound(String(i)));
     await h.host.recoverInterruptedTurns();
+    rmSync(turnDirs(h.dir).done, { recursive: true });
     await h.host.recoverInterruptedTurns();
     expect(h.render).not.toHaveBeenCalled();
     expect(h.editPanel).not.toHaveBeenCalled();
@@ -69,7 +76,7 @@ describe("cancelled inbound boot recovery", () => {
   });
 
   it.each(["pending", "running"] as const)("settles a cancelled attempt with a %s admission exactly once", async state => {
-    const h = fixture([state]);
+    const h = await fixture([state]);
     expect(h.store.getInbound("0")?.state).toBe(state);
     await h.host.recoverInterruptedTurns();
     expect(h.render).toHaveBeenCalledOnce();
@@ -80,6 +87,7 @@ describe("cancelled inbound boot recovery", () => {
         expect.objectContaining({ name: "Action", value: expect.stringContaining("Cancelled") }),
       ]) }));
     expect(h.store.getInbound("0")?.state).toBe("completed");
+    expect(await readLiveMarker(h.dir, "inbound-0")).toBeNull();
     await h.host.recoverInterruptedTurns();
     expect(h.render).toHaveBeenCalledOnce();
     expect(h.editPanel).toHaveBeenCalledOnce();
@@ -87,7 +95,7 @@ describe("cancelled inbound boot recovery", () => {
   });
 
   it("does not render a cancelled attempt without an admission", async () => {
-    const h = fixture(["missing"]);
+    const h = await fixture(["missing"]);
     await h.host.recoverInterruptedTurns();
     expect(h.render).not.toHaveBeenCalled();
     expect(h.editPanel).not.toHaveBeenCalled();

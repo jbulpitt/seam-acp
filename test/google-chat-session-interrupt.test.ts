@@ -41,7 +41,7 @@ function fixture(detachB = false) {
     prompt: vi.fn(async (text: string) => {
       busy = true;
       try {
-        if (text.includes("PROMPT_A")) {
+        if (text.endsWith("PROMPT_A")) {
           beganA.resolve(); await a.promise;
           if (cancelledA) return { stopReason: "cancelled", cancelled: true };
         } else {
@@ -66,12 +66,18 @@ function fixture(detachB = false) {
     getOrStartRuntime: vi.fn(async () => runtime),
     abortTurn: vi.fn(async () => { cancelledA = true; a.resolve(); return "cancelled"; }),
   });
-  let cards = 0;
+  let writes = 0;
+  const api = { request: vi.fn(async (_scope: string, request: any): Promise<any> => ({
+    name: request.method === "PATCH" ? request.url.split("/v1/")[1] : `spaces/session-home/messages/sent-${++writes}`,
+    thread: request.data?.thread ?? { name: `spaces/session-home/threads/output-${writes}` },
+    sender: { name: "users/seam", type: "BOT" },
+  })) };
+  let activeHost: Orchestrator;
   const output = {
     platform: root.platform,
-    sendPanel: vi.fn(async (channel: ChannelRef, _panel: any) => ({ channel, id: `card-${++cards}` })),
-    editPanel: vi.fn(async (_ref: any, _panel: any) => {}),
-    sendMessage: vi.fn(async (channel: ChannelRef, _text: string, _options?: any) => ({ channel, id: "answer" })),
+    sendPanel: vi.fn(async (channel: ChannelRef, panel: any) => input.sendPanel(channel, panel)),
+    editPanel: vi.fn(async (ref: any, panel: any) => input.editPanel(ref, panel)),
+    sendMessage: vi.fn(async (channel: ChannelRef, text: string, options?: any) => input.sendMessage(channel, text, options)),
     editMessage: vi.fn(async () => {}),
     findMessageByNonce: vi.fn(async () => ({ status: "absent" })),
     getThreadLiveState: vi.fn(async () => ({ locked: false, archived: false })),
@@ -81,14 +87,15 @@ function fixture(detachB = false) {
       modelCatalog: fixtureModelCatalog([]), logger: logger as any,
       config: { DATA_DIR: dir, REPOS_ROOT: dir, TURN_TIMEOUT_SECONDS: 60, DEFAULT_MODEL: "test", REPO_EMOJIS: new Map(),
         SEAM_TURN_RESUME_ENABLED: true, channelPresets: new Map(), threadPresets: new Map() } as any });
-    hosts.push(host); return host;
+    hosts.push(host); activeHost = host; return host;
   };
   const host = make();
   const space = { name: "spaces/session-home", spaceType: "SPACE", spaceThreadingState: "THREADED_MESSAGES" };
-  const input = new GoogleChatAdapter({ logger, api: { request: vi.fn() } as any,
+  const input = new GoogleChatAdapter({ logger, api, writeIntervalMs: 0,
     subscription: "projects/test/subscriptions/events", allowedUserIds: new Set(["users/42"]), defaultCwd: dir,
     spaceEvents: { space: () => space, appUser: () => "users/seam", recordAppUser: vi.fn() } as any });
   input.setCommandDeps({ store, router, mutation: { readThreadPresetEntry: () => undefined },
+    deliveryForChannel: (channel: ChannelRef, messageId?: string) => activeHost.deliveryForChannel(channel, messageId),
     runtimeTransition: {}, cancelChannel: vi.fn() } as any);
   input.onMessage(message => {
     received.push(message);
@@ -109,7 +116,7 @@ function fixture(detachB = false) {
     }
     store.close(); rmSync(dir, { recursive: true, force: true });
   });
-  return { store, record, host, make, input, receive, received, runs, output, router, runtime, a, b, beganA, beganB };
+  return { store, record, host, make, input, api, receive, received, runs, output, router, runtime, a, b, beganA, beganB };
 }
 
 describe("Google Chat session Space priority interrupts", () => {
@@ -123,9 +130,12 @@ describe("Google Chat session Space priority interrupts", () => {
     expect(h.router.abortTurn).toHaveBeenCalledWith(h.record.id, { force: true });
     expect(h.store.getInbound(first.messageId)?.state).toBe("completed");
     expect(h.store.turnAttempts.get(`inbound-${first.messageId}`)?.state).toBe("cancelled");
+    const card = h.store.turnAttempts.get(`inbound-${first.messageId}`)!.statusCard!;
     await vi.waitFor(() => expect(h.output.editPanel.mock.calls.some(([ref, panel]) =>
-      ref.id === "card-1" && JSON.stringify(panel).includes("Cancelled") && !panel.title.includes("Working"))).toBe(true));
-    expect(h.output.sendPanel.mock.calls.map(([target]) => target)).toEqual(aInThread ? [reply, root] : [root, reply]);
+      ref.id === card.messageId && JSON.stringify(panel).includes("Cancelled") && !panel.title.includes("Working"))).toBe(true));
+    const cards = h.api.request.mock.calls.filter(([, request]) => request.method === "POST" && request.data?.cardsV2);
+    expect(cards.map(([, request]) => request.data.thread?.name)).toEqual(aInThread
+      ? ["spaces/session-home/threads/topic", undefined] : [undefined, "spaces/session-home/threads/topic"]);
     h.b.resolve(); await Promise.all(h.runs);
     const final = h.output.sendMessage.mock.calls.filter(([, text]) => text === "B_FINAL");
     expect(final).toHaveLength(1);

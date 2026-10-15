@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import { promises as fsp } from "node:fs";
+import fs, { promises as fsp } from "node:fs";
 import path from "node:path";
 import crypto from "node:crypto";
 import { setTimeout as delay } from "node:timers/promises";
@@ -903,6 +903,23 @@ export interface ClaudeUsageData {
   } | null;
 }
 
+// Claude Code 2.1.294 / agent SDK 0.3.293 OAuth configuration.
+const CLAUDE_OAUTH_TOKEN_URL = "https://platform.claude.com/v1/oauth/token";
+const CLAUDE_OAUTH_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
+const CLAUDE_OAUTH_REFRESH_SCOPES = [
+  "user:profile", "user:inference", "user:sessions:claude_code",
+  "user:mcp_servers", "user:file_upload", "user:plugins",
+];
+
+function claudeAccessTokenExpired(oauth: Record<string, unknown>): boolean {
+  return typeof oauth.expiresAt === "number" && oauth.expiresAt <= Date.now();
+}
+
+function parseClaudeUsageCredentials(raw: string): Record<string, unknown> {
+  try { return JSON.parse(raw) as Record<string, unknown>; }
+  catch { throw new SyntaxError("invalid JSON"); }
+}
+
 /**
  * Reads subscription info from credentials, then calls the same
  * `/api/oauth/usage` endpoint Claude Code's `/usage` command uses to
@@ -926,10 +943,22 @@ export async function fetchClaudeUsage(
     extraUsage: null,
   };
   let accessToken: string | null = null;
+  let credentialFile: string | undefined;
+  let oauth: Record<string, unknown> = {};
   let sensitiveValues: string[] = [];
   const messageOf = (error: unknown): string => redactProbeText(
     error instanceof Error ? error.message : String(error), undefined, sensitiveValues,
   );
+  const useCredentials = (parsed: Record<string, unknown>): Record<string, unknown> => {
+    const current = parsed.claudeAiOauth as Record<string, unknown> | undefined ?? {};
+    accessToken = pickStringField(current, ["accessToken"]) ?? null;
+    sensitiveValues.push(...[accessToken, pickStringField(current, ["refreshToken"])]
+      .filter((value): value is string => Boolean(value)));
+    result.login = pickLogin(parsed) ?? pickStringField(current, ["email", "login"]) ?? null;
+    result.subscriptionType = pickStringField(current, ["subscriptionType"]) ?? null;
+    result.rateLimitTier = pickStringField(current, ["rateLimitTier"]) ?? null;
+    return current;
+  };
   const candidates = [
     path.join(dir, ".credentials.json"),
     path.join(dir, "credentials.json"),
@@ -937,18 +966,9 @@ export async function fetchClaudeUsage(
   for (const file of candidates) {
     try {
       const raw = await fsp.readFile(file, { encoding: "utf8", signal });
-      const parsed = JSON.parse(raw) as Record<string, unknown>;
-      const oauth = parsed.claudeAiOauth as Record<string, unknown> | undefined;
-      result.login =
-        pickLogin(parsed) ??
-        (oauth ? pickStringField(oauth as Record<string, unknown>, ["email", "login"]) : undefined) ??
-        null;
-      result.subscriptionType = pickStringField(oauth ?? {}, ["subscriptionType"]) ?? null;
-      result.rateLimitTier = pickStringField(oauth ?? {}, ["rateLimitTier"]) ?? null;
-      const tok = pickStringField(oauth ?? {}, ["accessToken"]);
-      if (tok) accessToken = tok;
-      sensitiveValues = [tok, pickStringField(oauth ?? {}, ["refreshToken"])]
-        .filter((value): value is string => Boolean(value));
+      const parsed = parseClaudeUsageCredentials(raw);
+      oauth = useCredentials(parsed);
+      credentialFile = file;
       if (accessToken) delete result.error;
       else result.error = `Claude usage: no OAuth access token in ${file}`;
       break;
@@ -965,19 +985,126 @@ export async function fetchClaudeUsage(
     if (identity?.login) result.login = identity.login;
   }
   if (accessToken) {
-    const headers = {
-      Authorization: `Bearer ${accessToken}`,
-      "anthropic-beta": "oauth-2025-04-20",
+    const readCurrent = async (requestSignal: AbortSignal) => {
+      const raw = await fsp.readFile(credentialFile!, { encoding: "utf8", signal: requestSignal });
+      const stat = await fsp.stat(credentialFile!, { bigint: true });
+      requestSignal.throwIfAborted();
+      const parsed = parseClaudeUsageCredentials(raw);
+      return { raw, stat, parsed };
     };
+    const refresh = async (requestSignal: AbortSignal, rejected: boolean): Promise<boolean> => {
+      try {
+        const rejectedToken = accessToken;
+        const snapshot = await readCurrent(requestSignal);
+        oauth = useCredentials(snapshot.parsed);
+        if (accessToken && !claudeAccessTokenExpired(oauth) && (!rejected || accessToken !== rejectedToken)) return true;
+        const refreshToken = pickStringField(oauth, ["refreshToken"]);
+        if (!refreshToken) throw new Error(`OAuth refresh: no refresh token in ${credentialFile}`);
+        const response = await fetch(CLAUDE_OAUTH_TOKEN_URL, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            grant_type: "refresh_token", refresh_token: refreshToken,
+            client_id: pickStringField(oauth, ["clientId"]) ?? CLAUDE_OAUTH_CLIENT_ID,
+            scope: (Array.isArray(oauth.scopes) && oauth.scopes.length ? oauth.scopes : CLAUDE_OAUTH_REFRESH_SCOPES).join(" "),
+          }),
+          signal: requestSignal,
+        });
+        if (!response.ok) {
+          let detail = await response.text();
+          requestSignal.throwIfAborted();
+          let errorCode: unknown;
+          try {
+            const body = JSON.parse(detail);
+            errorCode = body?.error;
+            detail = typeof errorCode === "string"
+              ? [errorCode, body.error_description].filter(Boolean).join(": ")
+              : body?.error?.message ?? body?.message ?? detail;
+          } catch { /* retain non-JSON response */ }
+          const cause = `OAuth refresh endpoint returned ${response.status}: ${detail || response.statusText}`;
+          if (errorCode === "invalid_grant") {
+            // A different process may have rotated the rejected refresh token.
+            try {
+              const current = await readCurrent(requestSignal);
+              oauth = useCredentials(current.parsed);
+              if (accessToken && accessToken !== rejectedToken && !claudeAccessTokenExpired(oauth)) return true;
+            } catch (error) {
+              requestSignal.throwIfAborted();
+              throw new Error(`${cause}; credential re-read failed: ${messageOf(error)}`);
+            }
+          }
+          throw new Error(cause);
+        }
+        let body: Record<string, unknown>;
+        try { body = await response.json() as Record<string, unknown>; }
+        catch (error) {
+          requestSignal.throwIfAborted();
+          if (error instanceof SyntaxError) throw new Error("OAuth refresh endpoint returned invalid JSON");
+          throw error;
+        }
+        requestSignal.throwIfAborted();
+        const token = pickStringField(body, ["access_token"]);
+        const rotatedRefresh = pickStringField(body, ["refresh_token"]) ?? refreshToken;
+        sensitiveValues.push(...[token, rotatedRefresh].filter((value): value is string => Boolean(value)));
+        if (!token || typeof body.expires_in !== "number" || !Number.isFinite(body.expires_in) || body.expires_in <= 0) {
+          throw new Error("OAuth refresh response is missing a valid access_token or expires_in");
+        }
+        const updated = { ...snapshot.parsed, claudeAiOauth: {
+          ...oauth, accessToken: token, refreshToken: rotatedRefresh, expiresAt: Date.now() + body.expires_in * 1000,
+          ...(typeof body.refresh_token_expires_in === "number"
+            ? { refreshTokenExpiresAt: Date.now() + body.refresh_token_expires_in * 1000 } : {}),
+        } };
+        const temp = `${credentialFile}.${process.pid}.${crypto.randomUUID()}.tmp`;
+        try {
+          const mode = Number(snapshot.stat.mode & 0o7777n);
+          await fsp.writeFile(temp, `${JSON.stringify(updated, null, 2)}\n`, {
+            encoding: "utf8", mode, flag: "wx", signal: requestSignal,
+          });
+          await fsp.chmod(temp, mode);
+          requestSignal.throwIfAborted();
+          // No async gap between the final comparison and atomic replacement.
+          const currentRaw = fs.readFileSync(credentialFile!, "utf8");
+          const stat = fs.statSync(credentialFile!, { bigint: true });
+          if (currentRaw !== snapshot.raw || stat.ino !== snapshot.stat.ino || stat.dev !== snapshot.stat.dev
+            || stat.mtimeNs !== snapshot.stat.mtimeNs || stat.ctimeNs !== snapshot.stat.ctimeNs || stat.mode !== snapshot.stat.mode) {
+            oauth = useCredentials(parseClaudeUsageCredentials(currentRaw));
+            if (accessToken && !claudeAccessTokenExpired(oauth)) return true;
+            throw new Error("credentials changed during OAuth refresh; not overwriting the newer file");
+          }
+          fs.renameSync(temp, credentialFile!);
+          oauth = useCredentials(updated);
+        } finally {
+          await fsp.rm(temp, { force: true });
+        }
+        return true;
+      } catch (error) {
+        signal?.throwIfAborted();
+        result.error = `Claude usage ${messageOf(error)}`;
+        return false;
+      }
+    };
+    let refreshed = false;
     // The OAuth usage endpoint occasionally 429s / times out; a couple of quick
     // retries keep a single transient blip from surfacing as "quota
     // unavailable" (the cold-start case last-known-good retention can't cover).
     for (let attempt = 0; attempt < 3; attempt++) {
+      const requestSignal = signal ? AbortSignal.any([signal, AbortSignal.timeout(8000)]) : AbortSignal.timeout(8000);
       try {
-        const res = await fetch("https://api.anthropic.com/api/oauth/usage", {
-          headers,
-          signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(8000)]) : AbortSignal.timeout(8000),
+        if (!refreshed && claudeAccessTokenExpired(oauth)) {
+          refreshed = true;
+          if (!await refresh(requestSignal, false)) return result;
+        }
+        const readUsage = () => fetch("https://api.anthropic.com/api/oauth/usage", {
+          headers: { Authorization: `Bearer ${accessToken}`, "anthropic-beta": "oauth-2025-04-20" },
+          signal: requestSignal,
         });
+        let res = await readUsage();
+        if (res.status === 401 && !refreshed) {
+          refreshed = true;
+          await res.body?.cancel();
+          if (!await refresh(requestSignal, true)) return result;
+          res = await readUsage();
+        }
         if (res.ok) {
           const body = (await res.json()) as Record<string, unknown>;
           result.fiveHour = parseBucket(body.five_hour);

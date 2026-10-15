@@ -15,6 +15,7 @@ import {
   type AgentQuotaSource,
 } from "../packages/core/src/core/quota/quota-poller.js";
 import { QuotaRegistry } from "../packages/core/src/core/quota/quota-registry.js";
+import { renderAgentQuotaLayout, renderAgentQuotaPanel } from "../packages/core/src/core/quota/agent-quota-card.js";
 import type { AgentQuota } from "../packages/core/src/core/quota/agent-quota.js";
 import type { Logger } from "../packages/core/src/lib/logger.js";
 import type { ComponentEvent } from "../packages/core/src/platforms/chat-adapter.js";
@@ -41,6 +42,7 @@ describe("bounded quota refresh", () => {
   afterEach(() => {
     vi.restoreAllMocks();
     vi.unstubAllGlobals();
+    vi.useRealTimers();
   });
 
   it("times out only the stuck source, aborts its IO, and permits a later recovery", async () => {
@@ -152,6 +154,56 @@ describe("bounded quota refresh", () => {
     expect(recovered.sources[0]?.outcome).toBe("refreshed");
     expect(calls).toBe(2);
   }, 500);
+
+  it("expires retained success when a completed timeout is reused without overlapping its reader", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-10-15T02:30:13Z"));
+    const registry = new QuotaRegistry();
+    const onUpdate = vi.fn();
+    let release!: (value: AgentQuota) => void;
+    const fetch = vi.fn<AgentQuotaSource["fetch"]>()
+      .mockResolvedValueOnce(quota("claude", "Claude"))
+      .mockImplementationOnce(() => new Promise(resolve => { release = resolve; }))
+      .mockResolvedValue(quota("claude", "Claude"));
+    const poller = new AgentQuotaPoller({
+      logger: silent, registry, onUpdate,
+      sources: [{ agentId: "claude", displayName: "Claude", eventDriven: false, fetch }],
+    });
+    try {
+      await poller.refreshAll(true);
+      await vi.advanceTimersByTimeAsync(15 * 60_000);
+      const timedOut = poller.refreshAll(true);
+      await vi.advanceTimersByTimeAsync(30_000);
+      expect((await timedOut).sources[0]).toMatchObject({ outcome: "timed_out", quota: { ok: true } });
+      expect((await poller.refreshAll(true)).sources[0]?.quota.ok).toBe(true);
+      expect(onUpdate).toHaveBeenCalledTimes(1);
+
+      await vi.advanceTimersByTimeAsync(3 * 60 * 60_000);
+      const expired = await poller.refreshAll(true);
+      expect(expired.sources[0]).toMatchObject({
+        outcome: "timed_out", error: "Quota refresh timed out after 30s",
+        quota: { ok: false, error: "Quota refresh timed out after 30s" },
+      });
+      expect(registry.get("claude")?.ok).toBe(false);
+      const unavailable = registry.get("claude")!;
+      expect(JSON.stringify(renderAgentQuotaLayout([unavailable]))).toContain("Quota refresh timed out after 30s");
+      expect(JSON.stringify(renderAgentQuotaPanel([unavailable]))).toContain("Quota refresh timed out after 30s");
+      expect(fetch).toHaveBeenCalledTimes(2);
+      expect(onUpdate).toHaveBeenCalledTimes(2);
+      expect((await poller.refreshAll(true)).sources[0]?.quota).toBe(registry.get("claude"));
+      expect(onUpdate).toHaveBeenCalledTimes(2);
+
+      release(quota("claude", "Claude"));
+      await poller.drain();
+      expect(registry.get("claude")?.ok).toBe(false);
+      expect((await poller.refreshAll(true)).sources[0]?.outcome).toBe("refreshed");
+      expect(fetch).toHaveBeenCalledTimes(3);
+    } finally {
+      release(quota("claude", "Claude"));
+      poller.stop();
+      await poller.drain();
+    }
+  });
 
   it.each(["headers", "body"] as const)(
     "aborts the real Copilot source while response %s are stalled",

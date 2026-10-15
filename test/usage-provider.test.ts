@@ -37,7 +37,7 @@ describe("internal usage-provider port", () => {
     const port = createUsageProviderPort({ profiles, ollamaUsageCliPath: "/ollama-usage" });
     const signal = new AbortController().signal;
     for (const id of ["claude-work", "copilot-work", "codex", "ollama-cloud"]) await port.readUsage(port.binding(id), signal);
-    expect(adapters.fetchClaudeUsage).toHaveBeenCalledWith("/private/claude-work");
+    expect(adapters.fetchClaudeUsage).toHaveBeenCalledWith("/private/claude-work", signal);
     expect(adapters.fetchCopilotUsage).toHaveBeenCalledWith("/private/copilot-work", signal);
     expect(adapters.fetchCodexUsage).toHaveBeenCalledWith({ signal });
     expect(adapters.fetchOllamaCloudUsage).toHaveBeenCalledWith("/ollama-usage", signal);

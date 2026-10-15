@@ -129,6 +129,76 @@ describe("Claude usage OAuth refresh", () => {
     expect(fs.statSync(file).ino).toBe(inode);
   });
 
+  it("holds Claude Code's .storage-write lock through the grant and credential commit, then releases it", async () => {
+    const lock = path.join(dir, ".storage-write.lock");
+    fetchMock.mockImplementation(async url => {
+      if (url === tokenUrl) {
+        expect(fs.statSync(lock).isDirectory()).toBe(true);
+        return Response.json(rotated);
+      }
+      return Response.json(usage);
+    });
+    const rename = fs.renameSync.bind(fs);
+    const commit = vi.spyOn(fs, "renameSync").mockImplementation((from, to) => {
+      expect(fs.statSync(lock).isDirectory()).toBe(true);
+      rename(from, to);
+    });
+    const data = await fetchClaudeUsage(dir);
+    expect(data).not.toHaveProperty("error");
+    expect(commit).toHaveBeenCalledTimes(1);
+    expect(fs.existsSync(lock)).toBe(false);
+  });
+
+  it("does not rotate tokens or remove a live Claude Code writer lock", async () => {
+    const lock = path.join(dir, ".storage-write.lock");
+    fs.mkdirSync(lock);
+    fs.utimesSync(lock, new Date(now), new Date(now));
+    const before = fs.readFileSync(file, "utf8");
+    const data = await fetchClaudeUsage(dir);
+    expect(data.error).toMatch(/credential write lock.*ELOCKED/i);
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(fs.readFileSync(file, "utf8")).toBe(before);
+    expect(fs.statSync(lock).isDirectory()).toBe(true);
+  });
+
+  it("recovers an abandoned writer lock using Claude Code's existing 15s stale bound", async () => {
+    const lock = path.join(dir, ".storage-write.lock");
+    fs.mkdirSync(lock);
+    fs.utimesSync(lock, new Date(now - 15_001), new Date(now - 15_001));
+    const data = await fetchClaudeUsage(dir);
+    expect(data).not.toHaveProperty("error");
+    expectUsageToken(newAccess);
+    expect(fs.existsSync(lock)).toBe(false);
+  });
+
+  it("does not need the writer lock to read usage from an already healthy login", async () => {
+    write(credentials(now + 3600_000));
+    const lock = path.join(dir, ".storage-write.lock");
+    fs.mkdirSync(lock);
+    const data = await fetchClaudeUsage(dir);
+    expect(data).not.toHaveProperty("error");
+    expect(fetchMock.mock.calls.map(([url]) => url)).toEqual([usageUrl]);
+    expect(fs.existsSync(lock)).toBe(true);
+  });
+
+  it("does not commit or release a writer lock that was replaced during the refresh", async () => {
+    const lock = path.join(dir, ".storage-write.lock");
+    const moved = path.join(dir, "original-lock");
+    const before = fs.readFileSync(file, "utf8");
+    fetchMock.mockImplementation(async url => {
+      if (url === tokenUrl) {
+        fs.renameSync(lock, moved);
+        fs.mkdirSync(lock);
+        return Response.json(rotated);
+      }
+      return Response.json(usage);
+    });
+    const data = await fetchClaudeUsage(dir);
+    expect(data.error).toMatch(/credential write lock.*ownership changed/i);
+    expect(fs.readFileSync(file, "utf8")).toBe(before);
+    expect(fs.existsSync(lock)).toBe(true);
+  });
+
   it("reuses a concurrent rotation observed after a usage 401 without granting again", async () => {
     write(credentials(now + 3600_000));
     fetchMock.mockImplementationOnce(async () => {
@@ -225,6 +295,7 @@ describe("Claude usage OAuth refresh", () => {
     expectNoSecrets(quota);
     expect(fetchMock.mock.calls.map(([url]) => url)).toEqual([tokenUrl]);
     expect(fs.readFileSync(file, "utf8")).toBe(before);
+    expect(fs.readdirSync(dir)).toEqual([".credentials.json"]);
   });
 
   it("does not refresh twice when the refreshed token is also rejected with 401", async () => {

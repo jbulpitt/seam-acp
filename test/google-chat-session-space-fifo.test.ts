@@ -38,7 +38,42 @@ function fixture() {
   return { store, file, record, host, router, input };
 }
 
-describe("Space-root FIFO keeps per-prompt delivery across restart", () => {
+describe("previously admitted Space-root FIFO keeps per-prompt delivery across restart", () => {
+  it("recovers the oldest surviving prompt even when a queued successor is non-preemptive", () => {
+    const h = fixture();
+    h.store.admitInbound({ ...h.input("first", "A"), platform: "google-chat", channelRef: channel.id,
+      sessionRecordId: h.record.id, createdUtc: now, preemptive: true } as any);
+    h.store.claimInbound("first", 0, now);
+    h.store.admitInbound({ ...h.input("second", "B"), platform: "google-chat", channelRef: channel.id,
+      sessionRecordId: h.record.id, createdUtc: now } as any);
+    expect(h.store.recoverInboundChannel(channel.id, now)).toMatchObject({ messageId: "first", deliveryChannel: target("A") });
+    expect(h.store.getInbound("second")?.state).toBe("pending");
+    expect(h.store.claimInbound("first", 1, now)).toBe(true);
+    expect(h.store.completeInbound("first", 1, now)).toBe(true);
+    expect(h.store.recoverInboundChannel(channel.id, now)).toMatchObject({ messageId: "second", deliveryChannel: target("B") });
+  });
+
+  it("boot queues all surviving prompts in admission order without waiting on the first turn", async () => {
+    const h = fixture();
+    for (const [id, thread, preemptive] of [["first", "A", true], ["second", "B", false], ["third", "C", false]] as const)
+      h.store.admitInbound({ ...h.input(id, thread), platform: "google-chat", channelRef: channel.id,
+        sessionRecordId: h.record.id, createdUtc: now, preemptive } as any);
+    Object.assign(h.host, { liveTurnInventory: async () => [], recoverInboundOutput: async () => {} });
+    let release!: () => void;
+    const held = new Promise<void>(resolve => { release = resolve; }), seen: string[] = [];
+    (h.host as any).handleIncomingMessageInner.mockImplementation(async (msg: any) => {
+      seen.push(msg.messageId); if (msg.messageId === "first") await held;
+    });
+    let ready = false;
+    const boot = h.host.recoverInterruptedTurns().then(() => { ready = true; });
+    try {
+      await vi.waitFor(() => expect(seen).toEqual(["first"]));
+      expect(ready).toBe(true);
+    } finally { release(); await boot; }
+    await (h.host as any).queueOnChannel(channel.id, async () => {});
+    expect(seen).toEqual(["first", "second", "third"]);
+  });
+
   it("persists each queued prompt's own thread without replacing its predecessor", () => {
     const h = fixture();
     for (const [id, thread] of [["first", "A"], ["second", "B"]]) h.store.admitInbound({ ...h.input(id!, thread!),
@@ -160,7 +195,10 @@ describe("Space-root FIFO keeps per-prompt delivery across restart", () => {
     const attempt = h.store.turnAttempts.claim({ id: "inbound-first", target: channel.id, prompt: "First", session: "live", kind: "handoff", createdUtc: now }, "codex@local", "old-boot", "inbound");
     h.store.turnAttempts.bind(attempt, "keep-acp"); h.store.turnAttempts.startPrompt(attempt);
     h.store.turnAttempts.suspendBoot("old-boot");
-    await (h.host as any).handleIncomingMessage(h.input("second", "B"));
+    h.store.admitInbound({ ...h.input("second", "B"), platform: "google-chat", channelRef: channel.id,
+      sessionRecordId: h.record.id, createdUtc: now } as any);
+    Object.assign(h.host, { liveTurnInventory: async () => [], recoverInboundOutput: async () => {} });
+    await h.host.recoverInterruptedTurns();
     expect(h.store.getInbound("second")).toMatchObject({ state: "pending", deliveryChannel: target("B") });
     expect((h.host as any).handleIncomingMessageInner).not.toHaveBeenCalled();
     expect(h.router.abortTurn).not.toHaveBeenCalled();

@@ -281,7 +281,7 @@ export class GoogleChatAdapter implements ChatAdapter {
     signal?.addEventListener("abort", abort, { once: true });
     const incoming: IncomingMessage = {
       messageId: inboundId(message.name),
-      channel, ...((home || channel.parentId === undefined) ? { deliveryChannel, preemptive: false } : {}),
+      channel, ...((home || channel.parentId === undefined) ? { deliveryChannel } : {}),
       authorId: resourceId(user.name, "users"),
       authorName: user.displayName, authorIsBot: false,
       text: context ? `${context}\n\n${text}` : text, attachments, raw,

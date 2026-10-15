@@ -52,7 +52,8 @@ describe("one Google Chat session root with native per-prompt delivery", () => {
   it.each(["direct", "workspace"] as const)("admits an unmentioned top-level %s prompt at the exact root", async source => {
     const h = fixture(); await h.receive("top", false, source);
     expect(h.incoming).toHaveLength(1);
-    expect(h.incoming[0]).toMatchObject({ channel, deliveryChannel: channel, preemptive: false, text: "Prompt top" });
+    expect(h.incoming[0]).toMatchObject({ channel, deliveryChannel: channel, text: "Prompt top" });
+    expect(h.incoming[0].preemptive).not.toBe(false);
     expect(h.store.get(h.record.id)?.acpSessionId).toBe("same-acp");
     expect(h.ensureSessionRecord.mock.calls.every(([input]) => input.channelRef === channel.id)).toBe(true);
     expect(h.request).not.toHaveBeenCalled();
@@ -70,7 +71,8 @@ describe("one Google Chat session root with native per-prompt delivery", () => {
     const h = fixture(); await h.receive("reply", true, "workspace", "topic");
     expect(h.incoming).toHaveLength(1);
     expect(h.incoming[0]).toMatchObject({ channel, deliveryChannel: {
-      platform: "google-chat", id: "session-home.topic", parentId: "session-home" }, preemptive: false });
+      platform: "google-chat", id: "session-home.topic", parentId: "session-home" } });
+    expect(h.incoming[0].preemptive).not.toBe(false);
     expect(h.incoming[0].text).toContain("[In thread under Root Author's message");
     expect(h.incoming[0].text).toContain("2026-10-12T18:00:00Z");
     expect(h.incoming[0].text).toContain("Root report");
@@ -100,8 +102,8 @@ describe("one Google Chat session root with native per-prompt delivery", () => {
 
   it("uses the edited status root's readable content, not cardsV2 JSON, without a history call", async () => {
     const h = fixture();
-    const ref = await h.adapter.sendPanel(channel, { title: "Working", description: "First report", fields: [] });
-    await h.adapter.editPanel(ref, { title: "Done", description: "Completed report", fields: [] });
+    const ref = await h.adapter.sendPanel(channel, { title: "Working", description: "First report", fields: [], color: 0 });
+    await h.adapter.editPanel(ref, { title: "Done", description: "Completed report", fields: [], color: 0 });
     await h.receive("reply", true, "workspace", "new-output");
     expect(h.incoming[0].text).toContain("Completed report");
     expect(h.incoming[0].text).not.toContain("cardsV2");

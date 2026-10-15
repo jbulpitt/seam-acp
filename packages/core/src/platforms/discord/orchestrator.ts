@@ -2551,16 +2551,7 @@ export class Orchestrator {
       admissionId = msg.messageId;
     }
 
-    if (!preemptive && msg.deliveryChannel && admissionId) {
-      if (!this.channelQueues.has(this.queueChannelRef(channelId)) && this.promptedAttemptBlock(channelId, true)) return;
-      await Promise.all(this.store.listInboundNonterminal(channelId)
-        .filter(row => !row.preemptive && row.deliveryChannel && row.state === "pending")
-        .map(row => this.startRecoveredInbound(row)));
-      return;
-    }
-
-    // Bump the generation so a preemptive recovered row queued before this
-    // message stands down. Queued user messages are not superseded: each runs.
+    // Same-session continuations observe this generation to detect interrupts.
     const queueRef = this.queueChannelRef(channelId);
     if (preemptive) this.channelGenerations.set(queueRef, (this.channelGenerations.get(queueRef) ?? 0) + 1);
 
@@ -2922,13 +2913,8 @@ export class Orchestrator {
    * admission. Used at boot and by localized recovery. */
   private startRecoveredInbound(row: InboundAdmission, operatorResume = false,
     queueFence?: ChannelQueueFence): Promise<void> {
-    const myGen = row.preemptive
-      ? (this.channelGenerations.get(this.queueChannelRef(row.channelRef)) ?? 0) + 1
-      : this.channelGenerations.get(this.queueChannelRef(row.channelRef)) ?? 0;
-    if (row.preemptive) this.channelGenerations.set(this.queueChannelRef(row.channelRef), myGen);
     const msg = this.inboundMessage(row);
     const run = async (fence: ChannelQueueFence) => {
-      if (row.preemptive && (this.channelGenerations.get(this.queueChannelRef(row.channelRef)) ?? 0) > myGen) return;
       if (this.restartCutoff) return;
       if (!this.store.claimInbound(row.messageId, fence.epoch, new Date().toISOString())) return;
       try {
@@ -16071,9 +16057,9 @@ export class Orchestrator {
         // Legacy ambiguous execution is inventory, not original-task replay.
         continue;
       }
-      const pending = this.store.recoverInboundChannel(row.channelRef, now.toISOString(), row.preemptive ? undefined : row.messageId);
+      const pending = this.store.recoverInboundChannel(row.channelRef, now.toISOString(), row.messageId);
       if (pending) {
-        if (pending.deliveryChannel && !pending.preemptive) {
+        if (pending.deliveryChannel) {
           if (!this.channelQueues.has(this.queueChannelRef(row.channelRef)) && this.promptedAttemptBlock(row.channelRef, true) && !a) continue;
           void this.startRecoveredInbound(pending);
         }
@@ -16370,6 +16356,7 @@ export class Orchestrator {
   private async recoverInboundOutput(): Promise<void> {
     for (const a of this.store.turnAttempts.list("cancelled")) {
       if (a.source !== "inbound") continue;
+      await this.renderPersistedTerminalAttemptCard(a);
       this.store.settleInboundExecution(a.id.slice("inbound-".length));
       await finishLiveTurn(this.config.DATA_DIR, { id: a.id, status: "cancelled",
         channelRef: a.spec.target, finishedUtc: new Date().toISOString(), reason: "durable cancellation" });
@@ -16595,8 +16582,7 @@ export class Orchestrator {
         const row = this.store.getInbound(marker.inboundMessageId);
         if (!a || a.state !== "suspended" || !row) return `Cannot resume \`${id}\` — no suspended, identity-bound execution.`;
         if (isAwaitingReauth(a.stalledReason)) return `Cannot resume \`${id}\` — ${a.stalledReason}.`;
-        const pending = this.store.recoverInboundChannel(row.channelRef, new Date().toISOString(),
-          queueFence ? row.messageId : undefined);
+        const pending = this.store.recoverInboundChannel(row.channelRef, new Date().toISOString(), row.messageId);
         if (!pending) return `Cannot resume \`${id}\` — admission is terminal.`;
         const run = this.startRecoveredInbound(pending, true, queueFence);
         if (queueFence) await run;
@@ -20164,7 +20150,7 @@ export class Orchestrator {
       const messageId = attemptId.startsWith("inbound-") ? attemptId.slice("inbound-".length) : "";
       const row = messageId ? this.store.getInbound(messageId) : null;
       if (!row) return "admission is terminal";
-      const pending = this.store.recoverInboundChannel(row.channelRef, new Date().toISOString());
+      const pending = this.store.recoverInboundChannel(row.channelRef, new Date().toISOString(), row.messageId);
       if (!pending) return "admission is terminal";
       await this.startRecoveredInbound(pending);
       return null;

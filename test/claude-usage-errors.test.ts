@@ -98,12 +98,12 @@ describe("Claude usage failure causes", () => {
     expect(fetchMock).toHaveBeenCalledTimes(3);
   });
 
-  it("reports an auth response's top-level message without adding retries", async () => {
+  it("reports an auth response's cause when the one OAuth refresh is also rejected", async () => {
     writeCredentials();
-    fetchMock.mockResolvedValue(Response.json({ message: "OAuth token has expired" }, { status: 401 }));
+    fetchMock.mockImplementation(async () => Response.json({ message: "OAuth token has expired" }, { status: 401 }));
     const data = await fetchClaudeUsage(dir);
-    expect(data).toHaveProperty("error", "Claude usage endpoint returned 401: OAuth token has expired");
-    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(data).toHaveProperty("error", "Claude usage OAuth refresh endpoint returned 401: OAuth token has expired");
+    expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 
   it("preserves a non-JSON endpoint error body", async () => {
@@ -143,7 +143,7 @@ describe("Claude usage failure causes", () => {
     writeCredentials();
     const message = `Access denied: ${accessToken}; ${refreshToken}`;
     if (kind === "response") {
-      fetchMock.mockResolvedValue(Response.json({ error: { message } }, { status: 401 }));
+      fetchMock.mockImplementation(async () => Response.json({ error: { message } }, { status: 401 }));
     } else {
       fetchMock.mockRejectedValue(new Error(message));
     }

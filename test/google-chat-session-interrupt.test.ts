@@ -179,7 +179,7 @@ describe("Google Chat session Space priority interrupts", () => {
     expect(child.kill).not.toHaveBeenCalled();
   });
 
-  it("settles a superseded prompted card after a crash between admission and live finalization", async () => {
+  it("leaves completed superseded admissions alone during output recovery", async () => {
     const h = fixture(), now = new Date().toISOString();
     const admit = (id: string) => h.store.admitInbound({ messageId: id, platform: root.platform,
       channelRef: root.id, deliveryChannel: id === "A" ? reply : root, sessionRecordId: h.record.id,
@@ -193,9 +193,7 @@ describe("Google Chat session Space priority interrupts", () => {
     expect(h.store.getInbound("A")?.state).toBe("completed");
     const restarted = h.make();
     await (restarted as any).recoverInboundOutput();
-    expect(h.output.editPanel).toHaveBeenCalledWith({ channel: { platform: "google-chat", id: reply.id }, id: "old-card" },
-      expect.objectContaining({ title: expect.not.stringContaining("Working"),
-        fields: expect.arrayContaining([expect.objectContaining({ name: "Action", value: expect.stringContaining("Cancelled") })]) }));
+    expect(h.output.editPanel).not.toHaveBeenCalled();
     expect(h.runtime.prompt).not.toHaveBeenCalled();
     expect(h.store.getInbound("B")?.state).toBe("pending");
   });

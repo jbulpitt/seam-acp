@@ -2,6 +2,7 @@ import { spawn } from "node:child_process";
 import { promises as fsp } from "node:fs";
 import path from "node:path";
 import crypto from "node:crypto";
+import { setTimeout as delay } from "node:timers/promises";
 import type { McpServer } from "@agentclientprotocol/sdk";
 import {
   asLocalAdapter,
@@ -906,11 +907,13 @@ export interface ClaudeUsageData {
  * Reads subscription info from credentials, then calls the same
  * `/api/oauth/usage` endpoint Claude Code's `/usage` command uses to
  * fetch utilization. Requires the `oauth-2025-04-20` beta header.
- * Returns whatever fields could be populated; never throws.
+ * Returns whatever fields could be populated; caller cancellation throws.
  */
 export async function fetchClaudeUsage(
-  configDir?: string
+  configDir?: string,
+  signal?: AbortSignal
 ): Promise<ClaudeUsageData> {
+  signal?.throwIfAborted();
   const dir = configDir?.trim() || path.join(process.env.HOME ?? "", ".claude");
   const result: ClaudeUsageData = {
     login: null,
@@ -933,7 +936,7 @@ export async function fetchClaudeUsage(
   ];
   for (const file of candidates) {
     try {
-      const raw = await fsp.readFile(file, "utf8");
+      const raw = await fsp.readFile(file, { encoding: "utf8", signal });
       const parsed = JSON.parse(raw) as Record<string, unknown>;
       const oauth = parsed.claudeAiOauth as Record<string, unknown> | undefined;
       result.login =
@@ -950,6 +953,7 @@ export async function fetchClaudeUsage(
       else result.error = `Claude usage: no OAuth access token in ${file}`;
       break;
     } catch (error) {
+      signal?.throwIfAborted();
       // JSON parser messages can quote credential contents.
       const detail = error instanceof SyntaxError ? "invalid JSON" : messageOf(error);
       const cause = `Claude usage: could not read ${file}: ${detail}`;
@@ -957,7 +961,7 @@ export async function fetchClaudeUsage(
     }
   }
   if (!result.login) {
-    const identity = await readClaudeIdentity(configDir);
+    const identity = await readClaudeIdentity(configDir, signal);
     if (identity?.login) result.login = identity.login;
   }
   if (accessToken) {
@@ -972,7 +976,7 @@ export async function fetchClaudeUsage(
       try {
         const res = await fetch("https://api.anthropic.com/api/oauth/usage", {
           headers,
-          signal: AbortSignal.timeout(8000),
+          signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(8000)]) : AbortSignal.timeout(8000),
         });
         if (res.ok) {
           const body = (await res.json()) as Record<string, unknown>;
@@ -994,6 +998,7 @@ export async function fetchClaudeUsage(
           break;
         }
         let detail = await res.text().catch(messageOf);
+        signal?.throwIfAborted();
         try {
           const body = JSON.parse(detail);
           detail = body?.error?.message ?? body?.message ?? detail;
@@ -1002,10 +1007,16 @@ export async function fetchClaudeUsage(
         // Only 429/408/5xx are worth retrying; other 4xx (auth) won't recover.
         if (res.status !== 429 && res.status !== 408 && res.status < 500) break;
       } catch (error) {
+        signal?.throwIfAborted();
         result.error = `Claude usage: ${messageOf(error)}`;
       }
       if (attempt < 2) {
-        await new Promise((resolve) => setTimeout(resolve, 300 * (attempt + 1)));
+        try {
+          await delay(300 * (attempt + 1), undefined, { signal });
+        } catch (error) {
+          signal?.throwIfAborted();
+          throw error;
+        }
       }
     }
   }
@@ -1030,7 +1041,8 @@ function parseBucket(raw: unknown): ClaudeUsageBucket | null {
  * failure so callers fall back to the generic "no account info" branch.
  */
 async function readClaudeIdentity(
-  configDir: string | undefined
+  configDir: string | undefined,
+  signal?: AbortSignal
 ): Promise<AgentIdentity | null> {
   const dir = configDir ?? path.join(process.env.HOME ?? "", ".claude");
   const candidates = [
@@ -1041,11 +1053,12 @@ async function readClaudeIdentity(
   ];
   for (const file of candidates) {
     try {
-      const raw = await fsp.readFile(file, "utf8");
+      const raw = await fsp.readFile(file, { encoding: "utf8", signal });
       const parsed = JSON.parse(raw) as Record<string, unknown>;
       const login = pickLogin(parsed);
       if (login) return { login };
     } catch {
+      signal?.throwIfAborted();
       /* try the next candidate */
     }
   }

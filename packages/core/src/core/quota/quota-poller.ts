@@ -184,7 +184,18 @@ export class AgentQuotaPoller {
     const source = this.sources.get(agentId);
     if (!source) throw new Error(`Unknown quota source '${agentId}'`);
     const pending = this.inFlight.get(agentId);
-    if (pending) return pending;
+    if (pending) {
+      const result = await pending;
+      if (result.outcome !== "timed_out") return result;
+      // A timed-out reader can still own IO, but not retain success forever.
+      const current = this.registry.get(agentId) ?? result.quota;
+      if (!current.ok) return { ...result, quota: current };
+      const { quota, changed } = this.applyResult(mapUnavailableQuota(
+        { agentId, displayName: source.displayName }, result.error!,
+      ));
+      if (changed) this.onUpdate?.(quota);
+      return { ...result, quota };
+    }
     const now = Date.now();
     const previousAt = this.lastRefreshAt.get(agentId) ?? 0;
     if (!force && now - previousAt < QUOTA_MIN_REFRESH_MS) {

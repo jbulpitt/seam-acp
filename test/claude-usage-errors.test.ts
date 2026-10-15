@@ -157,7 +157,7 @@ describe("Claude usage failure causes", () => {
     fs.writeFileSync(credentials, JSON.stringify({ claudeAiOauth: { expiresAt: 0 } }));
     const port = createUsageProviderPort({ profiles: [{ id: "claude", displayName: "Claude", configDir: dir }] });
     const [source] = createQuotaSources(port.bindings(), port);
-    const quota = await source!.fetch(undefined);
+    const quota = await source!.fetch(new AbortController().signal);
     const error = `Claude usage: no OAuth access token in ${credentials}`;
     expect(quota).toMatchObject({ agentId: "claude", ok: false, error });
     const layout = renderAgentQuotaLayout([quota]);

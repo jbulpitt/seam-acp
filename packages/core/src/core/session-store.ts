@@ -2653,7 +2653,7 @@ export class SessionStore {
           deliveryChannelJson: input.deliveryChannel ? JSON.stringify(input.deliveryChannel) : null,
         });
         if (result.changes !== 1) return false;
-      // A normal Discord message is a priority replacement, not FIFO. Make
+      // A normal user message is a priority replacement, not FIFO. Make
       // that intent durable in the same commit as the new admission so boot
       // recovery cannot resurrect the turn it superseded.
       if (input.preemptive !== false) {
@@ -2783,40 +2783,28 @@ export class SessionStore {
   }
 
   /**
-   * Recover the FIFO head, or the newest replacement admission. Recorded
-   * continuations select only their own admission.
+   * Admission already settles superseded work. Recover the oldest survivor;
+   * recorded continuations select only their own admission.
    */
   recoverInboundChannel(channelRef: string, updatedUtc: string, messageId?: string): InboundAdmission | null {
     const recover = this.db.transaction(() => {
-      const rows = this.db
+      const row = this.db
         .prepare<[string, string | null, string | null], InboundAdmissionRow>(
           `SELECT * FROM inbound_admissions
            WHERE channel_ref = ? AND state IN ('pending','running') AND command_result_json IS NULL
            AND (? IS NULL OR message_id = ?)
-           ORDER BY created_utc ASC, rowid ASC`
+           ORDER BY created_utc ASC, rowid ASC LIMIT 1`
         )
-        .all(channelRef, messageId ?? null, messageId ?? null);
-      const newest = rows.find(row => row.preemptive === 0) ?? rows.at(-1);
-      if (!newest) return null;
-      for (const old of rows) {
-        if (newest.preemptive !== 0 && old.preemptive !== 0 && old.message_id !== newest.message_id) this.turnAttempts.cancel(inboundAttemptId(old.message_id));
-      }
-      this.db
-        .prepare(
-          `UPDATE inbound_admissions SET state = 'completed', updated_utc = ?
-           WHERE channel_ref = ? AND state IN ('pending','running') AND message_id <> ? AND command_result_json IS NULL
-           AND preemptive <> 0 AND ? <> 0
-           AND (? IS NULL OR message_id = ?)`
-        )
-        .run(updatedUtc, channelRef, newest.message_id, newest.preemptive, messageId ?? null, messageId ?? null);
+        .get(channelRef, messageId ?? null, messageId ?? null);
+      if (!row) return null;
       this.db
         .prepare(
           `UPDATE inbound_admissions SET state = 'pending', queue_epoch = NULL, updated_utc = ?
            WHERE message_id = ? AND state IN ('pending','running')`
         )
-        .run(updatedUtc, newest.message_id);
+        .run(updatedUtc, row.message_id);
       return mapInboundAdmission({
-        ...newest,
+        ...row,
         state: "pending",
         queue_epoch: null,
         updated_utc: updatedUtc,

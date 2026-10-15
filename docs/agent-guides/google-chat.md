@@ -13,10 +13,12 @@ session Space, adds the requester as manager, and binds one ACP session to its
 root. Automatic launches use that message as the first prompt and title.
 `/new` creates an empty session and replies with its Space link.
 
-Every native thread inside that Space shares the same session and FIFO. A
-top-level prompt gets top-level output; a native-thread prompt gets its status,
+Every native thread inside that Space shares the same session. A new message
+interrupts the running turn, as in Discord; its predecessor's card settles as
+cancelled. A top-level prompt gets top-level output; a native-thread prompt gets its status,
 text and files in that thread. Each admitted prompt retains its own target
-through queuing, controller restart and bridge reattachment. Native-thread
+through queuing, controller restart and bridge reattachment. Previously admitted
+work that has not been superseded recovers in admission order. Native-thread
 prompts include a short root-context header: local delivery metadata for Seam
 roots, otherwise one history read. A failed context read logs Google's actual
 cause and admits the original prompt without a header.

@@ -142,7 +142,7 @@ Both commands reply privately: top-level replies are unthreaded, and in-thread
 replies stay in that thread. In unthreaded Spaces they change the shared Space
 session. Durable receipts prevent redelivery from applying a command twice.
 
-### Private schedule list
+### Private schedule editor
 
 Register `/schedules` as a slash command with id **7**, description
 `Manage this Space's schedules privately`, with dialogs disabled.
@@ -153,15 +153,26 @@ through four schedules at a time. Run now uses the same scheduler as Discord
 and is available to everyone admitted by the existing Chat access rules.
 
 `GOOGLE_CHAT_ADMIN_USER_IDS` contains comma-separated Chat user resource names
-such as `users/123456789`. Only these users can Pause, Resume, or Delete a
-schedule. An empty set means no mutation admins. Delete first replaces that
-row's controls with Confirm/Cancel. Add and Edit forms are not available yet.
+such as `users/123456789`. Only these users can Add, Edit, Pause, Resume, or
+Delete a schedule. An empty set means no mutation admins. Delete first replaces
+that row's controls with Confirm/Cancel.
+
+Add schedule and each row's Edit button replace the same private message with
+an inline form. Name, prompt, cadence preset or custom cron, timezone, and
+isolated/live mode follow the Discord builder's shared rules. Isolated mode
+also offers model, working directory, output format, and target Space/thread.
+A blank model or working directory inherits the bound conversation's defaults;
+a blank target posts there. Targets accept `SPACE.THREAD` or
+`spaces/SPACE/threads/THREAD` (omit the thread to target a Space). Save validates
+on the server and returns to the same list page. Errors preserve the entered
+values; Cancel returns without saving. Live schedules discard isolated-only
+overrides. Forms use native card inputs, not dialogs.
 
 The list uses `privateMessageViewer`, so only its requesting user and the app
 can see it. Every click replaces the whole card message with a PATCH; the
 message's private viewer stays unchanged. Click effects and pending card
 updates use the existing command receipt, so Pub/Sub redelivery does not
-repeat Run now or undo a Pause/Resume action.
+repeat Run now, create a schedule twice on a redelivered Save, or undo a Pause/Resume action.
 
 The standalone Shared Drive uploader also defines
 `GOOGLE_CHAT_DRIVE_FOLDER_ID` and `GOOGLE_CHAT_DRIVE_SHARING_POLICY`

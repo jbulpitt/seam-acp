@@ -71,6 +71,7 @@ import { buildGlobalMcpServers } from "./mcp.js";
 import { startTunnelGistPublisher } from "./lib/tunnel-gist.js";
 import { ScheduledPromptManager } from "./core/scheduled-prompts/manager.js";
 import { createScheduleListPorts } from "./core/schedule-list.js";
+import { scheduleBuilderDefaults } from "./core/schedule-ui.js";
 import { WakeManager } from "./core/wake/manager.js";
 import { ParkedPromptManager } from "./core/parked-prompts/manager.js";
 import { WarmSetManager } from "./core/warm-set/manager.js";
@@ -570,7 +571,8 @@ async function main(): Promise<void> {
     configPlan: orchestrator.getConfigApplyPlan(), modelCatalog,
     deliveryForChannel: (channel, messageId) => orchestrator.deliveryForChannel(channel, messageId),
     scheduleList: { adminUserIds: config.GOOGLE_CHAT_ADMIN_USER_IDS,
-      ports: createScheduleListPorts({ store, manager: () => scheduledManager, runNow: id => orchestrator.runScheduledPrompt(id) }) },
+      ports: { ...createScheduleListPorts({ store, manager: () => scheduledManager, runNow: id => orchestrator.runScheduledPrompt(id) }),
+        reposRoot: config.REPOS_ROOT, builderDefaults: channel => scheduleBuilderDefaults({ config, router, modelCatalog }, channel) } },
     cancelChannel: channel => orchestrator.cancelChannel(channel) });
   googleChat?.installSessionSpaces({ config,
     prepare: snapshot => prepareGoogleChatSpaceSelection(snapshot, { router, modelCatalog,

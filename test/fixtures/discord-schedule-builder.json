@@ -1,0 +1,570 @@
+[
+  {
+    "embeds": [
+      {
+        "title": "⏰ New scheduled prompt",
+        "color": 3447003,
+        "description": "This runs **on its own, on a clean session** — it won't remember this conversation. Write the prompt so it stands alone. Schedules don't carry files: for anything substantial, commit a runbook to the repo and have the prompt ask the agent to read it.",
+        "fields": [
+          {
+            "name": "🏷️ Name",
+            "value": "*(not set)*"
+          },
+          {
+            "name": "✏️ Prompt",
+            "value": "*(not set — click ✏️ Prompt & name)*"
+          },
+          {
+            "name": "🕐 Runs",
+            "value": "*(not set)*",
+            "inline": true
+          },
+          {
+            "name": "🌍 Timezone",
+            "value": "America/Chicago",
+            "inline": true
+          },
+          {
+            "name": "🧠 Session",
+            "value": "isolated (clean session)",
+            "inline": true
+          },
+          {
+            "name": "Agent",
+            "value": "`codex`",
+            "inline": true
+          },
+          {
+            "name": "🤖 Model",
+            "value": "Thread default (`session-model`)",
+            "inline": true
+          },
+          {
+            "name": "📂 Working dir",
+            "value": "`/repos/current`",
+            "inline": true
+          },
+          {
+            "name": "📮 Output to",
+            "value": "*(this thread)*",
+            "inline": true
+          },
+          {
+            "name": "🖼️ Output as",
+            "value": "status cards",
+            "inline": true
+          }
+        ]
+      }
+    ],
+    "components": [
+      {
+        "type": 1,
+        "components": [
+          {
+            "type": 3,
+            "custom_id": "sched:cadence",
+            "placeholder": "🕐 How often?",
+            "options": [
+              {
+                "label": "Every day at 9:00 AM",
+                "value": "0 9 * * *"
+              },
+              {
+                "label": "Weekdays at 9:00 AM",
+                "value": "0 9 * * 1-5"
+              },
+              {
+                "label": "Every Monday at 9:00 AM",
+                "value": "0 9 * * 1"
+              },
+              {
+                "label": "Every hour",
+                "value": "0 * * * *"
+              },
+              {
+                "label": "Every 15 minutes",
+                "value": "*/15 * * * *"
+              },
+              {
+                "label": "Custom cron…",
+                "value": "__custom__"
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "type": 1,
+        "components": [
+          {
+            "type": 3,
+            "custom_id": "sched:tz",
+            "placeholder": "🌍 Timezone",
+            "options": [
+              {
+                "label": "America/Chicago",
+                "value": "America/Chicago",
+                "default": true
+              },
+              {
+                "label": "America/New_York",
+                "value": "America/New_York",
+                "default": false
+              },
+              {
+                "label": "America/Denver",
+                "value": "America/Denver",
+                "default": false
+              },
+              {
+                "label": "America/Los_Angeles",
+                "value": "America/Los_Angeles",
+                "default": false
+              },
+              {
+                "label": "UTC",
+                "value": "UTC",
+                "default": false
+              },
+              {
+                "label": "Europe/London",
+                "value": "Europe/London",
+                "default": false
+              },
+              {
+                "label": "Europe/Berlin",
+                "value": "Europe/Berlin",
+                "default": false
+              },
+              {
+                "label": "Asia/Tokyo",
+                "value": "Asia/Tokyo",
+                "default": false
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "type": 1,
+        "components": [
+          {
+            "type": 3,
+            "custom_id": "sched:model",
+            "placeholder": "🤖 Model",
+            "options": [
+              {
+                "label": "Thread default (session-model)",
+                "value": "__default__",
+                "default": true
+              },
+              {
+                "label": "Model two",
+                "value": "model-two",
+                "default": false
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "type": 1,
+        "components": [
+          {
+            "type": 2,
+            "custom_id": "sched:prompt",
+            "label": "✏️ Prompt & details",
+            "style": 1
+          },
+          {
+            "type": 2,
+            "custom_id": "sched:output",
+            "label": "🖼️ Output: cards",
+            "style": 2
+          },
+          {
+            "type": 2,
+            "custom_id": "sched:mode",
+            "label": "🧵 Session: isolated",
+            "style": 2
+          },
+          {
+            "type": 2,
+            "custom_id": "sched:create",
+            "label": "✅ Create",
+            "style": 3,
+            "disabled": true
+          },
+          {
+            "type": 2,
+            "custom_id": "sched:cancel",
+            "label": "Cancel",
+            "style": 2
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "embeds": [
+      {
+        "title": "✏️ Edit scheduled prompt `sch_existing`",
+        "color": 3447003,
+        "description": "This runs **on its own, on a clean session** — it won't remember this conversation. Write the prompt so it stands alone. Schedules don't carry files: for anything substantial, commit a runbook to the repo and have the prompt ask the agent to read it.\n\n⚠️ This schedule still carries 1 legacy reference file and will NOT run (#158). Scheduled prompts no longer send files: move those instructions into a repository runbook and edit the schedule so its prompt references the runbook. Saving that edit clears the legacy files and re-arms it. The stored bytes are left on disk under data/scheduled-attachments/.",
+        "fields": [
+          {
+            "name": "🏷️ Name",
+            "value": "Report"
+          },
+          {
+            "name": "✏️ Prompt",
+            "value": "```\nRead the runbook.\nPost the result.\n```"
+          },
+          {
+            "name": "🕐 Runs",
+            "value": "At 05:00 PM, Monday through Friday `0 17 * * 1-5`\nNext: <t:1792170000:F>",
+            "inline": true
+          },
+          {
+            "name": "🌍 Timezone",
+            "value": "UTC",
+            "inline": true
+          },
+          {
+            "name": "🧠 Session",
+            "value": "isolated (clean session)",
+            "inline": true
+          },
+          {
+            "name": "Agent",
+            "value": "`codex`",
+            "inline": true
+          },
+          {
+            "name": "🤖 Model",
+            "value": "`model-two`",
+            "inline": true
+          },
+          {
+            "name": "📂 Working dir",
+            "value": "`/repos/other`",
+            "inline": true
+          },
+          {
+            "name": "📮 Output to",
+            "value": "<#123456789>",
+            "inline": true
+          },
+          {
+            "name": "🖼️ Output as",
+            "value": "plain messages",
+            "inline": true
+          }
+        ]
+      }
+    ],
+    "components": [
+      {
+        "type": 1,
+        "components": [
+          {
+            "type": 3,
+            "custom_id": "sched:cadence",
+            "placeholder": "🕐 How often?",
+            "options": [
+              {
+                "label": "Every day at 9:00 AM",
+                "value": "0 9 * * *"
+              },
+              {
+                "label": "Weekdays at 9:00 AM",
+                "value": "0 9 * * 1-5"
+              },
+              {
+                "label": "Every Monday at 9:00 AM",
+                "value": "0 9 * * 1"
+              },
+              {
+                "label": "Every hour",
+                "value": "0 * * * *"
+              },
+              {
+                "label": "Every 15 minutes",
+                "value": "*/15 * * * *"
+              },
+              {
+                "label": "Custom cron…",
+                "value": "__custom__"
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "type": 1,
+        "components": [
+          {
+            "type": 3,
+            "custom_id": "sched:tz",
+            "placeholder": "🌍 Timezone",
+            "options": [
+              {
+                "label": "America/Chicago",
+                "value": "America/Chicago",
+                "default": false
+              },
+              {
+                "label": "America/New_York",
+                "value": "America/New_York",
+                "default": false
+              },
+              {
+                "label": "America/Denver",
+                "value": "America/Denver",
+                "default": false
+              },
+              {
+                "label": "America/Los_Angeles",
+                "value": "America/Los_Angeles",
+                "default": false
+              },
+              {
+                "label": "UTC",
+                "value": "UTC",
+                "default": true
+              },
+              {
+                "label": "Europe/London",
+                "value": "Europe/London",
+                "default": false
+              },
+              {
+                "label": "Europe/Berlin",
+                "value": "Europe/Berlin",
+                "default": false
+              },
+              {
+                "label": "Asia/Tokyo",
+                "value": "Asia/Tokyo",
+                "default": false
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "type": 1,
+        "components": [
+          {
+            "type": 3,
+            "custom_id": "sched:model",
+            "placeholder": "🤖 Model",
+            "options": [
+              {
+                "label": "Thread default (session-model)",
+                "value": "__default__",
+                "default": false
+              },
+              {
+                "label": "Model two",
+                "value": "model-two",
+                "default": true
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "type": 1,
+        "components": [
+          {
+            "type": 2,
+            "custom_id": "sched:prompt",
+            "label": "✏️ Prompt & details",
+            "style": 1
+          },
+          {
+            "type": 2,
+            "custom_id": "sched:output",
+            "label": "🖼️ Output: messages",
+            "style": 2
+          },
+          {
+            "type": 2,
+            "custom_id": "sched:mode",
+            "label": "🧵 Session: isolated",
+            "style": 2
+          },
+          {
+            "type": 2,
+            "custom_id": "sched:create",
+            "label": "💾 Save",
+            "style": 3,
+            "disabled": false
+          },
+          {
+            "type": 2,
+            "custom_id": "sched:cancel",
+            "label": "Cancel",
+            "style": 2
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "embeds": [
+      {
+        "title": "✏️ Edit scheduled prompt `sch_existing`",
+        "color": 3447003,
+        "description": "This runs **in this thread**, as a real turn on this conversation's session. It streams like a normal message, shares and remembers this thread's context, and waits its turn if the thread is busy. Schedules don't carry files: for anything substantial, commit a runbook to the repo and have the prompt ask the agent to read it.\n\n⚠️ This schedule still carries 1 legacy reference file and will NOT run (#158). Scheduled prompts no longer send files: move those instructions into a repository runbook and edit the schedule so its prompt references the runbook. Saving that edit clears the legacy files and re-arms it. The stored bytes are left on disk under data/scheduled-attachments/.",
+        "fields": [
+          {
+            "name": "🏷️ Name",
+            "value": "Report"
+          },
+          {
+            "name": "✏️ Prompt",
+            "value": "```\nRead the runbook.\nPost the result.\n```"
+          },
+          {
+            "name": "🕐 Runs",
+            "value": "At 05:00 PM, Monday through Friday `0 17 * * 1-5`\nNext: <t:1792170000:F>",
+            "inline": true
+          },
+          {
+            "name": "🌍 Timezone",
+            "value": "UTC",
+            "inline": true
+          },
+          {
+            "name": "🧠 Session",
+            "value": "live (in this thread)",
+            "inline": true
+          }
+        ]
+      }
+    ],
+    "components": [
+      {
+        "type": 1,
+        "components": [
+          {
+            "type": 3,
+            "custom_id": "sched:cadence",
+            "placeholder": "🕐 How often?",
+            "options": [
+              {
+                "label": "Every day at 9:00 AM",
+                "value": "0 9 * * *"
+              },
+              {
+                "label": "Weekdays at 9:00 AM",
+                "value": "0 9 * * 1-5"
+              },
+              {
+                "label": "Every Monday at 9:00 AM",
+                "value": "0 9 * * 1"
+              },
+              {
+                "label": "Every hour",
+                "value": "0 * * * *"
+              },
+              {
+                "label": "Every 15 minutes",
+                "value": "*/15 * * * *"
+              },
+              {
+                "label": "Custom cron…",
+                "value": "__custom__"
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "type": 1,
+        "components": [
+          {
+            "type": 3,
+            "custom_id": "sched:tz",
+            "placeholder": "🌍 Timezone",
+            "options": [
+              {
+                "label": "America/Chicago",
+                "value": "America/Chicago",
+                "default": false
+              },
+              {
+                "label": "America/New_York",
+                "value": "America/New_York",
+                "default": false
+              },
+              {
+                "label": "America/Denver",
+                "value": "America/Denver",
+                "default": false
+              },
+              {
+                "label": "America/Los_Angeles",
+                "value": "America/Los_Angeles",
+                "default": false
+              },
+              {
+                "label": "UTC",
+                "value": "UTC",
+                "default": true
+              },
+              {
+                "label": "Europe/London",
+                "value": "Europe/London",
+                "default": false
+              },
+              {
+                "label": "Europe/Berlin",
+                "value": "Europe/Berlin",
+                "default": false
+              },
+              {
+                "label": "Asia/Tokyo",
+                "value": "Asia/Tokyo",
+                "default": false
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "type": 1,
+        "components": [
+          {
+            "type": 2,
+            "custom_id": "sched:prompt",
+            "label": "✏️ Prompt & details",
+            "style": 1
+          },
+          {
+            "type": 2,
+            "custom_id": "sched:mode",
+            "label": "🧠 Session: live",
+            "style": 2
+          },
+          {
+            "type": 2,
+            "custom_id": "sched:create",
+            "label": "💾 Save",
+            "style": 3,
+            "disabled": false
+          },
+          {
+            "type": 2,
+            "custom_id": "sched:cancel",
+            "label": "Cancel",
+            "style": 2
+          }
+        ]
+      }
+    ]
+  }
+]

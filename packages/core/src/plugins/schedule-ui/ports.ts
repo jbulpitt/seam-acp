@@ -4,7 +4,7 @@ import type { ChannelRef, ComponentEvent } from "../../platforms/chat-adapter.js
 import type { CardLifecycle, CardView, StoppableCollector } from "../../platforms/discord/collector-lifecycle.js";
 import type { SlashInvocation } from "../slash-registry.js";
 import type { ComponentAcknowledgement } from "../../platforms/interaction-response.js";
-import type { ScheduleListPorts } from "../../core/schedule-list.js";
+import type { ScheduleEditorPorts } from "../../core/schedule-editor.js";
 
 export type ScheduleReply = CardView & { flags?: number | bigint };
 export interface ScheduleModal {
@@ -45,13 +45,8 @@ export interface ScheduleClick extends ScheduleInteraction {
   openFollowUp(): ScheduleInteraction;
 }
 
-export interface ScheduleUiPorts extends ScheduleListPorts {
+export interface ScheduleUiPorts extends ScheduleEditorPorts {
   logger: Pick<Logger, "warn" | "error">;
-  reposRoot: string;
-  builderDefaults(channel: ChannelRef): {
-    agent: string; registered: boolean; model: string; cwd: string;
-    models: Array<{ modelId: string; name: string }>;
-  };
   interaction(invocation: SlashInvocation): ScheduleInteraction;
   component(invocation: ComponentEvent): ScheduleClick;
 }

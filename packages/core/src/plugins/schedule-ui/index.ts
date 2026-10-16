@@ -1,4 +1,3 @@
-import { randomUUID } from "node:crypto";
 import { ApplicationCommandOptionType as Option, MessageFlags, EmbedBuilder, ButtonBuilder, ActionRowBuilder, ButtonStyle, StringSelectMenuBuilder, ModalBuilder, TextInputBuilder, TextInputStyle } from "discord.js";
 import type { ChannelRef } from "../../platforms/chat-adapter.js";
 import { CardLifecycle, expiredCardView } from "../../platforms/discord/collector-lifecycle.js";
@@ -6,7 +5,6 @@ import { parseScheduleListCustomId, requestedSchedulePage, scheduleListDescripti
 import { AutocompleteRegistry, tokenAutocompleteChoices } from "../../platforms/discord/autocomplete.js";
 import { describeCron, validateCron, nextRun as cronNextRun } from "../../core/scheduled-prompts/cron.js";
 import { legacyAttachmentQuarantine } from "../../core/scheduled-prompts/quarantine.js";
-import { resolveRepoPath } from "../../core/path-utils.js";
 import type { ScheduledPrompt } from "../../core/scheduled-prompts/types.js";
 import type { Plugin } from "../types.js";
 import type { SlashContribution } from "../slash-registry.js";
@@ -14,27 +12,10 @@ import type { ScheduleInteraction, ScheduleClick, ScheduleUiPorts } from "./port
 import type { ComponentAcknowledgementContext, ComponentResponseMode } from "../../platforms/interaction-response.js";
 import { ScheduleList, type ScheduleListRow } from "../../core/schedule-list.js";
 
+import { SCHEDULE_PRESETS, SCHEDULE_TIMEZONES, scheduleDraft, scheduleMissingFields, schedulePromptDetails, saveSchedule } from "../../core/schedule-editor.js";
+
 const PLATFORM = "discord";
 const SCHEDULED_COLOR = 0x3498db;
-const SCHEDULE_DEFAULT_TZ = "America/Chicago";
-const SCHEDULE_TIMEZONES = [
-  "America/Chicago",
-  "America/New_York",
-  "America/Denver",
-  "America/Los_Angeles",
-  "UTC",
-  "Europe/London",
-  "Europe/Berlin",
-  "Asia/Tokyo",
-];
-const SCHEDULE_PRESETS: Array<{ label: string; value: string }> = [
-  { label: "Every day at 9:00 AM", value: "0 9 * * *" },
-  { label: "Weekdays at 9:00 AM", value: "0 9 * * 1-5" },
-  { label: "Every Monday at 9:00 AM", value: "0 9 * * 1" },
-  { label: "Every hour", value: "0 * * * *" },
-  { label: "Every 15 minutes", value: "*/15 * * * *" },
-  { label: "Custom cron…", value: "__custom__" },
-];
 const SCHEDULE_LEAVES = [
   { name: "add", description: "Create a scheduled prompt (finish setup on the card)", handle: "cmdScheduleAdd", id: false },
   { name: "list", description: "List this thread's scheduled prompts", handle: "cmdScheduleList", id: false },
@@ -254,17 +235,7 @@ export class ScheduleUi {
     }
     const { agent: inheritedAgent, registered: profile, model: sessionModel, cwd: inheritedCwd, models } = this.ports.builderDefaults(channel);
 
-    const state = {
-      name: existing?.name ?? "",
-      promptText: existing?.promptText ?? "",
-      cron: (existing?.cron ?? null) as string | null,
-      timezone: existing?.timezone ?? SCHEDULE_DEFAULT_TZ,
-      model: existing?.model ?? null, // null = inherit effective thread model at fire time
-      cwd: existing?.cwd ?? null, // null = inherit effective thread cwd at fire time
-      target: existing?.targetChannel ?? null, // null = this thread
-      outputType: (existing?.outputType ?? "card") as "card" | "messages",
-      sessionMode: (existing?.sessionMode ?? "isolated") as "isolated" | "live",
-    };
+    const state = scheduleDraft(existing);
     const quarantine = existing ? legacyAttachmentQuarantine(existing) : null;
 
     const render = () => {
@@ -419,21 +390,12 @@ export class ScheduleUi {
           await c.showModal(modal);
           const sub = await c.awaitModalSubmit({ acknowledgement: "update", filter: (m) => m.customId === `sched:promptmodal:${msg.id}` && m.user.id === i.user.id, time: 600_000 });
           if (sub) {
-            state.name = sub.fields.getTextInputValue("name").trim();
-            state.promptText = sub.fields.getTextInputValue("prompt").trim();
-            const errors: string[] = [];
-            if (!modalLive) {
-              const rawCwd = sub.fields.getTextInputValue("cwd").trim();
-              if (rawCwd) {
-                try { state.cwd = resolveRepoPath(this.ports.reposRoot, rawCwd); }
-                catch (e) { errors.push(`cwd: ${(e as Error).message}`); }
-              } else state.cwd = null;
-              const rawTarget = sub.fields.getTextInputValue("target").trim();
-              if (rawTarget) {
-                if (/^\d+$/.test(rawTarget)) state.target = rawTarget;
-                else errors.push("output id must be a numeric channel/thread id");
-              } else state.target = null;
-            }
+            const details = schedulePromptDetails(PLATFORM, this.ports.reposRoot, state, {
+              name: sub.fields.getTextInputValue("name"), promptText: sub.fields.getTextInputValue("prompt"),
+              ...(!modalLive ? { cwd: sub.fields.getTextInputValue("cwd"), target: sub.fields.getTextInputValue("target") } : {}),
+            }, modalLive);
+            Object.assign(state, details.draft);
+            const errors = details.errors;
             await i.reply(render());
             if (errors.length) await sub.followUp({ content: `⚠️ ${errors.join("; ")}`, flags: MessageFlags.Ephemeral });
           }
@@ -441,49 +403,16 @@ export class ScheduleUi {
           await lifecycle.terminal("cancel", { content: "Cancelled.", embeds: [], components: [] });
         } else if (c.isButton() && c.customId === "sched:create") {
           if (!state.name || !state.promptText || !state.cron) {
-            const missing: string[] = [];
-            if (!state.name) missing.push("a name");
-            if (!state.promptText) missing.push("a prompt");
-            if (!state.cron) missing.push("a cadence/schedule");
+            const missing = scheduleMissingFields(state);
             await c.followUp({
               content: `⚠️ Not created yet — still need ${missing.join(", ")}. Use **Prompt & details** to set the name + prompt and pick a cadence, then click Create.`,
               flags: MessageFlags.Ephemeral,
             });
             return;
           }
-          const now = new Date().toISOString();
-          const next = cronNextRun(state.cron, state.timezone);
+          const row = saveSchedule(this.ports, channel, i.user.id, state, existing);
+          const next = row.nextRunUtc ? new Date(row.nextRunUtc) : null;
           const live = state.sessionMode === "live";
-          const persistedModel = live ? null : state.model;
-          const persistedCwd = live ? null : state.cwd;
-          const persistedTarget = live ? null : state.target;
-          const persistedOutput: "card" | "messages" = live ? "card" : state.outputType;
-          let row: ScheduledPrompt;
-          if (existing) {
-            row = {
-              ...existing,
-              name: state.name, promptText: state.promptText, cron: state.cron, timezone: state.timezone,
-              model: persistedModel, cwd: persistedCwd, targetChannel: persistedTarget, outputType: persistedOutput,
-              sessionMode: state.sessionMode,
-              legacyAttachmentCount: 0,
-              updatedUtc: now, nextRunUtc: next ? next.toISOString() : null,
-            };
-            this.ports.repository.save(row);
-            this.ports.admin.reschedule(existing.id);
-          } else {
-            const id = `sch_${randomUUID().slice(0, 8)}`;
-            row = {
-              id, platform: PLATFORM, channelRef: channel.id, parentRef: channel.parentId ?? null,
-              name: state.name, promptText: state.promptText, cron: state.cron, timezone: state.timezone,
-              model: persistedModel, cwd: persistedCwd, targetChannel: persistedTarget, outputType: persistedOutput,
-              sessionMode: state.sessionMode,
-              catchupSeconds: 7200, enabled: true, legacyAttachmentCount: 0, createdBy: i.user.id,
-              createdUtc: now, updatedUtc: now, lastRunUtc: null, lastStatus: null,
-              nextRunUtc: next ? next.toISOString() : null, pinnedSessionId: null,
-            };
-            this.ports.repository.save(row);
-            this.ports.admin.arm(row);
-          }
           const confirm = new EmbedBuilder()
             .setTitle(existing ? "✏️ Scheduled prompt updated" : "⏰ Scheduled prompt created")
             .setColor(0x2ecc71)

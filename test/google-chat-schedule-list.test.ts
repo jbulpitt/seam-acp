@@ -268,6 +268,15 @@ describe("Google Chat inline schedule editor", () => {
     expect(JSON.stringify(h.messages.get(name))).not.toContain("schedule 0");
   });
 
+  it("edits a native-thread schedule against that thread's defaults and keeps its binding", async () => {
+    const h = fixture(0);
+    h.store.upsertScheduled(schedule(0, { channelRef: "home.topic", parentRef: "home" }));
+    const name = await h.open(); await h.click(name, "Edit", "schedule 0");
+    expect(h.ports.builderDefaults).toHaveBeenCalledWith({ platform: "google-chat", id: "home.topic", parentId: "home" });
+    await h.submit(name, { name: "thread edit" });
+    expect(h.store.getScheduled("sch_0")).toMatchObject({ name: "thread edit", channelRef: "home.topic", parentRef: "home", model: null, cwd: null });
+  });
+
   it("cancels an unsaved form without changing schedules or its list page", async () => {
     const h = fixture(), before = h.store.listScheduledByChannel("google-chat", "home"), name = await h.open();
     await h.click(name, "Next"); await h.click(name, "Edit", "schedule 4");
@@ -294,9 +303,11 @@ describe("Google Chat inline schedule editor", () => {
     await h.submit(name, { cadence: "0 * * * *" });
     expect(JSON.stringify(h.messages.get(name))).toContain("a name");
     expect(JSON.stringify(h.messages.get(name))).toContain("a prompt");
-    await h.submit(name, { name: "target", prompt: "read", target: "not a channel!" });
+    await h.submit(name, { name: "target", prompt: "read", cwd: '"', target: "not a channel!" });
     expect(h.store.listScheduledByChannel("google-chat", "home")).toHaveLength(0);
     expect(h.fields(name).target).toBe("not a channel!");
+    expect(h.fields(name).cwd).toBe('"');
+    expect(JSON.stringify(h.messages.get(name))).toContain("Repo path is required");
     expect(JSON.stringify(h.messages.get(name))).toContain("Space/thread");
   });
 

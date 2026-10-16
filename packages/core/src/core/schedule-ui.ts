@@ -1,4 +1,6 @@
 import type { ChatInputCommandInteraction } from "discord.js";
+import type { ChannelRef } from "../platforms/chat-adapter.js";
+import type { ScheduleBuilderDefaults } from "./schedule-editor.js";
 import type { Config } from "../config.js";
 import type { Logger } from "../lib/logger.js";
 import type { SessionStore } from "./session-store.js";
@@ -16,21 +18,24 @@ interface ScheduleUiDependencies {
   runNow(id: string): Promise<void>;
 }
 
+export function scheduleBuilderDefaults(deps: Pick<ScheduleUiDependencies, "config" | "router" | "modelCatalog">,
+  channel: ChannelRef): ScheduleBuilderDefaults {
+  const record = deps.router.ensureSessionRecord({ platform: channel.platform, channelRef: channel.id,
+    ...(channel.parentId ? { parentRef: channel.parentId } : {}), cwd: deps.config.REPOS_ROOT });
+  const current = deps.router.describeConfig(record);
+  return {
+    agent: current.agent.value, registered: Boolean(deps.router.getProfile(current.agent.value)), model: current.model.value, cwd: current.cwd.value,
+    models: deps.modelCatalog.models({ agentId: current.agent.value, location: current.location.value }, { current: current.model.value })
+      .map(model => ({ modelId: model.id, name: model.displayName })).slice(0, 24),
+  };
+}
+
 /** Controller-only schedule repository and administration facade. */
 export function scheduleUiPorts(deps: ScheduleUiDependencies, interaction: ScheduleUiPorts["interaction"], component: ScheduleUiPorts["component"]): ScheduleUiPorts {
   return {
     logger: deps.logger.child({ plugin: "schedule-ui" }), reposRoot: deps.config.REPOS_ROOT,
     ...createScheduleListPorts(deps),
-    builderDefaults: channel => {
-      const record = deps.router.ensureSessionRecord({ platform: channel.platform, channelRef: channel.id,
-        ...(channel.parentId ? { parentRef: channel.parentId } : {}), cwd: deps.config.REPOS_ROOT });
-      const current = deps.router.describeConfig(record);
-      return {
-        agent: current.agent.value, registered: Boolean(deps.router.getProfile(current.agent.value)), model: current.model.value, cwd: current.cwd.value,
-        models: deps.modelCatalog.models({ agentId: current.agent.value, location: current.location.value }, { current: current.model.value })
-          .map(model => ({ modelId: model.id, name: model.displayName })).slice(0, 24),
-      };
-    },
+    builderDefaults: channel => scheduleBuilderDefaults(deps, channel),
     interaction, component,
   };
 }

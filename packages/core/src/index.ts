@@ -70,6 +70,7 @@ import { DEFAULT_THREAD_NAMER_CONFIG } from "./platforms/discord/thread-namer.js
 import { buildGlobalMcpServers } from "./mcp.js";
 import { startTunnelGistPublisher } from "./lib/tunnel-gist.js";
 import { ScheduledPromptManager } from "./core/scheduled-prompts/manager.js";
+import { createScheduleListPorts } from "./core/schedule-list.js";
 import { WakeManager } from "./core/wake/manager.js";
 import { ParkedPromptManager } from "./core/parked-prompts/manager.js";
 import { WarmSetManager } from "./core/warm-set/manager.js";
@@ -568,6 +569,8 @@ async function main(): Promise<void> {
   googleChat?.setCommandDeps({ store, router, mutation: orchestrator.getConfigMutation(), runtimeTransition: orchestrator.getRuntimeTransition(),
     configPlan: orchestrator.getConfigApplyPlan(), modelCatalog,
     deliveryForChannel: (channel, messageId) => orchestrator.deliveryForChannel(channel, messageId),
+    scheduleList: { adminUserIds: config.GOOGLE_CHAT_ADMIN_USER_IDS,
+      ports: createScheduleListPorts({ store, manager: () => scheduledManager, runNow: id => orchestrator.runScheduledPrompt(id) }) },
     cancelChannel: channel => orchestrator.cancelChannel(channel) });
   googleChat?.installSessionSpaces({ config,
     prepare: snapshot => prepareGoogleChatSpaceSelection(snapshot, { router, modelCatalog,

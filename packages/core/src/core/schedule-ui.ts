@@ -8,6 +8,7 @@ import type { ScheduledPromptManager } from "./scheduled-prompts/manager.js";
 import type { PluginHost } from "../plugins/host.js";
 import type { SlashInvocation } from "../plugins/slash-registry.js";
 import type { ScheduleInteraction, ScheduleUiPorts } from "../plugins/schedule-ui/ports.js";
+import { createScheduleListPorts } from "./schedule-list.js";
 
 interface ScheduleUiDependencies {
   config: Config; logger: Logger; store: SessionStore; router: SessionRouter;
@@ -19,16 +20,9 @@ interface ScheduleUiDependencies {
 export function scheduleUiPorts(deps: ScheduleUiDependencies, interaction: ScheduleUiPorts["interaction"], component: ScheduleUiPorts["component"]): ScheduleUiPorts {
   return {
     logger: deps.logger.child({ plugin: "schedule-ui" }), reposRoot: deps.config.REPOS_ROOT,
-    repository: {
-      list: channel => deps.store.listScheduledByChannel("discord", channel),
-      get: id => deps.store.getScheduled(id) ?? undefined, save: row => deps.store.upsertScheduled(row), remove: id => deps.store.deleteScheduled(id),
-    },
-    admin: {
-      arm: row => deps.manager()?.armFromRow(row), disarm: id => deps.manager()?.disarm(id), reschedule: id => deps.manager()?.reschedule(id),
-      runNow: async id => { const manager = deps.manager(); if (manager) await manager.runNow(id); else await deps.runNow(id); },
-    },
+    ...createScheduleListPorts(deps),
     builderDefaults: channel => {
-      const record = deps.router.ensureSessionRecord({ platform: "discord", channelRef: channel.id,
+      const record = deps.router.ensureSessionRecord({ platform: channel.platform, channelRef: channel.id,
         ...(channel.parentId ? { parentRef: channel.parentId } : {}), cwd: deps.config.REPOS_ROOT });
       const current = deps.router.describeConfig(record);
       return {

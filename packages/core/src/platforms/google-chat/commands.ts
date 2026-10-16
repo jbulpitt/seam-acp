@@ -7,6 +7,7 @@ export const GOOGLE_CHAT_COMMANDS = [
   { command: "model", id: 4, name: "/model", description: "Set this session's model: /model <id>", type: "SLASH_COMMAND" },
   { command: "repo", id: 5, name: "/repo", description: "Set this session's repo: /repo <path>", type: "SLASH_COMMAND" },
   { command: "effort", id: 6, name: "/effort", description: "Set this session's effort: /effort <level>", type: "SLASH_COMMAND" },
+  { command: "schedules", id: 7, name: "/schedules", description: "Manage this Space's schedules privately", type: "SLASH_COMMAND" },
 ] as const;
 
 export type GoogleChatCommandName = typeof GOOGLE_CHAT_COMMANDS[number]["command"];

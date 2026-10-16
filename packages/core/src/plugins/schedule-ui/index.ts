@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { ApplicationCommandOptionType as Option, MessageFlags, EmbedBuilder, ButtonBuilder, ActionRowBuilder, ButtonStyle, StringSelectMenuBuilder, ModalBuilder, TextInputBuilder, TextInputStyle } from "discord.js";
 import type { ChannelRef } from "../../platforms/chat-adapter.js";
 import { CardLifecycle, expiredCardView } from "../../platforms/discord/collector-lifecycle.js";
-import { paginateSchedules, parseScheduleListCustomId, requestedSchedulePage, scheduleListDescription, scheduleNavState, schedulePageCaption, schedulePageCustomId, scheduleRunOutcome } from "../../platforms/discord/schedule-list-view.js";
+import { parseScheduleListCustomId, requestedSchedulePage, scheduleListDescription, scheduleNavState, schedulePageCaption, schedulePageCustomId } from "../../platforms/discord/schedule-list-view.js";
 import { AutocompleteRegistry, tokenAutocompleteChoices } from "../../platforms/discord/autocomplete.js";
 import { describeCron, validateCron, nextRun as cronNextRun } from "../../core/scheduled-prompts/cron.js";
 import { legacyAttachmentQuarantine } from "../../core/scheduled-prompts/quarantine.js";
@@ -12,6 +12,7 @@ import type { Plugin } from "../types.js";
 import type { SlashContribution } from "../slash-registry.js";
 import type { ScheduleInteraction, ScheduleClick, ScheduleUiPorts } from "./ports.js";
 import type { ComponentAcknowledgementContext, ComponentResponseMode } from "../../platforms/interaction-response.js";
+import { ScheduleList, type ScheduleListRow } from "../../core/schedule-list.js";
 
 const PLATFORM = "discord";
 const SCHEDULED_COLOR = 0x3498db;
@@ -43,15 +44,17 @@ const SCHEDULE_LEAVES = [
 ] as const;
 
 export class ScheduleUi {
+  readonly list: ScheduleList;
   readonly autocomplete = new AutocompleteRegistry();
   readonly editTransitions = new Map<string, CardLifecycle>();
   logger: ScheduleUiPorts["logger"];
   constructor(readonly ports: ScheduleUiPorts) {
+    this.list = new ScheduleList(ports);
     this.logger = ports.logger;
     for (const leaf of SCHEDULE_LEAVES.filter(leaf => leaf.id)) this.autocomplete.register("schedule", leaf.name, "id", "opaque", ctx => {
       try {
         if (!ctx.channelId) return [];
-        return tokenAutocompleteChoices(ports.repository.list(ctx.channelId).map(row => ({ id: row.id, label: row.name })), ctx.focusedValue);
+        return tokenAutocompleteChoices(ports.repository.list(ctx.channelId, PLATFORM).map(row => ({ id: row.id, label: row.name })), ctx.focusedValue);
       } catch { return []; }
     });
   }
@@ -61,14 +64,14 @@ export class ScheduleUi {
       channelId: i.channelRef?.id, parentId: i.channelRef?.parentId, projectScopeId: i.channelRef?.parentId,
     });
   }
-  private scheduleSummaryLine(s: ScheduledPrompt): string {
+  private scheduleSummaryLine(s: ScheduleListRow): string {
     const state = s.enabled ? "🟢" : "⏸️";
     const last = s.lastStatus ? ` · last: ${s.lastStatus}` : "";
     const next = s.enabled && s.nextRunUtc ? ` · next: <t:${Math.floor(Date.parse(s.nextRunUtc) / 1000)}:R>` : "";
-    const quarantined = legacyAttachmentQuarantine(s) ? " · ⚠️ legacy files — edit to re-arm" : "";
+    const quarantined = s.quarantined ? " · ⚠️ legacy files — edit to re-arm" : "";
     const model = s.sessionMode !== "live" && s.model ? ` · 🤖${s.model}` : "";
     const mode = s.sessionMode === "live" ? " · 🧠live" : "";
-    return `${state} **${s.name}** \`${s.id}\`\n   ${describeCron(s.cron)} (${s.timezone})${mode}${model}${quarantined}${next}${last}`;
+    return `${state} **${s.name}** \`${s.id}\`\n   ${s.cadence} (${s.timezone})${mode}${model}${quarantined}${next}${last}`;
   }
 
   async cmdScheduleList(i: ScheduleInteraction): Promise<void> {
@@ -77,7 +80,7 @@ export class ScheduleUi {
       await i.reply({ content: "Use this inside a thread.", flags: MessageFlags.Ephemeral });
       return;
     }
-    if (this.ports.repository.list(channel.id).length === 0) {
+    if (this.list.page(channel).total === 0) {
       await i.reply({ content: "No scheduled prompts for this thread. Create one with `/seamadmin schedule add`.", flags: MessageFlags.Ephemeral });
       return;
     }
@@ -100,19 +103,14 @@ export class ScheduleUi {
       return;
     }
     const id = parsed?.arg;
-    const row = id ? this.ports.repository.get(id) : undefined;
-    if (!row || !id || row.channelRef !== channel.id) {
+    const row = id ? this.list.get(channel, id) : undefined;
+    if (!row || !id) {
       await c.followUp({ content: "That schedule no longer exists.", flags: MessageFlags.Ephemeral });
       await c.editReply(rebuild());
       return;
     }
     if (parsed?.action === "run") {
-      await this.ports.admin.runNow(id);
-      const fresh = this.ports.repository.get(id);
-      await c.followUp({ content: scheduleRunOutcome({
-        name: row.name, status: fresh?.lastStatus,
-        quarantined: !!legacyAttachmentQuarantine(fresh ?? row),
-      }), flags: MessageFlags.Ephemeral });
+      await c.followUp({ content: await this.list.run(channel, id), flags: MessageFlags.Ephemeral });
       await c.editReply(rebuild());
     } else if (parsed?.action === "edit") {
       let lifecycle = this.editTransitions.get(c.messageId);
@@ -129,14 +127,10 @@ export class ScheduleUi {
       const editor = c.openFollowUp();
       await this.cmdScheduleAdd(editor, row);
     } else if (parsed?.action === "toggle") {
-      const updated: ScheduledPrompt = { ...row, enabled: !row.enabled, updatedUtc: new Date().toISOString() };
-      this.ports.repository.save(updated);
-      if (updated.enabled) this.ports.admin.arm(updated);
-      else this.ports.admin.disarm(id);
+      this.list.toggle(channel, id);
       await c.editReply(rebuild());
     } else if (parsed?.action === "del") {
-      this.ports.admin.disarm(id);
-      this.ports.repository.remove(id);
+      this.list.remove(channel, id);
       await c.editReply(rebuild());
     }
   }
@@ -149,8 +143,7 @@ export class ScheduleUi {
     components: ActionRowBuilder<ButtonBuilder>[];
     page: number;
   } {
-    const rows = this.ports.repository.list(channel.id);
-    const slice = paginateSchedules(rows, page);
+    const slice = this.list.page(channel, page);
     const embed = new EmbedBuilder()
       .setTitle("⏰ Scheduled prompts")
       .setColor(SCHEDULED_COLOR)

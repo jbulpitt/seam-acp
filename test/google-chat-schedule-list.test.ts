@@ -30,6 +30,8 @@ function fixture(count = 5, admins = new Set(["users/42"])) {
   const ports = scheduleUiPorts({ store, logger, config: { REPOS_ROOT: "/fixture" },
     manager: () => manager, runNow: vi.fn(), router: {}, modelCatalog: {} } as any,
     () => { throw new Error("not a Discord interaction"); }, () => { throw new Error("not a Discord component"); });
+  ports.builderDefaults = vi.fn(() => ({ agent: "codex", registered: true, model: "session-model", cwd: "/fixture/repo",
+    models: [{ modelId: "other-model", name: "Other model" }] }));
   const messages = new Map<string, any>();
   let sent = 0;
   const request = vi.fn(async (scope: string, r: any): Promise<any> => {
@@ -70,12 +72,22 @@ function fixture(count = 5, admins = new Set(["users/42"])) {
     const found = controls.find((b: any) => b.text === label);
     expect(found, `button ${label} for ${row ?? "list"}`).toBeDefined(); return found;
   };
-  const clickRaw = (name: string, control: any, actor = "42", id?: string) => deliver({ type: "CARD_CLICKED", space,
-    user: user(actor), message: messages.get(name), action: {
+  const clickRaw = (name: string, control: any, actor = "42", id?: string, fields?: Record<string, string>) => deliver({ type: "CARD_CLICKED", space,
+    user: user(actor), message: messages.get(name), ...(fields ? { common: { formInputs: Object.fromEntries(
+      Object.entries(fields).map(([key, value]) => [key, { stringInputs: { value: [value] } }])) } } : {}), action: {
       actionMethodName: control.onClick.action.function, parameters: control.onClick.action.parameters,
     } }, id);
   const click = (name: string, label: string, row?: string, actor = "42", id?: string) => clickRaw(name, button(name, label, row), actor, id);
-  return { store, manager, request, messages, open, click, clickRaw, button, deliver };
+  const widgets = (name: string): any[] => messages.get(name).cardsV2.flatMap((c: any) => c.card.sections.flatMap((s: any) => s.widgets));
+  const fields = (name: string): Record<string, string> => Object.fromEntries(widgets(name).flatMap(w => w.textInput
+    ? [[w.textInput.name, w.textInput.value ?? ""]]
+    : w.selectionInput ? [[w.selectionInput.name, w.selectionInput.items.find((i: any) => i.selected)?.value ?? ""]] : []));
+  const submit = (name: string, values: Record<string, string> = {}, id?: string) => clickRaw(name, button(name, "Save"), "42", id, { ...fields(name), ...values });
+  const change = (name: string, field: string, value: string, overrides: Record<string, string> = {}) => {
+    const input = widgets(name).find(w => w.selectionInput?.name === field).selectionInput;
+    return clickRaw(name, { onClick: { action: input.onChangeAction } }, "42", undefined, { ...fields(name), ...overrides, [field]: value });
+  };
+  return { store, manager, ports, request, messages, open, click, clickRaw, button, deliver, widgets, fields, submit, change };
 }
 
 describe("private Google Chat schedule list", () => {
@@ -191,5 +203,115 @@ describe("private Google Chat schedule list", () => {
     await h.click(name, "Run now", "schedule 0");
     expect(JSON.stringify(h.messages.get(name))).toContain("bridge worker unavailable: original cause");
     expect(h.messages.get(name).privateMessageViewer).toEqual({ name: "users/42" });
+  });
+});
+
+
+describe("Google Chat inline schedule editor", () => {
+  it("offers Add and Edit only to admins and keeps the form on the original private message", async () => {
+    const h = fixture(1), member = await h.open("43"), name = await h.open();
+    expect(JSON.stringify(h.messages.get(member))).not.toContain('"text":"Add schedule"');
+    expect(JSON.stringify(h.messages.get(member))).not.toContain('"text":"Edit"');
+    await h.click(name, "Add schedule");
+    expect(h.fields(name)).toMatchObject({ name: "", prompt: "", timezone: "America/Chicago", mode: "isolated", model: "__default__", cwd: "", target: "", output: "card" });
+    expect(h.messages.get(name).privateMessageViewer).toEqual({ name: "users/42" });
+    expect(h.request.mock.calls.filter(([, r]) => r.method === "PATCH").at(-1)?.[1]).toMatchObject({
+      url: `https://chat.googleapis.com/v1/${name}`, params: { updateMask: "cardsV2" }, data: { cardsV2: expect.any(Array) },
+    });
+    const save = h.button(name, "Save");
+    const forged = { ...save, onClick: { action: { ...save.onClick.action, parameters: save.onClick.action.parameters.map((p: any) => ({ ...p, value: p.key === "viewer" ? "users/43" : p.value })) } } };
+    await h.clickRaw(member, forged, "43", undefined, { ...h.fields(name), name: "not allowed", prompt: "run", cadence: "0 * * * *" });
+    expect(h.store.listScheduledByChannel("google-chat", "home")).toHaveLength(1);
+    expect(h.manager.armFromRow).not.toHaveBeenCalled();
+  });
+
+  it("saves a preset with the shared defaults, repo path and native Chat target", async () => {
+    const h = fixture(0), name = await h.open();
+    await h.click(name, "Add schedule");
+    await h.submit(name, { name: "  Weekly report  ", prompt: "  Read the runbook.  ", cadence: "0 9 * * 1", timezone: "UTC",
+      model: "other-model", cwd: "repo", output: "messages", target: "spaces/destination/threads/topic" });
+    const rows = h.store.listScheduledByChannel("google-chat", "home");
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({ platform: "google-chat", channelRef: "home", name: "Weekly report", promptText: "Read the runbook.",
+      cron: "0 9 * * 1", timezone: "UTC", sessionMode: "isolated", model: "other-model", cwd: "/fixture/repo", targetChannel: "destination.topic",
+      outputType: "messages", createdBy: "42", catchupSeconds: 7200, enabled: true, legacyAttachmentCount: 0, lastStatus: null, pinnedSessionId: null });
+    expect(rows[0]?.nextRunUtc).toBeTruthy();
+    expect(h.manager.armFromRow).toHaveBeenCalledExactlyOnceWith(rows[0]);
+    expect(JSON.stringify(h.messages.get(name))).toContain("Weekly report");
+    expect(h.widgets(name).some(w => w.textInput)).toBe(false);
+  });
+
+  it("keeps invalid custom cron and all entered values until a corrected Save", async () => {
+    const h = fixture(0), name = await h.open();
+    await h.click(name, "Add schedule");
+    await h.submit(name, { name: "custom", prompt: "keep this\nwhole prompt", cadence: "__custom__", cron: "not a cron", timezone: "Asia/Tokyo", cwd: "repo", target: "destination.topic", output: "messages", model: "other-model" });
+    expect(h.store.listScheduledByChannel("google-chat", "home")).toHaveLength(0);
+    expect(JSON.stringify(h.messages.get(name))).toContain("Invalid cron:");
+    expect(h.fields(name)).toMatchObject({ name: "custom", prompt: "keep this\nwhole prompt", cron: "not a cron", timezone: "Asia/Tokyo", cwd: "repo", target: "destination.topic", output: "messages", model: "other-model" });
+    await h.submit(name, { cron: "0 17 * * 1-5" });
+    expect(h.store.listScheduledByChannel("google-chat", "home")[0]).toMatchObject({ cron: "0 17 * * 1-5", timezone: "Asia/Tokyo" });
+    expect(h.manager.armFromRow).toHaveBeenCalledOnce();
+  });
+
+  it("prefills an edit, retains disabled/history fields and returns to the same page", async () => {
+    const h = fixture(), old = { ...h.store.getScheduled("sch_4")!, enabled: false, cron: "0 17 * * 1-5", timezone: "UTC",
+      model: "model-no-longer-in-catalog", cwd: "/fixture/original", targetChannel: "destination.topic", outputType: "messages" as const, pinnedSessionId: "original-acp", lastStatus: "ok", legacyAttachmentCount: 2 };
+    h.store.upsertScheduled(old);
+    const name = await h.open(); await h.click(name, "Next"); await h.click(name, "Edit", "schedule 4");
+    expect(h.fields(name)).toMatchObject({ name: old.name, prompt: old.promptText, cadence: "__custom__", cron: old.cron, timezone: "UTC", model: old.model, cwd: old.cwd, target: old.targetChannel, output: "messages" });
+    await h.submit(name, { name: "edited", prompt: "new prompt" });
+    expect(h.store.getScheduled(old.id)).toMatchObject({ ...old, name: "edited", promptText: "new prompt", legacyAttachmentCount: 0,
+      updatedUtc: expect.any(String), nextRunUtc: expect.any(String) });
+    expect(h.manager.reschedule).toHaveBeenCalledExactlyOnceWith(old.id);
+    expect(h.manager.armFromRow).not.toHaveBeenCalled();
+    expect(JSON.stringify(h.messages.get(name))).toContain("Page 2/2");
+    expect(JSON.stringify(h.messages.get(name))).not.toContain("schedule 0");
+  });
+
+  it("cancels an unsaved form without changing schedules or its list page", async () => {
+    const h = fixture(), before = h.store.listScheduledByChannel("google-chat", "home"), name = await h.open();
+    await h.click(name, "Next"); await h.click(name, "Edit", "schedule 4");
+    await h.change(name, "cadence", "__custom__", { name: "unsaved", prompt: "not persisted", cron: "bad cron" });
+    await h.click(name, "Cancel");
+    expect(h.store.listScheduledByChannel("google-chat", "home")).toEqual(before);
+    expect(JSON.stringify(h.messages.get(name))).toContain("Page 2/2");
+    expect(h.manager.reschedule).not.toHaveBeenCalled();
+  });
+
+  it("keeps typed values across mode changes, hides isolated fields in live mode and clears overrides on Save", async () => {
+    const h = fixture(0), name = await h.open(); await h.click(name, "Add schedule");
+    await h.change(name, "mode", "live", { name: "live report", prompt: "use this context", cadence: "0 * * * *", cwd: "repo", model: "other-model", target: "destination", output: "messages" });
+    expect(h.fields(name)).toMatchObject({ name: "live report", prompt: "use this context", mode: "live" });
+    expect(h.fields(name)).not.toHaveProperty("cwd"); expect(h.fields(name)).not.toHaveProperty("model");
+    await h.change(name, "mode", "isolated");
+    expect(h.fields(name)).toMatchObject({ cwd: "repo", model: "other-model", target: "destination", output: "messages" });
+    await h.change(name, "mode", "live"); await h.submit(name);
+    expect(h.store.listScheduledByChannel("google-chat", "home")[0]).toMatchObject({ sessionMode: "live", model: null, cwd: null, targetChannel: null, outputType: "card" });
+  });
+
+  it("validates required fields and target while preserving raw invalid values", async () => {
+    const h = fixture(0), name = await h.open(); await h.click(name, "Add schedule");
+    await h.submit(name, { cadence: "0 * * * *" });
+    expect(JSON.stringify(h.messages.get(name))).toContain("a name");
+    expect(JSON.stringify(h.messages.get(name))).toContain("a prompt");
+    await h.submit(name, { name: "target", prompt: "read", target: "not a channel!" });
+    expect(h.store.listScheduledByChannel("google-chat", "home")).toHaveLength(0);
+    expect(h.fields(name).target).toBe("not a channel!");
+    expect(JSON.stringify(h.messages.get(name))).toContain("Space/thread");
+  });
+
+  it("never creates twice after Save PATCH retry and Pub/Sub ACK redelivery", async () => {
+    const h = fixture(0), name = await h.open(); await h.click(name, "Add schedule");
+    const control = h.button(name, "Save"), values = { ...h.fields(name), name: "exactly once", prompt: "report", cadence: "0 * * * *" };
+    const normal = h.request.getMockImplementation()!; let failPatch = true, failAck = true;
+    h.request.mockImplementation(async (scope, r) => {
+      if (r.method === "PATCH" && failPatch) { failPatch = false; throw new Error("Chat PATCH connection lost"); }
+      if (scope === "pubsub" && failAck) { failAck = false; throw new Error("Pub/Sub ACK connection lost"); }
+      return normal(scope, r);
+    });
+    await expect(h.clickRaw(name, control, "42", "same-save", values)).rejects.toThrow("Pub/Sub ACK connection lost");
+    await h.clickRaw(name, control, "42", "same-save", values);
+    expect(h.store.listScheduledByChannel("google-chat", "home")).toHaveLength(1);
+    expect(h.manager.armFromRow).toHaveBeenCalledOnce();
   });
 });

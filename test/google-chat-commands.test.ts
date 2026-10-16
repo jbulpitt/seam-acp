@@ -12,6 +12,7 @@ describe("Google Chat non-add-on commands", () => {
       { name: "/new", id: 1, type: "SLASH_COMMAND" }, { name: "/cancel", id: 2, type: "SLASH_COMMAND" },
       { name: "/agent", id: 3, type: "SLASH_COMMAND" }, { name: "/model", id: 4, type: "SLASH_COMMAND" },
       { name: "/repo", id: 5, type: "SLASH_COMMAND" }, { name: "/effort", id: 6, type: "SLASH_COMMAND" },
+      { name: "/schedules", id: 7, type: "SLASH_COMMAND" },
     ]);
     for (const entry of GOOGLE_CHAT_COMMANDS) expect(entry.description.length).toBeLessThanOrEqual(50);
   });

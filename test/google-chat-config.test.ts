@@ -5,6 +5,13 @@ import { loadConfig, PresetsFileSchema } from "../packages/core/src/config.js";
 const base = { DISCORD_BOT_TOKEN: "fixture-token", DISCORD_ALLOWED_USER_IDS: "123", REPOS_ROOT: tmpdir() };
 
 describe("optional Google Chat configuration", () => {
+  it("keeps schedule admins separate from admitted Chat users, with none by default", () => {
+    expect((loadConfig({ env: base }) as any).GOOGLE_CHAT_ADMIN_USER_IDS).toEqual(new Set());
+    const config = loadConfig({ env: { ...base, GOOGLE_CHAT_ALLOWED_USER_IDS: "users/42,users/43",
+      GOOGLE_CHAT_ADMIN_USER_IDS: " users/42, users/42, " } }) as any;
+    expect(config.GOOGLE_CHAT_ADMIN_USER_IDS).toEqual(new Set(["users/42"]));
+    expect(config.GOOGLE_CHAT_ALLOWED_USER_IDS).toEqual(new Set(["users/42", "users/43"]));
+  });
   it("loads the native media user's identity and OAuth token path without changing bot auth", () => {
     const config = loadConfig({ env: { ...base, GOOGLE_CHAT_CREDENTIALS_FILE: "/fixture/app.json",
       GOOGLE_CHAT_MEDIA_USER: "users/poster", GOOGLE_CHAT_MEDIA_TOKEN_FILE: "/fixture/user.json" } }) as any;

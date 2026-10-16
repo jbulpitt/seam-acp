@@ -40,7 +40,7 @@ export type GoogleChatCommandResult =
 
 /** Uses the same core cancellation and configuration operations as Discord. */
 export async function executeGoogleChatCommand(
-  command: Omit<GoogleChatCommand, "command"> & { command: Exclude<GoogleChatCommand["command"], "new"> },
+  command: Omit<GoogleChatCommand, "command"> & { command: Exclude<GoogleChatCommand["command"], "new" | "schedules"> },
   deps: GoogleChatCommandDeps,
 ): Promise<GoogleChatCommandResult> {
   const channel = deps.channelFor(command.space, command.thread);

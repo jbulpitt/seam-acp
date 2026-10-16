@@ -1,4 +1,5 @@
 import type { ChannelRef, MessageAttachment } from "../../platforms/chat-adapter.js";
+import type { GoogleChatCardsMessage } from "../../platforms/google-chat/card-renderer.js";
 
 export type InboundAdmissionState = "pending" | "running" | "completed";
 
@@ -30,7 +31,7 @@ export interface GoogleChatSpaceCreationReceipt {
 }
 
 export interface InboundCommandResult {
-  replies: Array<{ channel: ChannelRef; text: string; index: number }>;
+  replies: Array<{ channel: ChannelRef; text: string; index: number; cards?: GoogleChatCardsMessage; messageId?: string }>;
   error?: string;
   spaceCreation?: GoogleChatSpaceCreationReceipt;
 }

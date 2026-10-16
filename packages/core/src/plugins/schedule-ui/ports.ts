@@ -2,9 +2,9 @@ import type { ModalBuilder } from "discord.js";
 import type { Logger } from "../../lib/logger.js";
 import type { ChannelRef, ComponentEvent } from "../../platforms/chat-adapter.js";
 import type { CardLifecycle, CardView, StoppableCollector } from "../../platforms/discord/collector-lifecycle.js";
-import type { ScheduledPrompt } from "../../core/scheduled-prompts/types.js";
 import type { SlashInvocation } from "../slash-registry.js";
 import type { ComponentAcknowledgement } from "../../platforms/interaction-response.js";
+import type { ScheduleListPorts } from "../../core/schedule-list.js";
 
 export type ScheduleReply = CardView & { flags?: number | bigint };
 export interface ScheduleModal {
@@ -45,21 +45,9 @@ export interface ScheduleClick extends ScheduleInteraction {
   openFollowUp(): ScheduleInteraction;
 }
 
-export interface ScheduleUiPorts {
+export interface ScheduleUiPorts extends ScheduleListPorts {
   logger: Pick<Logger, "warn" | "error">;
   reposRoot: string;
-  repository: {
-    list(channelId: string): ScheduledPrompt[];
-    get(id: string): ScheduledPrompt | undefined;
-    save(row: ScheduledPrompt): void;
-    remove(id: string): void;
-  };
-  admin: {
-    arm(row: ScheduledPrompt): void;
-    disarm(id: string): void;
-    reschedule(id: string): void;
-    runNow(id: string): Promise<void>;
-  };
   builderDefaults(channel: ChannelRef): {
     agent: string; registered: boolean; model: string; cwd: string;
     models: Array<{ modelId: string; name: string }>;

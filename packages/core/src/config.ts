@@ -36,6 +36,9 @@ const Schema = z.object({
   GOOGLE_CHAT_CREDENTIALS_FILE: z.string().optional(),
   GOOGLE_CHAT_ALLOWED_USER_IDS: z.string().default("").transform(value =>
     new Set(value.split(",").map(id => id.trim()).filter(Boolean))),
+  /** Chat schedule mutations only; Run now follows the ordinary Chat access rules. */
+  GOOGLE_CHAT_ADMIN_USER_IDS: z.string().default("").transform(value =>
+    new Set(value.split(",").map(id => id.trim()).filter(Boolean))),
   GOOGLE_CHAT_ALLOWED_SPACE_IDS: z.string().default("").transform(value =>
     new Set(value.split(",").map(id => id.trim()).filter(Boolean))),
   GOOGLE_CHAT_DEFAULT_CWD: z.string().optional(),

@@ -34,6 +34,7 @@ import { hasAppMention, mentionsChatApp, isSharedSpace, stripAppMentions,
   type GoogleChatAnnotation, type GoogleChatSpace, type GoogleChatSpaceLifecycle } from "./spaces.js";
 import type { GoogleChatSpaceEvents } from "./space-events.js";
 import type { ParsedWorkspaceChatMessage } from "./workspace-message-event.js";
+import { GoogleChatScheduleList, GOOGLE_CHAT_SCHEDULE_ACTION, type GoogleChatScheduleListOptions } from "./schedule-list.js";
 
 export const GOOGLE_CHAT_PLATFORM = "google-chat";
 const root = "https://chat.googleapis.com/v1";
@@ -76,6 +77,7 @@ type CommandDeps = Pick<GoogleChatCommandDeps, "router" | "mutation" | "runtimeT
     & Partial<Pick<SessionStore, "get">>;
   mutation: GoogleChatCommandDeps["mutation"] & Pick<ConfigMutationService, "restoreThreadPresetEntry">;
   deliveryForChannel?: (channel: ChannelRef, inboundMessageId?: string) => DeliveryChannelContext;
+  scheduleList?: GoogleChatScheduleListOptions;
 };
 
 export class GoogleChatAdapter implements ChatAdapter {
@@ -90,6 +92,7 @@ export class GoogleChatAdapter implements ChatAdapter {
   private choiceAcknowledgement: ComponentAcknowledgement = "update";
   private componentAcknowledgement: ComponentAcknowledgement = "update";
   private commandDeps?: CommandDeps;
+  private scheduleList?: GoogleChatScheduleList;
   private sessionSpaces?: GoogleChatSessionSpaces;
   private readonly spaces = new Map<string, GoogleChatSpace>();
   private botUserId?: string;
@@ -127,6 +130,7 @@ export class GoogleChatAdapter implements ChatAdapter {
   }
   setCommandDeps(deps: CommandDeps): void {
     this.commandDeps = deps;
+    this.scheduleList = deps.scheduleList ? new GoogleChatScheduleList(deps.scheduleList) : undefined;
   }
   installSessionSpaces(options: Pick<ConstructorParameters<typeof GoogleChatSessionSpaces>[0], "config" | "customer" | "prepare" | "bind">): void {
     this.sessionSpaces = new GoogleChatSessionSpaces({ ...options, api: this.opts.api, store: this.commandDeps!.store,
@@ -351,26 +355,32 @@ export class GoogleChatAdapter implements ChatAdapter {
         receipt.replies.push({ channel: replyChannel ?? channel, text, index: receipt.replies.length });
       };
       try {
-        const result = await executeGoogleChatCommand({ ...command, command: command.command,
-          user: { ...command.user, id: resourceId(command.user.id, "users") } }, {
-          ...this.commandDeps,
-          channelFor: (space, thread) => this.channelFor(space, thread),
-          cwd: this.opts.defaultCwd,
-          location: this.opts.defaultLocation,
-          respond,
-        });
-        if (result && result.command === "cancel") {
-          const { outcome } = result;
-          let text: string;
-          if ("error" in outcome) text = `Cancel requested, but not confirmed: ${
-            outcome.error instanceof Error ? outcome.error.message : String(outcome.error)}. Work may still be running.`;
-          else if (outcome.outcome === "idle") text = outcome.cancelled.cancelled ? "Turn cancelled."
-            : outcome.parked ? "Queued prompt cancelled."
-            : outcome.queue.queued ? `No active turn; ${outcome.queue.queued} durable items remain queued. Nothing was discarded.`
-            : "No active turn.";
-          else text = outcome.outcome === "unacknowledged"
-            ? "Cancel requested, but not confirmed. Work may still be running." : "Cancel sent to the active turn.";
-          await respond(result.channel, text);
+        if (command.command === "schedules") {
+          if (!this.scheduleList) throw new Error("Google Chat schedule list handlers not installed");
+          receipt.replies.push({ channel: { platform: this.platform, id: resourceId(command.space, "spaces") },
+            text: "", index: 0, cards: this.scheduleList.render(command.space, command.user.id) });
+        } else {
+          const result = await executeGoogleChatCommand({ ...command, command: command.command,
+            user: { ...command.user, id: resourceId(command.user.id, "users") } }, {
+            ...this.commandDeps,
+            channelFor: (space, thread) => this.channelFor(space, thread),
+            cwd: this.opts.defaultCwd,
+            location: this.opts.defaultLocation,
+            respond,
+          });
+          if (result && result.command === "cancel") {
+            const { outcome } = result;
+            let text: string;
+            if ("error" in outcome) text = `Cancel requested, but not confirmed: ${
+              outcome.error instanceof Error ? outcome.error.message : String(outcome.error)}. Work may still be running.`;
+            else if (outcome.outcome === "idle") text = outcome.cancelled.cancelled ? "Turn cancelled."
+              : outcome.parked ? "Queued prompt cancelled."
+              : outcome.queue.queued ? `No active turn; ${outcome.queue.queued} durable items remain queued. Nothing was discarded.`
+              : "No active turn.";
+            else text = outcome.outcome === "unacknowledged"
+              ? "Cancel requested, but not confirmed. Work may still be running." : "Cancel sent to the active turn.";
+            await respond(result.channel, text);
+          }
         }
       } catch (err) {
         receipt = { replies: [], error: err instanceof Error ? err.message : String(err) };
@@ -389,8 +399,11 @@ export class GoogleChatAdapter implements ChatAdapter {
     const receipt = store.getInbound(messageId)!.commandResult!;
     for (const reply of [...receipt.replies]) {
       try {
-        await this.sendText(reply.channel, reply.text, { nonce: `${messageId}-reply-${reply.index}`, enforceNonce: true },
-          command.user.id);
+        if (reply.cards) {
+          if (reply.messageId) await this.editPrivateCards({ channel: reply.channel, id: reply.messageId }, reply.cards);
+          else await this.sendPrivateCards(reply.channel, reply.cards, command.user.id,
+            { nonce: `${messageId}-reply-${reply.index}`, enforceNonce: true });
+        } else await this.sendText(reply.channel, reply.text, { nonce: `${messageId}-reply-${reply.index}`, enforceNonce: true }, command.user.id);
       } catch (err) {
         const status = googleErrorStatus(err);
         if (status === undefined || status < 400 || status === 408 || status === 429 || status >= 500) throw err;
@@ -529,6 +542,13 @@ export class GoogleChatAdapter implements ChatAdapter {
   async sendPanel(channel: ChannelRef, panel: StructuredPanel, delivery?: DeliveryNonceOptions): Promise<MessageRef> {
     return this.postCards(channel, renderGoogleChatPanel(panel, randomUUID()), serializePanelText(panel), delivery);
   }
+  sendPrivateCards(channel: ChannelRef, cards: GoogleChatCardsMessage, viewer: string, delivery?: DeliveryNonceOptions): Promise<MessageRef> {
+    return this.postMessage(channel, { ...cards, privateMessageViewer: { name: viewer } }, delivery,
+      undefined, undefined, false);
+  }
+  editPrivateCards(message: MessageRef, cards: GoogleChatCardsMessage): Promise<void> {
+    return this.patchCards(message, cards, "");
+  }
   async editPanel(message: MessageRef, panel: StructuredPanel): Promise<void> {
     await this.patchCards(message, renderGoogleChatPanel(panel, message.id), serializePanelText(panel));
   }
@@ -605,6 +625,10 @@ export class GoogleChatAdapter implements ChatAdapter {
     const space = event.space?.name ?? thread?.split("/threads/")[0];
     if (!space) throw new Error("Google Chat CARD_CLICKED has no space name");
     if (!interactionId) throw new Error("Google Chat CARD_CLICKED has no Pub/Sub delivery id");
+    if ((event.action?.actionMethodName ?? event.common?.invokedFunction) === GOOGLE_CHAT_SCHEDULE_ACTION) {
+      await this.receiveScheduleClick(event, space, interactionId);
+      return;
+    }
     const parsed = parseGoogleChatCardClick({ ...event, type: "CARD_CLICKED" },
       { channel: this.channelFor(space, thread), interactionId });
     if (!parsed) return;
@@ -630,6 +654,34 @@ export class GoogleChatAdapter implements ChatAdapter {
         followUpEphemeralFile: async file => { await replyEphemeral(`${file.filename}\n\n${file.data.toString("utf8")}`); },
         showModal });
     }
+  }
+
+  private async receiveScheduleClick(event: ChatEvent, space: string, interactionId: string): Promise<void> {
+    if (!this.commandDeps || !this.scheduleList) throw new Error("Google Chat schedule list handlers not installed");
+    const { store } = this.commandDeps, viewer = event.user!.name!;
+    const messageId = inboundId(`schedule-click:${interactionId}`);
+    const channel = { platform: this.platform, id: resourceId(space, "spaces") };
+    const parameters = { ...event.common?.parameters,
+      ...Object.fromEntries(event.action?.parameters?.map(({ key, value }) => [key, value]) ?? []) };
+    store.admitInbound({ messageId, platform: this.platform, channelRef: channel.id,
+      sessionRecordId: store.getByChannel(this.platform, channel.id)?.id ?? `${this.platform}:${channel.id}`,
+      authorId: resourceId(viewer, "users"), authorName: event.user?.displayName, text: "schedule list action",
+      createdUtc: new Date().toISOString(), preemptive: false, commandResult: { replies: [] } });
+    const admitted = store.getInbound(messageId)!;
+    if (admitted.state !== "completed") {
+      if (!store.claimInbound(messageId, 0, new Date().toISOString())) return;
+      const receipt: InboundCommandResult = { replies: [] };
+      try {
+        const cards = await this.scheduleList.click(space, viewer, parameters);
+        if (!event.message?.name) throw new Error("Google Chat schedule click has no message name");
+        receipt.replies.push({ channel, text: "", index: 0, cards, messageId: event.message.name });
+      } catch (err) {
+        receipt.replies.push({ channel, text: err instanceof Error ? err.message : String(err), index: 0 });
+      }
+      store.completeInboundCommand(messageId, receipt, new Date().toISOString());
+    }
+    await this.drainCommandReplies({ command: "schedules", args: "", space, thread: null,
+      user: { id: viewer, name: event.user?.displayName ?? viewer } }, messageId);
   }
 
   async downloadAttachment(attachment: MessageAttachment): Promise<Buffer> {

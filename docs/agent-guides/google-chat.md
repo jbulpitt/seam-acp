@@ -142,6 +142,27 @@ Both commands reply privately: top-level replies are unthreaded, and in-thread
 replies stay in that thread. In unthreaded Spaces they change the shared Space
 session. Durable receipts prevent redelivery from applying a command twice.
 
+### Private schedule list
+
+Register `/schedules` as a slash command with id **7**, description
+`Manage this Space's schedules privately`, with dialogs disabled.
+
+The list includes schedules in the current Space and its native reply threads.
+Each row shows its name, cadence, next run, and On/Off state. Prev/Next pages
+through four schedules at a time. Run now uses the same scheduler as Discord
+and is available to everyone admitted by the existing Chat access rules.
+
+`GOOGLE_CHAT_ADMIN_USER_IDS` contains comma-separated Chat user resource names
+such as `users/123456789`. Only these users can Pause, Resume, or Delete a
+schedule. An empty set means no mutation admins. Delete first replaces that
+row's controls with Confirm/Cancel. Add and Edit forms are not available yet.
+
+The list uses `privateMessageViewer`, so only its requesting user and the app
+can see it. Every click replaces the whole card message with a PATCH; the
+message's private viewer stays unchanged. Click effects and pending card
+updates use the existing command receipt, so Pub/Sub redelivery does not
+repeat Run now or undo a Pause/Resume action.
+
 The standalone Shared Drive uploader also defines
 `GOOGLE_CHAT_DRIVE_FOLDER_ID` and `GOOGLE_CHAT_DRIVE_SHARING_POLICY`
 (`members-only` or `domain-readable`). The latter additionally requires
@@ -242,7 +263,7 @@ asset paths and operator commands in `docs/local/`.
 
 The live adapter supports formatted text turns, cardsV2 status and interaction
 cards, threaded replies, inbound attachment downloads and `/new`, `/cancel`,
-`/agent`, `/model`, `/repo`, `/effort`. Configured native images post as Chat
+`/agent`, `/model`, `/repo`, `/effort`, and private `/schedules` lists. Configured native images post as Chat
 attachments in named Spaces. Other files and image fallback use Shared Drive
 links; without Drive configuration, fallback uses text or a binary placeholder.
 

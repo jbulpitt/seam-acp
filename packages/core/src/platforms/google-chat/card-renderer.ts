@@ -29,13 +29,13 @@ export type GoogleChatCardWidget =
   | { image: { imageUrl: string; altText: string } }
   | { divider: Record<string, never> }
   | { buttonList: { buttons: GoogleChatCardButton[] } }
-  | { textInput: { name: string; label: string; type: "MULTIPLE_LINE" } }
+  | { textInput: { name: string; label: string; type: "SINGLE_LINE" | "MULTIPLE_LINE"; value?: string; hintText?: string } }
   | { selectionInput: {
       name: string;
       label: string;
       type: "CHECK_BOX" | "DROPDOWN";
       items: Array<{ text: string; value: string; selected?: boolean }>;
-      onChangeAction: GoogleChatCardAction;
+      onChangeAction?: GoogleChatCardAction;
     } };
 
 export interface GoogleChatCardsMessage {

@@ -672,7 +672,7 @@ export class GoogleChatAdapter implements ChatAdapter {
       if (!store.claimInbound(messageId, 0, new Date().toISOString())) return;
       const receipt: InboundCommandResult = { replies: [] };
       try {
-        const cards = await this.scheduleList.click(space, viewer, parameters);
+        const cards = await this.scheduleList.click(space, viewer, parameters, event.common?.formInputs);
         if (!event.message?.name) throw new Error("Google Chat schedule click has no message name");
         receipt.replies.push({ channel, text: "", index: 0, cards, messageId: event.message.name });
       } catch (err) {

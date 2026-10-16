@@ -169,17 +169,19 @@ describe("private Google Chat schedule list", () => {
     expect(JSON.stringify(h.messages.get(name))).toContain("schedule 0");
   });
 
-  it("does not repeat Run now after a failed PATCH and Pub/Sub redelivery", async () => {
+  it("does not repeat Run now after a retried PATCH and failed Pub/Sub ACK", async () => {
     const h = fixture(1), name = await h.open(), control = h.button(name, "Run now");
     const normal = h.request.getMockImplementation()!;
-    let fail = true;
+    let failPatch = true, failAck = true;
     h.request.mockImplementation(async (scope, r) => {
-      if (r.method === "PATCH" && fail) { fail = false; throw new Error("Chat PATCH connection lost"); }
+      if (r.method === "PATCH" && failPatch) { failPatch = false; throw new Error("Chat PATCH connection lost"); }
+      if (scope === "pubsub" && failAck) { failAck = false; throw new Error("Pub/Sub ACK connection lost"); }
       return normal(scope, r);
     });
-    await expect(h.clickRaw(name, control, "42", "same-publication")).rejects.toThrow("Chat PATCH connection lost");
+    await expect(h.clickRaw(name, control, "42", "same-publication")).rejects.toThrow("Pub/Sub ACK connection lost");
     await h.clickRaw(name, control, "42", "same-publication");
     expect(h.manager.runNow).toHaveBeenCalledExactlyOnceWith("sch_0");
+    expect(h.request.mock.calls.filter(([, r]) => r.method === "PATCH")).toHaveLength(2);
     expect(JSON.stringify(h.messages.get(name))).toContain("finished");
   });
 

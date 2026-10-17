@@ -47,8 +47,8 @@ describe("Google Chat Pub/Sub admission", () => {
     const receive = vi.fn(async () => admission);
     const request = vi.fn(async (_scope: unknown, r: any): Promise<any> => {
       if (!r.url.endsWith(":pull")) return {};
-      if (++pulls === 1) return { receivedMessages: [{ ackId: "held-ack", message: { messageId: "held",
-        data: Buffer.from('{"type":"CARD_CLICKED"}').toString("base64") } }] };
+      if (++pulls === 1) return { receivedMessages: ["held", "queued"].map(id => ({ ackId: `ack-${id}`, message: { messageId: id,
+        data: Buffer.from('{"type":"CARD_CLICKED","space":{"name":"spaces/X"}}').toString("base64") } })) };
       return new Promise((_, reject) => { r.signal.addEventListener("abort", () => reject(r.signal.reason), { once: true }); });
     });
     const transport = new PubSubPullTransport({ api: { request }, subscription, receive, logger });
@@ -61,7 +61,48 @@ describe("Google Chat Pub/Sub admission", () => {
       expect(request.mock.calls.every(([, r]) => r.url.endsWith(":pull"))).toBe(true);
     } finally { admit(); await stop; }
     expect(stopped).toBe(true);
+    expect(receive).toHaveBeenCalledOnce();
     expect(request.mock.calls.every(([, r]) => r.url.endsWith(":pull"))).toBe(true);
+  });
+
+  it("orders Workspace hydration and direct events in the same Space while admitting other Spaces", async () => {
+    const { PubSubPullTransport } = await import("../packages/core/src/platforms/google-chat/transport.js");
+    let hydrated!: () => void;
+    const hydration = new Promise<void>(resolve => { hydrated = resolve; });
+    const admitted: string[] = [];
+    const request = vi.fn(async (): Promise<any> => ({}));
+    const transport = new PubSubPullTransport({ api: { request }, subscription, logger,
+      receive: async raw => { admitted.push((raw as { id: string }).id); },
+      receiveWorkspaceMessage: async message => { await hydration; admitted.push(message.resourceName); } });
+    const workspace = transport.process({ ackId: "workspace", message: { messageId: "workspace",
+      attributes: { "ce-type": "google.workspace.chat.message.v1.created" },
+      data: Buffer.from('{"message":{"name":"spaces/X/messages/first"}}').toString("base64") } });
+    const direct = (space: string) => transport.process({ ackId: space, message: { messageId: space,
+      data: Buffer.from(JSON.stringify({ id: space, space: { name: `spaces/${space}` } })).toString("base64") } });
+    const x = direct("X"), y = direct("Y");
+    try {
+      await y;
+      expect(admitted).toEqual(["Y"]);
+      hydrated(); await Promise.all([workspace, x]);
+      expect(admitted).toEqual(["Y", "spaces/X/messages/first", "X"]);
+    } finally { hydrated(); await Promise.allSettled([workspace, x, y]); }
+  });
+
+  it("lets a later same-Space event admit after an earlier admission fails", async () => {
+    const { PubSubPullTransport } = await import("../packages/core/src/platforms/google-chat/transport.js");
+    let rejectFirst!: (cause: Error) => void;
+    const first = new Promise<void>((_, reject) => { rejectFirst = reject; });
+    const request = vi.fn(async (): Promise<any> => ({}));
+    const receive = vi.fn(async (raw: unknown) => { if ((raw as { id: string }).id === "first") await first; });
+    const transport = new PubSubPullTransport({ api: { request }, subscription, logger, receive });
+    const process = (id: string) => transport.process({ ackId: id, message: { messageId: id,
+      data: Buffer.from(JSON.stringify({ id, space: { name: "spaces/X" } })).toString("base64") } });
+    const cause = new Error("SQLite admission failed");
+    const failed = expect(process("first")).rejects.toBe(cause), next = process("next");
+    rejectFirst(cause);
+    await failed; await next;
+    expect(receive).toHaveBeenCalledTimes(2);
+    expect(request).toHaveBeenCalledExactlyOnceWith("pubsub", expect.objectContaining({ data: { ackIds: ["next"] } }));
   });
 
   it("keeps later same-Space admissions behind earlier hydration while another Space advances", async () => {

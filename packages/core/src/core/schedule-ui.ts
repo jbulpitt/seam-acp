@@ -15,7 +15,7 @@ import { createScheduleListPorts } from "./schedule-list.js";
 interface ScheduleUiDependencies {
   config: Config; logger: Logger; store: SessionStore; router: SessionRouter;
   modelCatalog: ModelCatalogService; manager(): ScheduledPromptManager | undefined;
-  runNow(id: string): Promise<void>;
+  runNow(id: string, onReserved?: () => void): Promise<void>;
 }
 
 export function scheduleBuilderDefaults(deps: Pick<ScheduleUiDependencies, "config" | "router" | "modelCatalog">,

@@ -26,7 +26,8 @@ function fixture(count = 5, admins = new Set(["users/42"])) {
   for (let i = 0; i < count; i++) store.upsertScheduled(schedule(i));
   store.upsertScheduled(schedule(8, { id: "discord-only", platform: "discord", name: "Discord private row" }));
   store.upsertScheduled(schedule(9, { id: "other-space", channelRef: "other", name: "Other Space row" }));
-  const manager = { armFromRow: vi.fn(), disarm: vi.fn(), reschedule: vi.fn(), runNow: vi.fn(async (id: string) => {
+  const manager = { armFromRow: vi.fn(), disarm: vi.fn(), reschedule: vi.fn(), runNow: vi.fn(async (id: string, onReserved?: () => void) => {
+    onReserved?.();
     store.upsertScheduled({ ...store.getScheduled(id)!, lastStatus: "ok" });
   }) };
   const ports = scheduleUiPorts({ store, logger, config: { REPOS_ROOT: "/fixture" },
@@ -162,7 +163,7 @@ describe("private Google Chat schedule list", () => {
     const memberView = JSON.stringify(h.messages.get(member));
     expect(memberView).not.toContain('"text":"Pause"'); expect(memberView).not.toContain('"text":"Delete"');
     await h.click(member, "Run now", "schedule 0", "43");
-    expect(h.manager.runNow).toHaveBeenCalledExactlyOnceWith("sch_0");
+    expect(h.manager.runNow).toHaveBeenCalledExactlyOnceWith("sch_0", expect.any(Function));
     const admin = await h.open();
     await h.click(admin, "Pause", "schedule 0");
     expect(h.store.getScheduled("sch_0")?.enabled).toBe(false);
@@ -229,9 +230,9 @@ describe("private Google Chat schedule list", () => {
     });
     await expect(h.clickRaw(name, control, "42", "same-publication")).rejects.toThrow("Pub/Sub ACK connection lost");
     await h.clickRaw(name, control, "42", "same-publication");
-    expect(h.manager.runNow).toHaveBeenCalledExactlyOnceWith("sch_0");
+    expect(h.manager.runNow).toHaveBeenCalledExactlyOnceWith("sch_0", expect.any(Function));
     expect(h.request.mock.calls.filter(([, r]) => r.method === "PATCH")).toHaveLength(2);
-    expect(JSON.stringify(h.messages.get(name))).toContain("finished");
+    expect(JSON.stringify(h.messages.get(name))).toContain("started");
   });
 
   it("preserves the real scheduler error in the private refreshed list", async () => {
@@ -240,6 +241,36 @@ describe("private Google Chat schedule list", () => {
     await h.click(name, "Run now", "schedule 0");
     expect(JSON.stringify(h.messages.get(name))).toContain("bridge worker unavailable: original cause");
     expect(h.messages.get(name).privateMessageViewer).toEqual({ name: "users/42" });
+  });
+
+  it("reports an occurrence reservation failure without claiming that the run started", async () => {
+    const h = fixture(1), name = await h.open(), onFire = vi.fn(async () => {});
+    const manager = new ScheduledPromptManager({ store: h.store, logger, onFire, resolveExecution: syntheticScheduleExecution });
+    h.manager.runNow.mockImplementation(manager.runNow.bind(manager));
+    vi.spyOn(h.store.scheduledOccurrences, "reserve").mockImplementationOnce(() => { throw new Error("SQLITE_FULL: occurrence reservation failed"); });
+    try {
+      await h.click(name, "Run now");
+      expect(JSON.stringify(h.messages.get(name))).toContain("SQLITE_FULL: occurrence reservation failed");
+      expect(JSON.stringify(h.messages.get(name))).not.toContain("started");
+      expect(h.store.scheduledOccurrences.pending()).toEqual([]);
+      expect(onFire).not.toHaveBeenCalled();
+    } finally { await manager.drain(); manager.stop(); }
+  });
+
+  it.each(["overlap", "quarantine"])("retains the existing %s notice when Run now is not reserved", async reason => {
+    const h = fixture(1), name = await h.open(), onFire = vi.fn(async () => {});
+    if (reason === "quarantine") (h.store as any).db.prepare("UPDATE scheduled_prompts SET attachments_json = ? WHERE id = ?")
+      .run('[{"filename":"legacy.txt"}]', "sch_0");
+    else h.store.scheduledOccurrences.reserve({ id: "prior-occurrence", scheduledFor: null }, h.store.getScheduled("sch_0")!);
+    const manager = new ScheduledPromptManager({ store: h.store, logger, onFire, resolveExecution: syntheticScheduleExecution });
+    h.manager.runNow.mockImplementation(manager.runNow.bind(manager));
+    try {
+      await h.click(name, "Run now");
+      const card = JSON.stringify(h.messages.get(name));
+      expect(card).toContain(reason === "quarantine" ? "quarantined" : "already running");
+      expect(card).not.toContain("started");
+      expect(onFire).not.toHaveBeenCalled();
+    } finally { await manager.drain(); manager.stop(); }
   });
 });
 

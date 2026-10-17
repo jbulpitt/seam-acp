@@ -571,7 +571,8 @@ async function main(): Promise<void> {
     configPlan: orchestrator.getConfigApplyPlan(), modelCatalog,
     deliveryForChannel: (channel, messageId) => orchestrator.deliveryForChannel(channel, messageId),
     scheduleList: { adminUserIds: config.GOOGLE_CHAT_ADMIN_USER_IDS,
-      ports: { ...createScheduleListPorts({ store, manager: () => scheduledManager, runNow: id => orchestrator.runScheduledPrompt(id) }),
+      ports: { ...createScheduleListPorts({ store, manager: () => scheduledManager, runNow: (id, onReserved) =>
+        orchestrator.runScheduledPrompt(id, undefined, false, undefined, onReserved) }),
         reposRoot: config.REPOS_ROOT, builderDefaults: channel => scheduleBuilderDefaults({ config, router, modelCatalog }, channel) } },
     cancelChannel: channel => orchestrator.cancelChannel(channel) });
   googleChat?.installSessionSpaces({ config,

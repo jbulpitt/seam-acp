@@ -1146,7 +1146,8 @@ export class Orchestrator {
       } });
     this.scheduleUi = installScheduleUi({
       plugins: this.plugins, config: this.config, logger: this.logger, store: this.store, router: this.router, modelCatalog: this.modelCatalog,
-      manager: () => this.scheduledManager, runNow: id => this.runScheduledPrompt(id),
+      manager: () => this.scheduledManager, runNow: (id, onReserved) => onReserved
+        ? this.runScheduledPrompt(id, undefined, false, undefined, onReserved) : this.runScheduledPrompt(id),
       component: evt => scheduleUiInteraction(discordComponentInteractions.get(evt) as MessageComponentInteraction, {
         channel: interaction => this.channelRefFromInteraction(interaction) ?? undefined,
         mutationRefusal: interaction => this.slashAccessRefusal(interaction, { kind: "mutating" }),
@@ -12578,7 +12579,7 @@ export class Orchestrator {
    *  blue cards. Owns last_run/last_status only — the manager owns next_run.
    *  Read-only w.r.t. the thread's live session. */
   async runScheduledPrompt(id: string, key = scheduledOccurrenceKey(id), manualResume = false,
-    queueFence?: ChannelQueueFence): Promise<void> {
+    queueFence?: ChannelQueueFence, onReserved?: () => void): Promise<void> {
     const row = this.store.scheduledOccurrences.get(key.id)?.row ?? this.store.getScheduled(id);
     if (!row) return;
     // Direct/manual recovery callers have the same durable admission boundary
@@ -12586,6 +12587,7 @@ export class Orchestrator {
     if (!this.store.scheduledOccurrences.reserve(key, row)) {
       this.patchScheduledStatus(id, "skipped: still running"); return;
     }
+    onReserved?.();
     // Register before the first asynchronous precondition check. Live mode is
     // also counted by queueOnChannel once admitted there, but this outer token
     // covers the otherwise invisible interval before queue registration.

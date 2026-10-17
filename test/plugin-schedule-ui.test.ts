@@ -5,6 +5,8 @@ import { buildSlashRegistrationBody } from "../packages/core/src/platforms/disco
 import { classifyDiscordInteraction } from "../packages/core/src/platforms/discord/adapter.js";
 import { namingFixture, NAMING_PARENT } from "./plugin-naming-fixture.js";
 import { discordComponentInteractions } from "../packages/core/src/platforms/discord/component-interactions.js";
+import { ScheduleList } from "../packages/core/src/core/schedule-list.js";
+import { scheduleUiPorts } from "../packages/core/src/core/schedule-ui.js";
 
 const cleanups: Array<() => Promise<void>> = [];
 afterEach(async () => { for (const cleanup of cleanups.splice(0).reverse()) await cleanup(); });
@@ -156,6 +158,31 @@ describe("schedule UI built-in", () => {
     } finally { finish(); }
     const { replies } = await click;
     expect(replies.some(view => view.content === "▶️ **existing** finished — last: `ok`.")).toBe(true);
+  });
+
+  it("also returns at durable reservation when the list uses the direct orchestrator runner", async () => {
+    const h = await fixture();
+    let finish!: () => void, returned = false;
+    let scheduled: Promise<void> | undefined;
+    const execution = new Promise<void>(resolve => { finish = resolve; });
+    const run = vi.spyOn(h.orchestrator as any, "runDurableScheduledPrompt").mockImplementation(async () => execution);
+    const ports = scheduleUiPorts({ store: h.store, logger: { child: () => ({}) }, manager: () => undefined,
+      config: { REPOS_ROOT: "/fixture" }, runNow: (id: string, onReserved?: () => void) =>
+        scheduled = h.orchestrator.runScheduledPrompt(id, undefined, false, undefined, onReserved) } as any,
+      () => { throw new Error("unused"); }, () => { throw new Error("unused"); });
+    const start = new ScheduleList(ports).start({ platform: "discord", id: "thread" }, "sch_11a221c3")
+      .then(notice => { returned = true; return notice; });
+    try {
+      await vi.waitFor(() => expect(returned).toBe(true), { timeout: 500 });
+      expect(await start).toBe("▶️ **existing** started.");
+      expect(h.store.scheduledOccurrences.pending()).toHaveLength(1);
+      expect(run).toHaveBeenCalledOnce();
+    } finally {
+      finish();
+      await start;
+      await scheduled;
+      run.mockRestore();
+    }
   });
 
   it("runs a pre-restart list button through the new host without its original collector", async () => {

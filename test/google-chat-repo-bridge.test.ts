@@ -128,8 +128,8 @@ describe("Google Chat repo commands after late bridge attachment", () => {
     const discordRepos = await (h.orch as any).listHostWorkspacePaths(undefined, location);
     expect(discordRepos).toContain(h.nextCwd);
     await h.run("");
-    expect(h.messages.at(-1)?.text).toContain(h.nextCwd);
-    expect(h.messages.at(-1)?.text).toContain(`host: ${location}`);
+    expect(JSON.stringify(h.messages.at(-1)?.cardsV2)).toContain(h.nextCwd);
+    expect(JSON.stringify(h.messages.at(-1)?.cardsV2)).toContain(`@${location}`);
     expect(h.rpcs.filter(frame => frame.method === "listWorkspaces")).toHaveLength(2);
     expect(h.hub.sessionBridgeId(h.record.id)).toBe(location);
     expect(h.admitted).not.toHaveBeenCalled();

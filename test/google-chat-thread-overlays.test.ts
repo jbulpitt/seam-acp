@@ -82,7 +82,7 @@ function fixture(channel = chat) {
   const initial = router.ensureSessionRecord({ platform: channel.platform, channelRef: channel.id,
     parentRef: channel.parentId, cwd: dir });
   store.upsert({ ...initial, acpSessionId: "saved-provider-context" }, { source: "fixture", cause: "seed owned context" });
-  return { file, sibling, store, router, mutation, maps, plan, runtime, record: () => store.get(initial.id)! };
+  return { file, sibling, store, router, mutation, maps, plan, runtime, catalog, record: () => store.get(initial.id)! };
 }
 
 describe("platform-aware persisted thread overlays", () => {
@@ -114,7 +114,8 @@ describe("platform-aware persisted thread overlays", () => {
       }));
       const adapter = new GoogleChatAdapter({ api: { request }, logger, subscription: "projects/test/subscriptions/events",
         defaultCwd: dir, allowedUserIds: new Set(["users/42"]), writeIntervalMs: 0 });
-      adapter.setCommandDeps({ store: h.store, router: h.router, mutation: h.mutation, runtimeTransition: h.runtime, cancelChannel: vi.fn() } as any);
+      adapter.setCommandDeps({ store: h.store, router: h.router, mutation: h.mutation, runtimeTransition: h.runtime,
+        modelCatalog: h.catalog, configPlan: h.plan, cancelChannel: vi.fn() } as any);
       await adapter.receiveEvent({ type: "MESSAGE", space: { name: `spaces/${chat.parentId}` },
         user: { name: "users/42", displayName: "Tester" }, message: {
           name: `spaces/${chat.parentId}/messages/bare-${commandId}`, text: `/${command}`, argumentText: null,
@@ -125,7 +126,8 @@ describe("platform-aware persisted thread overlays", () => {
       expect(h.record()).toEqual(before);
       expect(fs.readFileSync(h.file, "utf8")).toBe(presetBefore);
       expect(h.router.getRuntime(before.id)).toBe(warm);
-      expect(request.mock.calls[0]![1].data.text).toBe(`Usage: /${command} <id> — current: ${current}`);
+      expect(request.mock.calls[0]![1].data).toMatchObject({ cardsV2: expect.any(Array), privateMessageViewer: { name: "users/42" } });
+      expect(JSON.stringify(request.mock.calls[0]![1].data.cardsV2)).toContain(current);
     });
 
   it("loads qualified Chat keys alongside unchanged numeric Discord keys", () => {

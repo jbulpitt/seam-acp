@@ -37,8 +37,8 @@ function control(cards: any, label: string) {
   const result = buttons(cards).find(button => button.text === label);
   expect(result, `button ${label}`).toBeDefined(); return result;
 }
-function click(button: any) {
-  return { type: "CARD_CLICKED", space: { name: "spaces/dm", spaceType: "SPACE" }, user,
+function click(button: any, threaded = false) {
+  return { type: "CARD_CLICKED", space: { name: "spaces/dm", spaceType: threaded ? "DIRECT_MESSAGE" : "SPACE" }, user,
     // The private reply's thread is deliberately different from the session that opened it.
     message: { name: cardName, thread: { name: "spaces/dm/threads/card-reply" } },
     common: { invokedFunction: button.onClick.action.function },
@@ -83,7 +83,7 @@ function setup(db = ":memory:", current = { agent: "codex", model: "model-0", ef
   const deliver = (event: unknown, id = `event-${++sequence}`) => transport.process({ ackId: `ack-${id}`,
     message: { messageId: id, data: Buffer.from(JSON.stringify(event)).toString("base64") } });
   const latest = () => writes.at(-1)?.data;
-  return { store, current, writes, request, models, model, listProfiles, effortChoices, listRepos,
+  return { adapter, store, current, writes, request, models, model, listProfiles, effortChoices, listRepos,
     applyAgentChange, applyModelChange, configure, applyRepoChange, normal, deliver, latest };
 }
 
@@ -119,6 +119,7 @@ describe("private Google Chat config pickers", () => {
     ]);
     else expect(operation.mock.calls[0]).toMatchObject([
       { platform: "google-chat", id: "dm" }, h.store.getByChannel("google-chat", "dm"), value, { id: "42", name: "Member" },
+      ...(kind === "repo" ? [] : [expect.any(Function)]),
     ]);
     expect(h.writes.at(-1)).toMatchObject({ method: "PATCH", url: `https://chat.googleapis.com/v1/${cardName}`, params: { updateMask: "cardsV2" } });
     expect(JSON.stringify(h.latest())).toContain(result);
@@ -129,7 +130,7 @@ describe("private Google Chat config pickers", () => {
   it("keeps a DM picker bound to the invoking session instead of the private reply thread", async () => {
     const h = setup(); await h.deliver(command("model", "", true));
     expect(h.latest().thread).toEqual({ name: originalThread });
-    await h.deliver(click(choice(h.latest(), "model-1")));
+    await h.deliver(click(choice(h.latest(), "model-1"), true));
     expect(h.applyModelChange.mock.calls[0]![0]).toEqual({ platform: "google-chat", id: "dm.original", parentId: "dm" });
   });
 
@@ -193,11 +194,15 @@ describe("private Google Chat config pickers", () => {
     const db = join(dir, "sessions.db");
     const h = setup(db); await h.deliver(command("model"));
     const event = click(choice(h.latest(), "model-1"));
-    h.request.mockImplementationOnce(async (scope, req) => {
-      if (failure === "PATCH") throw new Error("Chat PATCH connection reset");
-      h.writes.push(req); return {};
-    });
-    if (failure === "ACK") h.request.mockImplementationOnce(async () => { throw new Error("Pub/Sub ACK connection reset"); });
+    if (failure === "PATCH") vi.spyOn(h.adapter, "editPrivateCards").mockRejectedValueOnce(new Error("Chat PATCH connection reset"));
+    else {
+      let failPatch = true;
+      h.request.mockImplementation(async (scope, req) => {
+        if (scope === "pubsub") throw new Error("Pub/Sub ACK connection reset");
+        if (failPatch) { failPatch = false; throw new Error("Chat PATCH connection reset"); }
+        h.writes.push(req); return {};
+      });
+    }
     await expect(h.deliver(event, "redelivered-click")).rejects.toThrow("connection reset");
     expect(h.applyModelChange).toHaveBeenCalledOnce();
     h.store.close(); stores.splice(stores.indexOf(h.store), 1);

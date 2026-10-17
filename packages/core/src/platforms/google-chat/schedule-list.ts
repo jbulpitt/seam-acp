@@ -150,7 +150,7 @@ export class GoogleChatScheduleList {
         return this.render(space, viewer, page);
       }
       if (action === "form-cancel") return this.render(space, viewer, page);
-      if (action === "run") notice = await this.list.run(scope, id);
+      if (action === "run") notice = await this.list.start(scope, id);
       else if (action === "pause" || action === "resume") this.list.setEnabled(scope, id, action === "resume");
       else if (action === "confirm") this.list.remove(scope, id);
       else if (action === "delete") {

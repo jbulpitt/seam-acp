@@ -173,8 +173,8 @@ export class ScheduledPromptManager {
    *  only refreshed from the armed timer if one exists. Honors the in-flight
    *  overlap guard. Works on disabled rows, but not on a row quarantined by a
    *  legacy attachment manifest (#158). */
-  runNow(id: string): Promise<void> {
-    return this.fire(id);
+  runNow(id: string, onReserved?: () => void): Promise<void> {
+    return this.fire(id, scheduledOccurrenceKey(id), undefined, onReserved);
   }
 
   // --- internals ------------------------------------------------------------
@@ -191,14 +191,14 @@ export class ScheduledPromptManager {
   }
 
   /** Execute one fire: run the job, then refresh next_run from the armed timer. */
-  private fire(id: string, occurrence = scheduledOccurrenceKey(id), onAdmittedOrSkipped?: () => void): Promise<void> {
-    const running = this.fireInner(id, occurrence, onAdmittedOrSkipped);
+  private fire(id: string, occurrence = scheduledOccurrenceKey(id), onAdmittedOrSkipped?: () => void, onReserved?: () => void): Promise<void> {
+    const running = this.fireInner(id, occurrence, onAdmittedOrSkipped, onReserved);
     const tracked = running.finally(() => this.activeFires.delete(tracked));
     this.activeFires.add(tracked);
     return tracked;
   }
 
-  private async fireInner(id: string, occurrence: ScheduledOccurrenceKey, onAdmittedOrSkipped?: () => void): Promise<void> {
+  private async fireInner(id: string, occurrence: ScheduledOccurrenceKey, onAdmittedOrSkipped?: () => void, onReserved?: () => void): Promise<void> {
     // #158: last line of defence. `armFromRow` never arms a quarantined row, but
     // catch-up and manual "Run now" reach `fire` directly — refuse there too so
     // there is exactly one answer for a legacy attachment-bearing schedule.
@@ -233,17 +233,20 @@ export class ScheduledPromptManager {
         const attempt = pending && this.store.turnAttempts.get(pending.id);
         if (attempt?.state === "suspended" && isAwaitingReauth(attempt.stalledReason)) {
           this.patchRow(id, { lastStatus: reauthWaitingStatus(attempt, current.timezone) });
+          onReserved?.();
           await this.onFire(id, pending!);
         } else this.patchRow(id, { lastStatus: "skipped: still running" });
         return;
       }
       if (intent.settled) return;
+      onReserved?.();
       const prepared = this.store.scheduledOccurrences.prepare(occurrence, intent.row, this.resolveExecution);
       if (!prepared) { this.patchRow(id, { lastStatus: "retained: scheduled identity unavailable" }); return; }
       await this.onFire(id, occurrence);
     } catch (err) {
       this.logger.error({ id, err }, "scheduled fire failed");
       this.patchRow(id, { lastStatus: admitted ? "error: scheduled occurrence retained" : "error: scheduled occurrence admission failed" });
+      if (!admitted && onReserved) throw err;
     } finally {
       this.inFlight.delete(id);
       const job = this.jobs.get(id);

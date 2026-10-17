@@ -8,10 +8,15 @@ export interface PubSubMessage {
   message?: WorkspacePubSubMessage;
 }
 
+interface InFlightAdmission {
+  spaces: string[];
+  admission: Promise<void>;
+}
+
 export class PubSubPullTransport {
   private controller?: AbortController;
   private loop?: Promise<void>;
-  private readonly inFlight = new Map<string, Promise<void>>();
+  private readonly inFlight = new Map<string, InFlightAdmission>();
 
   constructor(private readonly opts: { api: GoogleApi; subscription: string;
     receive: (event: unknown, signal?: AbortSignal, messageId?: string) => Promise<void>;
@@ -27,38 +32,50 @@ export class PubSubPullTransport {
   async stop(): Promise<void> {
     this.controller?.abort();
     await this.loop;
+    await Promise.allSettled([...this.inFlight.values()].map(entry => entry.admission));
     this.loop = undefined;
   }
 
   async process(received: PubSubMessage, signal?: AbortSignal): Promise<void> {
     if (!received.ackId || !received.message?.data) throw new Error("Pub/Sub event missing ackId or data");
     const id = received.message.messageId ?? received.ackId;
-    let admission = this.inFlight.get(id);
-    if (!admission) {
+    let entry = this.inFlight.get(id);
+    if (!entry) {
+      let spaces: string[], receive: () => Promise<void>;
       if (received.message.attributes?.["ce-type"]) {
         const messages = parseGoogleChatWorkspaceMessages(received.message);
-        admission = (async () => {
+        spaces = messages.map(message => message.space);
+        receive = async () => {
           for (const message of messages) {
             if (!this.opts.receiveWorkspaceMessage) throw new Error("Google Chat Workspace handler not installed");
             await this.opts.receiveWorkspaceMessage(message, signal);
           }
-        })();
+        };
       } else {
         // Buffer accepts missing padding and URL-safe base64 seen on the real subscription.
         const event: unknown = JSON.parse(Buffer.from(received.message.data, "base64").toString("utf8"));
-        admission = this.opts.receive(event, signal, id);
+        const space = (event as { space?: { name?: string } }).space?.name;
+        spaces = space ? [space] : [];
+        receive = () => this.opts.receive(event, signal, id);
       }
-      this.inFlight.set(id, admission);
+      // Preserve admission order within a Space without holding up other Spaces.
+      const prior = [...this.inFlight.values()].filter(pending => pending.spaces.some(space => spaces.includes(space)));
+      const admission = Promise.allSettled(prior.map(pending => pending.admission)).then(() => {
+        signal?.throwIfAborted();
+        return receive();
+      });
+      entry = { spaces, admission };
+      this.inFlight.set(id, entry);
     }
     try {
-      await admission;
+      await entry.admission;
       signal?.throwIfAborted();
       await this.opts.api.request("pubsub", { method: "POST",
         url: `https://pubsub.googleapis.com/v1/${this.opts.subscription}:acknowledge`,
         data: { ackIds: [received.ackId] }, signal });
       this.opts.logger.debug({ messageId: id }, "Google Chat event acknowledged after admission");
     } finally {
-      if (this.inFlight.get(id) === admission) this.inFlight.delete(id);
+      if (this.inFlight.get(id) === entry) this.inFlight.delete(id);
     }
   }
 
@@ -68,13 +85,12 @@ export class PubSubPullTransport {
       try {
         const result = await this.opts.api.request<{ receivedMessages?: PubSubMessage[] }>("pubsub", { method: "POST",
           url: `https://pubsub.googleapis.com/v1/${this.opts.subscription}:pull`, data: { maxMessages: 10 }, signal });
-        await Promise.all((result.receivedMessages ?? []).map(async message => {
-          try { await this.process(message, signal); }
-          catch (err) {
+        for (const message of result.receivedMessages ?? []) {
+          void this.process(message, signal).catch(err => {
             if (!signal.aborted) this.opts.logger.error({ err, messageId: message.message?.messageId },
               "Google Chat event not acknowledged; awaiting redelivery");
-          }
-        }));
+          });
+        }
         retryMs = 1000;
         if (!result.receivedMessages?.length) await delay(1000, undefined, { signal });
       } catch (err) {

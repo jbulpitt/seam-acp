@@ -2,9 +2,12 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { pino } from "pino";
 import { SessionStore } from "../packages/core/src/core/session-store.js";
 import { scheduleUiPorts } from "../packages/core/src/core/schedule-ui.js";
+import { ScheduledPromptManager } from "../packages/core/src/core/scheduled-prompts/manager.js";
+import { syntheticScheduleExecution } from "./scheduled-admission-fixture.js";
 import { GoogleChatAdapter } from "../packages/core/src/platforms/google-chat/adapter.js";
 import { PubSubPullTransport } from "../packages/core/src/platforms/google-chat/transport.js";
 import type { ScheduledPrompt } from "../packages/core/src/core/scheduled-prompts/types.js";
+import type { ScheduledOccurrenceKey } from "../packages/core/src/core/scheduled-prompts/occurrence-store.js";
 
 const cleanups: Array<() => void> = [];
 afterEach(() => { for (const cleanup of cleanups.splice(0).reverse()) cleanup(); });
@@ -24,7 +27,8 @@ function fixture(count = 5, admins = new Set(["users/42"])) {
   for (let i = 0; i < count; i++) store.upsertScheduled(schedule(i));
   store.upsertScheduled(schedule(8, { id: "discord-only", platform: "discord", name: "Discord private row" }));
   store.upsertScheduled(schedule(9, { id: "other-space", channelRef: "other", name: "Other Space row" }));
-  const manager = { armFromRow: vi.fn(), disarm: vi.fn(), reschedule: vi.fn(), runNow: vi.fn(async (id: string) => {
+  const manager = { armFromRow: vi.fn(), disarm: vi.fn(), reschedule: vi.fn(), runNow: vi.fn(async (id: string, onReserved?: () => void) => {
+    onReserved?.();
     store.upsertScheduled({ ...store.getScheduled(id)!, lastStatus: "ok" });
   }) };
   const ports = scheduleUiPorts({ store, logger, config: { REPOS_ROOT: "/fixture" },
@@ -91,6 +95,41 @@ function fixture(count = 5, admins = new Set(["users/42"])) {
 }
 
 describe("private Google Chat schedule list", () => {
+  it.each(["live", "isolated"] as const)("acknowledges Run now after durable reservation while the %s turn is still running", async sessionMode => {
+    const h = fixture(1), name = await h.open(), control = h.button(name, "Run now");
+    h.store.upsertScheduled({ ...h.store.getScheduled("sch_0")!, sessionMode });
+    let finish!: () => void, completed = false, acknowledged = false;
+    const execution = new Promise<void>(resolve => { finish = resolve; });
+    const onFire = vi.fn(async (_id: string, key: ScheduledOccurrenceKey) => {
+      await execution;
+      completed = true;
+      h.store.scheduledOccurrences.settle(key.id);
+      h.store.upsertScheduled({ ...h.store.getScheduled("sch_0")!, lastStatus: "ok" });
+    });
+    const manager = new ScheduledPromptManager({ store: h.store, logger, onFire, resolveExecution: syntheticScheduleExecution });
+    h.manager.runNow.mockImplementation(manager.runNow.bind(manager));
+    const click = h.clickRaw(name, control, "42", "running-click").then(() => { acknowledged = true; });
+    try {
+      await vi.waitFor(() => expect(acknowledged, "the click must not await the scheduled turn").toBe(true), { timeout: 500 });
+      expect(completed).toBe(false);
+      expect(h.store.scheduledOccurrences.pending()).toHaveLength(1);
+      expect(h.store.listInboundNonterminal()).toEqual([]);
+      expect(JSON.stringify(h.messages.get(name))).toContain("started");
+      expect(JSON.stringify(h.messages.get(name))).not.toContain("finished");
+      await h.clickRaw(name, control, "42", "running-click");
+      expect(onFire).toHaveBeenCalledOnce();
+      expect(h.store.scheduledOccurrences.pending()).toHaveLength(1);
+      expect(h.request.mock.calls.filter(([scope, r]) => scope === "pubsub" && r.data.ackIds?.includes("ack-running-click"))).toHaveLength(2);
+      await h.open("43");
+      expect(completed).toBe(false);
+    } finally {
+      finish();
+      await click;
+      await manager.drain();
+      manager.stop();
+    }
+  });
+
   it("lists only this Space's schedules privately, including native-thread schedules, and PATCHes complete pages", async () => {
     const h = fixture();
     h.store.upsertScheduled(schedule(7, { channelRef: "home.topic", parentRef: "home", name: "thread schedule" }));
@@ -125,7 +164,7 @@ describe("private Google Chat schedule list", () => {
     const memberView = JSON.stringify(h.messages.get(member));
     expect(memberView).not.toContain('"text":"Pause"'); expect(memberView).not.toContain('"text":"Delete"');
     await h.click(member, "Run now", "schedule 0", "43");
-    expect(h.manager.runNow).toHaveBeenCalledExactlyOnceWith("sch_0");
+    expect(h.manager.runNow).toHaveBeenCalledExactlyOnceWith("sch_0", expect.any(Function));
     const admin = await h.open();
     await h.click(admin, "Pause", "schedule 0");
     expect(h.store.getScheduled("sch_0")?.enabled).toBe(false);
@@ -192,9 +231,9 @@ describe("private Google Chat schedule list", () => {
     });
     await expect(h.clickRaw(name, control, "42", "same-publication")).rejects.toThrow("Pub/Sub ACK connection lost");
     await h.clickRaw(name, control, "42", "same-publication");
-    expect(h.manager.runNow).toHaveBeenCalledExactlyOnceWith("sch_0");
+    expect(h.manager.runNow).toHaveBeenCalledExactlyOnceWith("sch_0", expect.any(Function));
     expect(h.request.mock.calls.filter(([, r]) => r.method === "PATCH")).toHaveLength(2);
-    expect(JSON.stringify(h.messages.get(name))).toContain("finished");
+    expect(JSON.stringify(h.messages.get(name))).toContain("started");
   });
 
   it("preserves the real scheduler error in the private refreshed list", async () => {
@@ -203,6 +242,36 @@ describe("private Google Chat schedule list", () => {
     await h.click(name, "Run now", "schedule 0");
     expect(JSON.stringify(h.messages.get(name))).toContain("bridge worker unavailable: original cause");
     expect(h.messages.get(name).privateMessageViewer).toEqual({ name: "users/42" });
+  });
+
+  it("reports an occurrence reservation failure without claiming that the run started", async () => {
+    const h = fixture(1), name = await h.open(), onFire = vi.fn(async () => {});
+    const manager = new ScheduledPromptManager({ store: h.store, logger, onFire, resolveExecution: syntheticScheduleExecution });
+    h.manager.runNow.mockImplementation(manager.runNow.bind(manager));
+    vi.spyOn(h.store.scheduledOccurrences, "reserve").mockImplementationOnce(() => { throw new Error("SQLITE_FULL: occurrence reservation failed"); });
+    try {
+      await h.click(name, "Run now");
+      expect(JSON.stringify(h.messages.get(name))).toContain("SQLITE_FULL: occurrence reservation failed");
+      expect(JSON.stringify(h.messages.get(name))).not.toContain("started");
+      expect(h.store.scheduledOccurrences.pending()).toEqual([]);
+      expect(onFire).not.toHaveBeenCalled();
+    } finally { await manager.drain(); manager.stop(); }
+  });
+
+  it.each(["overlap", "quarantine"])("retains the existing %s notice when Run now is not reserved", async reason => {
+    const h = fixture(1), name = await h.open(), onFire = vi.fn(async () => {});
+    if (reason === "quarantine") (h.store as any).db.prepare("UPDATE scheduled_prompts SET attachments_json = ? WHERE id = ?")
+      .run('[{"filename":"legacy.txt"}]', "sch_0");
+    else h.store.scheduledOccurrences.reserve({ id: "prior-occurrence", scheduledFor: null }, h.store.getScheduled("sch_0")!);
+    const manager = new ScheduledPromptManager({ store: h.store, logger, onFire, resolveExecution: syntheticScheduleExecution });
+    h.manager.runNow.mockImplementation(manager.runNow.bind(manager));
+    try {
+      await h.click(name, "Run now");
+      const card = JSON.stringify(h.messages.get(name));
+      expect(card).toContain(reason === "quarantine" ? "quarantined" : "already running");
+      expect(card).not.toContain("started");
+      expect(onFire).not.toHaveBeenCalled();
+    } finally { await manager.drain(); manager.stop(); }
   });
 });
 

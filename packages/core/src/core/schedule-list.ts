@@ -22,7 +22,8 @@ export interface ScheduleListPorts {
     arm(row: ScheduledPrompt): void;
     disarm(id: string): void;
     reschedule(id: string): void;
-    runNow(id: string): Promise<void>;
+    /** Waits for completion; onReserved reports the earlier durable admission. */
+    runNow(id: string, onReserved?: () => void): Promise<void>;
   };
 }
 
@@ -38,7 +39,7 @@ export function scheduleInScope(row: ScheduledPrompt, scope: ScheduleListScope):
 export function createScheduleListPorts(deps: {
   store: Pick<SessionStore, "listScheduledByChannel" | "listAllScheduled" | "getScheduled" | "upsertScheduled" | "deleteScheduled">;
   manager(): Pick<ScheduledPromptManager, "armFromRow" | "disarm" | "reschedule" | "runNow"> | undefined;
-  runNow(id: string): Promise<void>;
+  runNow(id: string, onReserved?: () => void): Promise<void>;
 }): ScheduleListPorts {
   return {
     repository: {
@@ -51,7 +52,11 @@ export function createScheduleListPorts(deps: {
     admin: {
       arm: row => deps.manager()?.armFromRow(row), disarm: id => deps.manager()?.disarm(id),
       reschedule: id => deps.manager()?.reschedule(id),
-      runNow: async id => { const manager = deps.manager(); if (manager) await manager.runNow(id); else await deps.runNow(id); },
+      runNow: (id, onReserved) => {
+        const manager = deps.manager();
+        const run = manager ? manager.runNow.bind(manager) : deps.runNow;
+        return onReserved ? run(id, onReserved) : run(id);
+      },
     },
   };
 }
@@ -82,6 +87,17 @@ export class ScheduleList {
   async run(scope: ScheduleListScope, id: string): Promise<string> {
     const row = this.require(scope, id);
     await this.ports.admin.runNow(id);
+    const fresh = this.get(scope, id);
+    return scheduleRunOutcome({ name: row.name, status: fresh?.lastStatus,
+      quarantined: Boolean(legacyAttachmentQuarantine(fresh ?? row)) });
+  }
+
+  async start(scope: ScheduleListScope, id: string): Promise<string> {
+    const row = this.require(scope, id);
+    const reserved = await new Promise<boolean>((resolve, reject) => {
+      this.ports.admin.runNow(id, () => resolve(true)).then(() => resolve(false), reject);
+    });
+    if (reserved) return `▶️ **${row.name}** started.`;
     const fresh = this.get(scope, id);
     return scheduleRunOutcome({ name: row.name, status: fresh?.lastStatus,
       quarantined: Boolean(legacyAttachmentQuarantine(fresh ?? row)) });

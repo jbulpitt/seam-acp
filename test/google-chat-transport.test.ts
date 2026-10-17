@@ -5,6 +5,36 @@ const subscription = "projects/test/subscriptions/events";
 const logger = pino({ level: "silent" });
 
 describe("Google Chat Pub/Sub admission", () => {
+  it("pulls and acknowledges Space Y while a click in an earlier batch from Space X is still admitting", async () => {
+    const { PubSubPullTransport } = await import("../packages/core/src/platforms/google-chat/transport.js");
+    let admitX!: () => void;
+    const pendingX = new Promise<void>(resolve => { admitX = resolve; });
+    const clickX = { type: "CARD_CLICKED", space: { name: "spaces/X" } };
+    const messageY = { type: "MESSAGE", space: { name: "spaces/Y" }, message: { name: "spaces/Y/messages/hello", text: "hello" } };
+    const delivery = (id: string, event: unknown) => ({ ackId: `ack-${id}`, message: { messageId: id,
+      data: Buffer.from(JSON.stringify(event)).toString("base64") } });
+    let pulls = 0;
+    const request = vi.fn(async (_scope: unknown, r: any): Promise<any> => {
+      if (!r.url.endsWith(":pull")) return {};
+      if (++pulls === 1) return { receivedMessages: [delivery("X", clickX)] };
+      if (pulls === 2) return { receivedMessages: [delivery("Y", messageY)] };
+      return new Promise((_, reject) => {
+        r.signal.addEventListener("abort", () => reject(r.signal.reason), { once: true });
+      });
+    });
+    const receive = vi.fn(async (event: unknown) => { if ((event as any).space.name === "spaces/X") await pendingX; });
+    const transport = new PubSubPullTransport({ api: { request }, subscription, receive, logger });
+    await transport.start();
+    try {
+      await vi.waitFor(() => expect(request).toHaveBeenCalledWith("pubsub", expect.objectContaining({
+        url: `https://pubsub.googleapis.com/v1/${subscription}:acknowledge`, data: { ackIds: ["ack-Y"] },
+      })), { timeout: 500 });
+      expect(receive).toHaveBeenNthCalledWith(1, clickX, expect.any(AbortSignal), "X");
+      expect(receive).toHaveBeenNthCalledWith(2, messageY, expect.any(AbortSignal), "Y");
+      expect(request.mock.calls.some(([, r]) => r.data?.ackIds?.includes("ack-X"))).toBe(false);
+    } finally { admitX(); await transport.stop(); }
+  });
+
   it("decodes unpadded base64 and acknowledges only after durable admission", async () => {
     const { PubSubPullTransport } = await import("../packages/core/src/platforms/google-chat/transport.js");
     let admit!: () => void;

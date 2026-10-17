@@ -51,6 +51,7 @@ export async function renderGoogleChatConfigPicker(
   const paragraph = (text: string): GoogleChatCardWidget => ({ textParagraph: { text: formatGoogleChatCardText(text) } });
   if (notice) widgets.push(paragraph(notice));
   widgets.push(paragraph(`Current: ${selected}`));
+  if (command.command === "agent") widgets.push(paragraph("Change hosts with /agent agent@host."));
   if (!options.cancelled) {
     for (const choice of choices.slice(page * pageSize, (page + 1) * pageSize)) {
       widgets.push({ buttonList: { buttons: [button(`${choice.label}${choice.id === selected ? " (current)" : ""}`, "select", choice.id)] } });
@@ -62,7 +63,8 @@ export async function renderGoogleChatConfigPicker(
     widgets.push({ buttonList: { buttons: [button("Cancel", "cancel")] } });
   }
   return { cardsV2: [{ cardId: "config-picker", card: {
-    header: { title: `Choose ${command.command}`, subtitle: `Only visible to you · ${binding.agentId}@${binding.location} · Page ${page + 1}/${pageCount}` },
+    header: { title: `Choose ${command.command} · Host: ${binding.location}`,
+      subtitle: `Only visible to you · ${binding.agentId} · Page ${page + 1}/${pageCount}` },
     sections: [{ widgets }],
   } }] };
 }

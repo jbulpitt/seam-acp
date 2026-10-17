@@ -91,9 +91,13 @@ describe("private Google Chat config pickers", () => {
   it.each(["agent", "model", "effort", "repo"] as const)("opens /%s privately with the effective current choice and host choices", async kind => {
     const h = setup(); await h.deliver(command(kind));
     expect(h.latest()).toMatchObject({ privateMessageViewer: { name: user.name }, cardsV2: expect.any(Array) });
+    expect(JSON.stringify(h.latest().cardsV2[0].card.header)).toContain("Host: remote");
     const value = kind === "repo" ? h.current.cwd : h.current[kind];
     expect(choice(h.latest(), value).text).toContain("current");
-    if (kind === "agent") expect(h.listProfiles).toHaveBeenCalledWith("remote");
+    if (kind === "agent") {
+      expect(h.listProfiles).toHaveBeenCalledWith("remote");
+      expect(JSON.stringify(h.latest().cardsV2)).toContain("/agent agent@host");
+    }
     if (kind === "model") expect(h.models).toHaveBeenCalledWith({ agentId: "codex", location: "remote" }, { current: "model-0" });
     if (kind === "effort") {
       expect(h.effortChoices).toHaveBeenCalledWith({ agentId: "codex", location: "remote" }, "model-0");
@@ -101,6 +105,28 @@ describe("private Google Chat config pickers", () => {
     }
     if (kind === "repo") expect(h.listRepos).toHaveBeenCalledWith(h.store.getByChannel("google-chat", "dm"));
     expect(h.normal).not.toHaveBeenCalled(); expect(h.applyModelChange).not.toHaveBeenCalled();
+  });
+
+  it.each(["agent", "model", "effort", "repo"] as const)("refreshes /%s's header from the current session host after selection and Cancel", async kind => {
+    const h = setup(); h.current.location = "local";
+    await h.deliver(command(kind));
+    expect(JSON.stringify(h.latest().cardsV2[0].card.header)).toContain("Host: local");
+    // A typed command can move the session while an older card is still open.
+    h.current.location = "macbook-air";
+    const value = { agent: "grok", model: "model-1", effort: "high", repo: "/remote/repo with spaces" }[kind];
+    await h.deliver(click(choice(h.latest(), value)));
+    expect(JSON.stringify(h.latest().cardsV2[0].card.header)).toContain("Host: macbook-air");
+    h.current.location = "dev01";
+    await h.deliver(click(control(h.latest(), "Cancel")));
+    expect(JSON.stringify(h.latest().cardsV2[0].card.header)).toContain("Host: dev01");
+    expect(buttons(h.latest())).toEqual([]);
+  });
+
+  it("keeps typed /agent agent@host on the existing config path", async () => {
+    const h = setup(); await h.deliver(command("agent", "grok@macbook-air"));
+    expect(h.applyAgentChange.mock.calls[0]![2]).toBe("grok@macbook-air");
+    expect(h.latest().text).toBe("Agent switched. Session reset.");
+    expect(h.listProfiles).not.toHaveBeenCalled();
   });
 
   it.each([

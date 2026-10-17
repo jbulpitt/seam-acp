@@ -7,6 +7,7 @@ import { syntheticScheduleExecution } from "./scheduled-admission-fixture.js";
 import { GoogleChatAdapter } from "../packages/core/src/platforms/google-chat/adapter.js";
 import { PubSubPullTransport } from "../packages/core/src/platforms/google-chat/transport.js";
 import type { ScheduledPrompt } from "../packages/core/src/core/scheduled-prompts/types.js";
+import type { ScheduledOccurrenceKey } from "../packages/core/src/core/scheduled-prompts/occurrence-store.js";
 
 const cleanups: Array<() => void> = [];
 afterEach(() => { for (const cleanup of cleanups.splice(0).reverse()) cleanup(); });
@@ -99,7 +100,7 @@ describe("private Google Chat schedule list", () => {
     h.store.upsertScheduled({ ...h.store.getScheduled("sch_0")!, sessionMode });
     let finish!: () => void, completed = false, acknowledged = false;
     const execution = new Promise<void>(resolve => { finish = resolve; });
-    const onFire = vi.fn(async (_id, key) => {
+    const onFire = vi.fn(async (_id: string, key: ScheduledOccurrenceKey) => {
       await execution;
       completed = true;
       h.store.scheduledOccurrences.settle(key.id);

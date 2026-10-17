@@ -148,6 +148,8 @@ Bare `/agent` and `/model` also open private cards. Agents come from the
 session host's advertised profiles; models come from that agent's catalog on
 the same host. Each picker marks the current choice and offers Prev/Next for
 long lists. Cancel closes the controls without applying a change.
+Each header shows the session's current host. To move hosts, type
+`/agent agent@host`; picker choices apply on the current host.
 
 Selecting a choice uses the same validation, response and session transition
 as typing a value. The result and refreshed choices replace the whole private

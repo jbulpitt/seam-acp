@@ -17,12 +17,12 @@ export { GoogleChatSessionSpaces, resolveGoogleChatOrgDefaults, prepareGoogleCha
 export interface GoogleChatCommandDeps {
   /** The adapter owns resource-name -> canonical ChannelRef mapping. */
   channelFor(space: string, thread: string | null): ChannelRef;
-  router: Pick<SessionRouter, "ensureSessionRecord" | "describeConfig" | "bindRecordLocation">;
+  router: Pick<SessionRouter, "ensureSessionRecord" | "describeConfig" | "bindRecordLocation" | "listProfiles">;
   store: Pick<SessionStore, "getByChannel">;
   mutation: Pick<ConfigMutationService, "readThreadPresetEntry" | "applyThreadOverlay">;
   runtimeTransition: Pick<RuntimeTransition, "applyAgentChange" | "applyModelChange" | "configure">;
   configPlan: Pick<ConfigApplyPlan, "applyRepoChange" | "listRepos">;
-  modelCatalog: Pick<ModelCatalogService, "effortChoices">;
+  modelCatalog: Pick<ModelCatalogService, "models" | "model" | "effortChoices">;
   cancelChannel: Orchestrator["cancelChannel"];
   cwd: string;
   location?: string;
@@ -31,8 +31,10 @@ export interface GoogleChatCommandDeps {
 
 type CancelOutcome = Awaited<ReturnType<Orchestrator["cancelChannel"]>>;
 type SwitchOutcome = Awaited<ReturnType<RuntimeTransition["applyModelChange"]>>;
+export type GoogleChatConfigCommand = Exclude<GoogleChatCommand["command"], "new" | "schedules" | "cancel">;
 export type GoogleChatCommandResult =
   | { command: "cancel"; channel: ChannelRef; outcome: CancelOutcome }
+  | { command: "picker"; requestedCommand: GoogleChatConfigCommand; channel: ChannelRef }
   | { command: "usage"; requestedCommand: "agent" | "model" | "repo" | "effort"; channel: ChannelRef; message: string }
   | { command: "agent" | "model"; channel: ChannelRef; outcome: SwitchOutcome }
   | { command: "repo"; channel: ChannelRef; outcome: Awaited<ReturnType<ConfigApplyPlan["applyRepoChange"]>> }
@@ -55,22 +57,7 @@ export async function executeGoogleChatCommand(
   }
   deps.router.bindRecordLocation(record);
   if (!command.args.trim()) {
-    const current = deps.router.describeConfig(record);
-    let message: string;
-    if (command.command === "repo") {
-      message = `Usage: /repo <path> — current: ${current.cwd.value} (host: ${current.location.value})`;
-      try {
-        const repos = await deps.configPlan.listRepos(record);
-        message += `\nAvailable repos: ${repos.length ? repos.join(", ") : "none listed"}`;
-      } catch (err) {
-        message += `\nAvailable repos unavailable: ${err instanceof Error ? err.message : String(err)}`;
-      }
-    } else if (command.command === "effort") {
-      const levels = deps.modelCatalog.effortChoices({ agentId: current.agent.value, location: current.location.value }, current.model.value);
-      message = `Usage: /effort <level> — current: ${current.effort.value ?? "auto"}\nValid levels for ${current.agent.value}/${current.model.value}: ${levels.length ? levels.join(", ") : "none advertised"}. Use auto for the default.`;
-    } else message = `Usage: /${command.command} <id> — current: ${current[command.command].value}`;
-    await deps.respond(channel, message);
-    return { command: "usage", requestedCommand: command.command, channel, message };
+    return { command: "picker", requestedCommand: command.command, channel };
   }
   const actor = { id: command.user.id, name: command.user.name };
   const respond = (text: string) => deps.respond(channel, text);

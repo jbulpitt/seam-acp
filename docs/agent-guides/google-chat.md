@@ -126,14 +126,14 @@ Register these slash commands in the Chat API configuration alongside ids 1–4:
 Relative paths resolve under the bound bridge's workspace root (`REPOS_ROOT`
 on that host); absolute paths use that host's filesystem too. The host validates
 the directory and returns its real cause when it cannot use it. Bare `/repo`
-shows usage, the current cwd and the existing host workspace list.
+opens a private picker of the bound host's workspaces, with the current cwd marked.
 
 A changed cwd starts a fresh session. If a turn is running, it finishes in the
 old cwd before the next turn starts in the new repo. The confirmation states
 whether the session reset now, a reset is pending, or no reset was needed.
 
 `/effort <level>` uses the same configuration operation as `configure_thread`.
-Bare `/effort` shows the current effort and the current agent/model's catalog
+Bare `/effort` opens a private picker of the current agent/model's catalog
 levels. `auto` selects the default; invalid levels return the catalog or live
 provider's actual reason. Effort never resets conversation context, although
 some agents reload their runtime to apply it.
@@ -141,6 +141,19 @@ some agents reload their runtime to apply it.
 Both commands reply privately: top-level replies are unthreaded, and in-thread
 replies stay in that thread. In unthreaded Spaces they change the shared Space
 session. Durable receipts prevent redelivery from applying a command twice.
+
+### Private configuration pickers
+
+Bare `/agent` and `/model` also open private cards. Agents come from the
+session host's advertised profiles; models come from that agent's catalog on
+the same host. Each picker marks the current choice and offers Prev/Next for
+long lists. Cancel closes the controls without applying a change.
+
+Selecting a choice uses the same validation, response and session transition
+as typing a value. The result and refreshed choices replace the whole private
+card. Durable command receipts cover clicks and pending card updates across
+redelivery. These cards use the existing command ids 3–6; no registration
+change is needed.
 
 ### Private schedule editor
 

@@ -52,11 +52,11 @@ function setup(rejectPrivateRoot = false) {
   });
   const cancelChannel = vi.fn(async () => ({ parked: null, cancelled: { cancelled: true, starting: false },
     outcome: "idle", queue: { state: "idle", queued: 0 } }));
-  (adapter as any).setCommandDeps?.({ store, router: { ensureSessionRecord, describeConfig, bindRecordLocation: () => "local" },
+  (adapter as any).setCommandDeps?.({ store, router: { ensureSessionRecord, describeConfig, bindRecordLocation: () => "local", listProfiles: () => [{ id: "claude", displayName: "Claude" }] },
     mutation: { readThreadPresetEntry: () => undefined, applyThreadOverlay: () => ({ ok: true }) },
     runtimeTransition: { applyAgentChange, applyModelChange, configure }, cancelChannel,
     configPlan: { applyRepoChange, listRepos: async () => ["/projects/old", "/projects/new"] },
-    modelCatalog: { effortChoices: () => ["low", "high"] } });
+    modelCatalog: { effortChoices: () => ["low", "high"], models: () => [{ id: "claude-reviewed", displayName: "Claude reviewed" }], model: (_binding: unknown, id: string) => ({ id }) } });
   const transport = new PubSubPullTransport({ api: { request }, subscription: "projects/test/subscriptions/events", logger,
     receive: (...args: any[]) => (adapter.receiveEvent as any)(...args) });
   const deliver = (raw: unknown) => transport.process({ ackId: "ack-command", message: { messageId: "pubsub-command",
@@ -82,8 +82,8 @@ describe("merged Google Chat commands wired before ordinary turn admission", () 
     const raw = event(id, id === 5 ? "/repo" : "/effort");
     await h.deliver({ ...raw, message: { ...raw.message, argumentText: null } });
     expect(h.messages[0]).toMatchObject({ thread: { name: "spaces/dm/threads/thread" }, privateMessageViewer: { name: "users/42" } });
-    expect(h.messages[0].text).toContain(id === 5 ? "/projects/old" : "low");
-    expect(h.messages[0].text).toContain(id === 5 ? "/projects/new" : "high");
+    expect(JSON.stringify(h.messages[0].cardsV2)).toContain(id === 5 ? "/projects/old" : "low");
+    expect(JSON.stringify(h.messages[0].cardsV2)).toContain(id === 5 ? "/projects/new" : "high");
     expect(h.applyRepoChange).not.toHaveBeenCalled();
     expect(h.configure).not.toHaveBeenCalled();
     expect(h.normal).not.toHaveBeenCalled();
@@ -106,7 +106,7 @@ describe("merged Google Chat commands wired before ordinary turn admission", () 
     });
 
   it.each([[3, "agent", "claude"], [4, "model", "claude-reviewed"]])
-    ("replies with usage for bare /%s with null argumentText, preserving the saved session", async (id, command, current) => {
+    ("opens a picker for bare command %s with null argumentText, preserving the saved session", async (id, command, current) => {
       const h = setup();
       const before = structuredClone(h.record);
       const raw = event(Number(id), `/${command}`);
@@ -115,7 +115,8 @@ describe("merged Google Chat commands wired before ordinary turn admission", () 
       expect(h.applyModelChange).not.toHaveBeenCalled();
       expect(h.normal).not.toHaveBeenCalled();
       expect(h.record).toEqual(before);
-      expect(h.request.mock.calls[0]![1].data.text).toBe(`Usage: /${command} <id> — current: ${current}`);
+      expect(h.messages[0]).toHaveProperty("cardsV2");
+      expect(JSON.stringify(h.messages[0].cardsV2)).toContain(current);
       expect(h.request.mock.calls.at(-1)).toEqual(["pubsub", expect.objectContaining({
         data: { ackIds: ["ack-command"] },
       })]);
@@ -141,15 +142,16 @@ describe("merged Google Chat commands wired before ordinary turn admission", () 
     });
 
   it.each([[3, "agent", "claude", undefined], [4, "model", "claude-reviewed", false]])
-    ("delivers bare command %s usage from a top-level private invocation", async (id, command, current, threadReply) => {
+    ("delivers bare command %s picker from a top-level private invocation", async (id, command, current, threadReply) => {
       const h = setup(true);
       const before = structuredClone(h.record);
       const raw = rootEvent(Number(id), `/${command}`, threadReply as boolean | undefined);
       await h.deliver({ ...raw, message: { ...raw.message, argumentText: null } });
       expect(h.messages).toEqual([expect.objectContaining({
-        text: `Usage: /${command} <id> — current: ${current}`, privateMessageViewer: { name: "users/42" },
+        cardsV2: expect.any(Array), privateMessageViewer: { name: "users/42" },
       })]);
       expect(h.messages[0]).not.toHaveProperty("thread");
+      expect(JSON.stringify(h.messages[0].cardsV2)).toContain(current);
       expect(h.applyAgentChange).not.toHaveBeenCalled();
       expect(h.applyModelChange).not.toHaveBeenCalled();
       expect(h.record).toEqual(before);

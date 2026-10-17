@@ -146,6 +146,31 @@ describe("private Google Chat config pickers", () => {
     expect(h.current).toEqual(original); expect(h.applyModelChange).not.toHaveBeenCalled();
   });
 
+  it("retains the selected page and refreshes the marked model after a switch", async () => {
+    const h = setup(); await h.deliver(command("model"));
+    await h.deliver(click(control(h.latest(), "Next")));
+    await h.deliver(click(choice(h.latest(), "model-7")));
+    expect(choice(h.latest(), "model-7").text).toContain("current");
+    expect(JSON.stringify(h.latest())).toContain("Page 2/3");
+  });
+
+  it("marks the catalog's canonical model when the effective value is an alias", async () => {
+    const h = setup(); h.current.model = "default";
+    h.model.mockReturnValueOnce({ id: "model-0" });
+    await h.deliver(command("model"));
+    expect(choice(h.latest(), "model-0").text).toContain("current");
+  });
+
+  it("preserves the typed transition's no-op response when the current model is selected", async () => {
+    const h = setup(); await h.deliver(command("model"));
+    h.applyModelChange.mockImplementationOnce(async (_ch, _record, _value, _actor, respond) => {
+      await respond("Already using model-0. Session unchanged."); return { ok: true, message: "native" };
+    });
+    await h.deliver(click(choice(h.latest(), "model-0")));
+    expect(h.applyModelChange).toHaveBeenCalledOnce();
+    expect(JSON.stringify(h.latest())).toContain("Already using model-0. Session unchanged.");
+  });
+
   it("keeps the shared operation's refusal and current value visible", async () => {
     const h = setup(); await h.deliver(command("model"));
     h.applyModelChange.mockImplementationOnce(async (_ch, _record, _value, _actor, respond) => {

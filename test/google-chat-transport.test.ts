@@ -163,7 +163,7 @@ describe("Google Chat Pub/Sub admission", () => {
 
   it("can stop an idle long pull without acknowledging unprocessed work", async () => {
     const { PubSubPullTransport } = await import("../packages/core/src/platforms/google-chat/transport.js");
-    const request = vi.fn(async (_scope: unknown, r: any) => new Promise((_, reject) => {
+    const request = vi.fn(async (_scope: unknown, r: any): Promise<any> => new Promise((_, reject) => {
       r.signal.addEventListener("abort", () => reject(r.signal.reason), { once: true });
     }));
     const transport = new PubSubPullTransport({ api: { request }, subscription, receive: async () => {}, logger });

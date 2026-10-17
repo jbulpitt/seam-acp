@@ -173,7 +173,7 @@ describe("Google Chat command -> existing core operations", () => {
       message: { thread: { name: command.thread! }, slashCommand: { commandId: "2" }, argumentText: "/cancel" },
     });
     if (!parsed || parsed.command !== "cancel") throw new Error("Expected cancel command");
-    await executeGoogleChatCommand(parsed, h.deps);
+    await executeGoogleChatCommand({ ...parsed, command: parsed.command }, h.deps);
     expect(h.cancelChannel).toHaveBeenCalledExactlyOnceWith(channel);
   });
 });

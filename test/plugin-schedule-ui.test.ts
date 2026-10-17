@@ -142,6 +142,22 @@ describe("schedule UI built-in", () => {
     run.mockRestore();
   });
 
+  it("keeps Discord Run now waiting for completion before showing its outcome", async () => {
+    const h = await fixture();
+    let finish!: () => void, returned = false;
+    const running = new Promise<void>(resolve => { finish = resolve; });
+    h.manager.runNow.mockImplementation(async () => { await running; });
+    const list = command("list", undefined, h.component);
+    await h.orchestrator.handleSlashInteraction(list.native as never);
+    const click = list.click("sl:run:sch_11a221c3").then(result => { returned = true; return result; });
+    try {
+      await vi.waitFor(() => expect(h.manager.runNow).toHaveBeenCalledExactlyOnceWith("sch_11a221c3"));
+      expect(returned).toBe(false);
+    } finally { finish(); }
+    const { replies } = await click;
+    expect(replies.some(view => view.content === "▶️ **existing** finished — last: `ok`.")).toBe(true);
+  });
+
   it("runs a pre-restart list button through the new host without its original collector", async () => {
     const before = await fixture();
     const rows = before.store.listScheduledByChannel("discord", "thread");

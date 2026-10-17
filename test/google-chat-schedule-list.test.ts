@@ -2,6 +2,8 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { pino } from "pino";
 import { SessionStore } from "../packages/core/src/core/session-store.js";
 import { scheduleUiPorts } from "../packages/core/src/core/schedule-ui.js";
+import { ScheduledPromptManager } from "../packages/core/src/core/scheduled-prompts/manager.js";
+import { syntheticScheduleExecution } from "./scheduled-admission-fixture.js";
 import { GoogleChatAdapter } from "../packages/core/src/platforms/google-chat/adapter.js";
 import { PubSubPullTransport } from "../packages/core/src/platforms/google-chat/transport.js";
 import type { ScheduledPrompt } from "../packages/core/src/core/scheduled-prompts/types.js";
@@ -91,6 +93,41 @@ function fixture(count = 5, admins = new Set(["users/42"])) {
 }
 
 describe("private Google Chat schedule list", () => {
+  it.each(["live", "isolated"] as const)("acknowledges Run now after durable reservation while the %s turn is still running", async sessionMode => {
+    const h = fixture(1), name = await h.open(), control = h.button(name, "Run now");
+    h.store.upsertScheduled({ ...h.store.getScheduled("sch_0")!, sessionMode });
+    let finish!: () => void, completed = false, acknowledged = false;
+    const execution = new Promise<void>(resolve => { finish = resolve; });
+    const onFire = vi.fn(async (_id, key) => {
+      await execution;
+      completed = true;
+      h.store.scheduledOccurrences.settle(key.id);
+      h.store.upsertScheduled({ ...h.store.getScheduled("sch_0")!, lastStatus: "ok" });
+    });
+    const manager = new ScheduledPromptManager({ store: h.store, logger, onFire, resolveExecution: syntheticScheduleExecution });
+    h.manager.runNow.mockImplementation(manager.runNow.bind(manager));
+    const click = h.clickRaw(name, control, "42", "running-click").then(() => { acknowledged = true; });
+    try {
+      await vi.waitFor(() => expect(acknowledged, "the click must not await the scheduled turn").toBe(true), { timeout: 500 });
+      expect(completed).toBe(false);
+      expect(h.store.scheduledOccurrences.pending()).toHaveLength(1);
+      expect(h.store.listInboundNonterminal()).toEqual([]);
+      expect(JSON.stringify(h.messages.get(name))).toContain("started");
+      expect(JSON.stringify(h.messages.get(name))).not.toContain("finished");
+      await h.clickRaw(name, control, "42", "running-click");
+      expect(onFire).toHaveBeenCalledOnce();
+      expect(h.store.scheduledOccurrences.pending()).toHaveLength(1);
+      expect(h.request.mock.calls.filter(([scope, r]) => scope === "pubsub" && r.data.ackIds?.includes("ack-running-click"))).toHaveLength(2);
+      await h.open("43");
+      expect(completed).toBe(false);
+    } finally {
+      finish();
+      await click;
+      await manager.drain();
+      manager.stop();
+    }
+  });
+
   it("lists only this Space's schedules privately, including native-thread schedules, and PATCHes complete pages", async () => {
     const h = fixture();
     h.store.upsertScheduled(schedule(7, { channelRef: "home.topic", parentRef: "home", name: "thread schedule" }));

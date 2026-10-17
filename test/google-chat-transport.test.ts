@@ -17,7 +17,9 @@ describe("Google Chat Pub/Sub admission", () => {
     const request = vi.fn(async (_scope: unknown, r: any): Promise<any> => {
       if (!r.url.endsWith(":pull")) return {};
       if (++pulls === 1) return { receivedMessages: [delivery("X", clickX)] };
-      if (pulls === 2) return { receivedMessages: [delivery("Y", messageY)] };
+      if (pulls === 2) return { receivedMessages: [
+        { ...delivery("X", clickX), ackId: "ack-X-redelivery" }, delivery("Y", messageY),
+      ] };
       return new Promise((_, reject) => {
         r.signal.addEventListener("abort", () => reject(r.signal.reason), { once: true });
       });
@@ -31,7 +33,63 @@ describe("Google Chat Pub/Sub admission", () => {
       })), { timeout: 500 });
       expect(receive).toHaveBeenNthCalledWith(1, clickX, expect.any(AbortSignal), "X");
       expect(receive).toHaveBeenNthCalledWith(2, messageY, expect.any(AbortSignal), "Y");
+      expect(receive).toHaveBeenCalledTimes(2);
       expect(request.mock.calls.some(([, r]) => r.data?.ackIds?.includes("ack-X"))).toBe(false);
+      admitX();
+      await vi.waitFor(() => expect(request.mock.calls.filter(([, r]) => r.data?.ackIds?.some((id: string) => id.startsWith("ack-X")))).toHaveLength(2));
+    } finally { admitX(); await transport.stop(); }
+  });
+
+  it("stops pulling but drains an in-flight admission without acknowledging it during shutdown", async () => {
+    const { PubSubPullTransport } = await import("../packages/core/src/platforms/google-chat/transport.js");
+    let admit!: () => void, pulls = 0, stopped = false;
+    const admission = new Promise<void>(resolve => { admit = resolve; });
+    const receive = vi.fn(async () => admission);
+    const request = vi.fn(async (_scope: unknown, r: any): Promise<any> => {
+      if (!r.url.endsWith(":pull")) return {};
+      if (++pulls === 1) return { receivedMessages: [{ ackId: "held-ack", message: { messageId: "held",
+        data: Buffer.from('{"type":"CARD_CLICKED"}').toString("base64") } }] };
+      return new Promise((_, reject) => { r.signal.addEventListener("abort", () => reject(r.signal.reason), { once: true }); });
+    });
+    const transport = new PubSubPullTransport({ api: { request }, subscription, receive, logger });
+    await transport.start();
+    await vi.waitFor(() => expect(receive).toHaveBeenCalledOnce());
+    const stop = transport.stop().then(() => { stopped = true; });
+    try {
+      await new Promise(resolve => setImmediate(resolve));
+      expect(stopped).toBe(false);
+      expect(request.mock.calls.every(([, r]) => r.url.endsWith(":pull"))).toBe(true);
+    } finally { admit(); await stop; }
+    expect(stopped).toBe(true);
+    expect(request.mock.calls.every(([, r]) => r.url.endsWith(":pull"))).toBe(true);
+  });
+
+  it("keeps later same-Space admissions behind earlier hydration while another Space advances", async () => {
+    const { PubSubPullTransport } = await import("../packages/core/src/platforms/google-chat/transport.js");
+    let admitX!: () => void, pulls = 0;
+    const hydration = new Promise<void>(resolve => { admitX = resolve; });
+    const event = (space: string, id: string) => ({ ackId: `ack-${id}`, message: { messageId: id,
+      data: Buffer.from(JSON.stringify({ type: "MESSAGE", space: { name: `spaces/${space}` }, id })).toString("base64") } });
+    const request = vi.fn(async (_scope: unknown, r: any): Promise<any> => {
+      if (!r.url.endsWith(":pull")) return {};
+      if (++pulls === 1) return { receivedMessages: [event("X", "X1")] };
+      if (pulls === 2) return { receivedMessages: [event("X", "X2"), event("Y", "Y1")] };
+      return new Promise((_, reject) => { r.signal.addEventListener("abort", () => reject(r.signal.reason), { once: true }); });
+    });
+    const admitted: string[] = [];
+    const receive = vi.fn(async (raw: unknown) => {
+      const message = raw as { id: string };
+      if (message.id === "X1") await hydration;
+      admitted.push(message.id);
+    });
+    const transport = new PubSubPullTransport({ api: { request }, subscription, receive, logger });
+    await transport.start();
+    try {
+      await vi.waitFor(() => expect(admitted).toContain("Y1"));
+      expect(admitted).toEqual(["Y1"]);
+      expect(receive).toHaveBeenCalledTimes(2);
+      admitX();
+      await vi.waitFor(() => expect(admitted).toEqual(["Y1", "X1", "X2"]));
     } finally { admitX(); await transport.stop(); }
   });
 

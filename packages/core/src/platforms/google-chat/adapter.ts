@@ -35,6 +35,7 @@ import { hasAppMention, mentionsChatApp, isSharedSpace, stripAppMentions,
 import type { GoogleChatSpaceEvents } from "./space-events.js";
 import type { ParsedWorkspaceChatMessage } from "./workspace-message-event.js";
 import { GoogleChatScheduleList, GOOGLE_CHAT_SCHEDULE_ACTION, type GoogleChatScheduleListOptions } from "./schedule-list.js";
+import { renderGoogleChatConfigPicker, GOOGLE_CHAT_CONFIG_ACTION, type GoogleChatConfigPickerCommand } from "./config-picker.js";
 
 export const GOOGLE_CHAT_PLATFORM = "google-chat";
 const root = "https://chat.googleapis.com/v1";
@@ -360,14 +361,11 @@ export class GoogleChatAdapter implements ChatAdapter {
           receipt.replies.push({ channel: { platform: this.platform, id: resourceId(command.space, "spaces") },
             text: "", index: 0, cards: this.scheduleList.render(command.space, command.user.id) });
         } else {
+          const deps = this.configCommandDeps(respond);
           const result = await executeGoogleChatCommand({ ...command, command: command.command,
-            user: { ...command.user, id: resourceId(command.user.id, "users") } }, {
-            ...this.commandDeps,
-            channelFor: (space, thread) => this.channelFor(space, thread),
-            cwd: this.opts.defaultCwd,
-            location: this.opts.defaultLocation,
-            respond,
-          });
+            user: { ...command.user, id: resourceId(command.user.id, "users") } }, deps);
+          if (result.command === "picker") receipt.replies.push({ channel: replyChannel ?? result.channel, text: "", index: 0,
+            cards: await renderGoogleChatConfigPicker({ ...command, command: result.requestedCommand }, deps) });
           if (result && result.command === "cancel") {
             const { outcome } = result;
             let text: string;
@@ -392,6 +390,11 @@ export class GoogleChatAdapter implements ChatAdapter {
       store.completeInboundCommand(messageId, receipt, new Date().toISOString());
     }
     await this.drainCommandReplies(command, messageId);
+  }
+
+  private configCommandDeps(respond: GoogleChatCommandDeps["respond"]): GoogleChatCommandDeps {
+    return { ...this.commandDeps!, channelFor: (space, thread) => this.channelFor(space, thread),
+      cwd: this.opts.defaultCwd, location: this.opts.defaultLocation, respond };
   }
 
   private async drainCommandReplies(command: GoogleChatCommand, messageId: string): Promise<void> {
@@ -625,8 +628,9 @@ export class GoogleChatAdapter implements ChatAdapter {
     const space = event.space?.name ?? thread?.split("/threads/")[0];
     if (!space) throw new Error("Google Chat CARD_CLICKED has no space name");
     if (!interactionId) throw new Error("Google Chat CARD_CLICKED has no Pub/Sub delivery id");
-    if ((event.action?.actionMethodName ?? event.common?.invokedFunction) === GOOGLE_CHAT_SCHEDULE_ACTION) {
-      await this.receiveScheduleClick(event, space, interactionId);
+    const action = event.action?.actionMethodName ?? event.common?.invokedFunction;
+    if (action === GOOGLE_CHAT_SCHEDULE_ACTION || action === GOOGLE_CHAT_CONFIG_ACTION) {
+      await this.receiveCommandCardClick(event, space, interactionId, action);
       return;
     }
     const parsed = parseGoogleChatCardClick({ ...event, type: "CARD_CLICKED" },
@@ -656,24 +660,45 @@ export class GoogleChatAdapter implements ChatAdapter {
     }
   }
 
-  private async receiveScheduleClick(event: ChatEvent, space: string, interactionId: string): Promise<void> {
-    if (!this.commandDeps || !this.scheduleList) throw new Error("Google Chat schedule list handlers not installed");
+  private async receiveCommandCardClick(event: ChatEvent, space: string, interactionId: string,
+    action: typeof GOOGLE_CHAT_SCHEDULE_ACTION | typeof GOOGLE_CHAT_CONFIG_ACTION): Promise<void> {
+    if (!this.commandDeps) throw new Error("Google Chat command handlers not installed");
     const { store } = this.commandDeps, viewer = event.user!.name!;
-    const messageId = inboundId(`schedule-click:${interactionId}`);
-    const channel = { platform: this.platform, id: resourceId(space, "spaces") };
+    const config = action === GOOGLE_CHAT_CONFIG_ACTION;
+    const messageId = inboundId(`${config ? "config" : "schedule"}-click:${interactionId}`);
     const parameters = { ...event.common?.parameters,
       ...Object.fromEntries(event.action?.parameters?.map(({ key, value }) => [key, value]) ?? []) };
+    const channel = config ? this.channelFor(space, parameters.thread || null)
+      : { platform: this.platform, id: resourceId(space, "spaces") };
     store.admitInbound({ messageId, platform: this.platform, channelRef: channel.id,
       sessionRecordId: store.getByChannel(this.platform, channel.id)?.id ?? `${this.platform}:${channel.id}`,
-      authorId: resourceId(viewer, "users"), authorName: event.user?.displayName, text: "schedule list action",
+      authorId: resourceId(viewer, "users"), authorName: event.user?.displayName, text: config ? "config picker action" : "schedule list action",
       createdUtc: new Date().toISOString(), preemptive: false, commandResult: { replies: [] } });
     const admitted = store.getInbound(messageId)!;
     if (admitted.state !== "completed") {
       if (!store.claimInbound(messageId, 0, new Date().toISOString())) return;
       const receipt: InboundCommandResult = { replies: [] };
       try {
-        const cards = await this.scheduleList.click(space, viewer, parameters, event.common?.formInputs);
-        if (!event.message?.name) throw new Error("Google Chat schedule click has no message name");
+        let cards: GoogleChatCardsMessage;
+        if (config) {
+          const kind = parameters.command;
+          if (kind !== "agent" && kind !== "model" && kind !== "effort" && kind !== "repo") throw new Error(`Unknown config command: ${kind}`);
+          const command: GoogleChatConfigPickerCommand = { command: kind, space, thread: parameters.thread || null,
+            args: parameters.value ?? "", user: { id: resourceId(viewer, "users"), name: event.user?.displayName ?? viewer } };
+          const notices: string[] = [];
+          const deps = this.configCommandDeps(async (_channel, text) => { notices.push(text); });
+          if (parameters.action === "select") {
+            try { await executeGoogleChatCommand(command, deps); }
+            catch (err) { notices.push(err instanceof Error ? err.message : String(err)); }
+          } else if (parameters.action === "cancel") notices.push("Cancelled. Configuration unchanged.");
+          else if (parameters.action !== "page") throw new Error(`Unknown config action: ${parameters.action}`);
+          cards = await renderGoogleChatConfigPicker(command, deps, { page: Number(parameters.page),
+            notice: notices.join("\n"), cancelled: parameters.action === "cancel" });
+        } else {
+          if (!this.scheduleList) throw new Error("Google Chat schedule list handlers not installed");
+          cards = await this.scheduleList.click(space, viewer, parameters, event.common?.formInputs);
+        }
+        if (!event.message?.name) throw new Error("Google Chat command click has no message name");
         receipt.replies.push({ channel, text: "", index: 0, cards, messageId: event.message.name });
       } catch (err) {
         receipt.replies.push({ channel, text: err instanceof Error ? err.message : String(err), index: 0 });

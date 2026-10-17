@@ -5,10 +5,10 @@ import type { ChannelRef } from "../packages/core/src/platforms/chat-adapter.js"
 import { executeGoogleChatCommand, type GoogleChatCommandDeps } from "../packages/core/src/platforms/google-chat/command-actions.js";
 import { parseGoogleChatCommand, type GoogleChatCommand } from "../packages/core/src/platforms/google-chat/commands.js";
 
-const command: GoogleChatCommand = {
+const command = {
   command: "model", args: "unlisted-model", space: "spaces/dm", thread: "spaces/dm/threads/old",
   user: { id: "users/person", name: "A Person" },
-};
+} satisfies GoogleChatCommand;
 const channel: ChannelRef = { platform: "google-chat", id: "dm.old", parentId: "dm" };
 const parent: ChannelRef = { platform: "google-chat", id: "dm" };
 const created: ChannelRef = { platform: "google-chat", id: "dm.new", parentId: "dm" };
@@ -49,30 +49,33 @@ function harness() {
     cwd: { value: "/remote/projects/old" }, location: { value: "remote" }, effort: { value: "low" } } as ConfigDescription));
   const listRepos = vi.fn(async () => ["/remote/projects/old", "/remote/projects/other repo"]);
   const applyRepoChange = vi.fn(async () => ({ ok: true as const, message: "Repo changed; session reset.", sessionReset: true, resetPending: false }));
-  const configure = vi.fn(async () => ({ ok: true as const, applied: { effort: "high" }, sessionReset: false, runtimeReloaded: true, warnings: [] }));
+  const unchanged = { before: "fixture", after: "fixture", changed: false };
+  const configure = vi.fn(async () => ({ ok: true as const,
+    applied: { agent: "codex", model: "pinned-model", effort: "high", role: "auto", disableThreadPrefix: false, fastMode: false },
+    changes: { agent: unchanged, model: unchanged, role: unchanged, disableThreadPrefix: unchanged, fastMode: unchanged,
+      effort: { before: "low", after: "high", changed: true } },
+    sessionReset: false, runtimeReloaded: true, warnings: [] }));
   const effortChoices = vi.fn(() => ["low", "high", "provider-special"]);
-  const router = { ensureSessionRecord, describeConfig, bindRecordLocation: vi.fn(() => "local") };
+  const router = { ensureSessionRecord, describeConfig, bindRecordLocation: vi.fn(() => "local"), listProfiles: () => [] };
   const deps: GoogleChatCommandDeps = {
     channelFor, router, store: { getByChannel: () => record },
     mutation: { readThreadPresetEntry: () => undefined,
       applyThreadOverlay: vi.fn(() => ({ ok: true as const, message: "Applied", auditId: "fixture" })) },
     runtimeTransition: { applyAgentChange, applyModelChange, configure },
-    configPlan: { applyRepoChange, listRepos }, modelCatalog: { effortChoices },
+    configPlan: { applyRepoChange, listRepos }, modelCatalog: { effortChoices, models: () => [], model: () => null },
     cancelChannel, respond, cwd: "/repo",
   };
   return { deps, cancelOutcome, switchOutcome, newRecord, trace, channelFor, createThread, ensureSessionRecord, describeConfig, cancelChannel, applyAgentChange, applyModelChange, respond, listRepos, applyRepoChange, configure, effortChoices };
 }
 
 describe("Google Chat command -> existing core operations", () => {
-  it("shows bare /repo's effective cwd and the existing bound-host workspace list without mutation", async () => {
+  it.each(["repo", "effort", "agent", "model"] as const)("opens /%s's picker without attempting an empty change", async kind => {
     const h = harness();
-    await executeGoogleChatCommand({ ...command, command: "repo", args: "" }, h.deps);
-    expect(h.listRepos).toHaveBeenCalledExactlyOnceWith(record);
-    expect(h.respond).toHaveBeenCalledWith(channel, expect.stringContaining("Usage: /repo <path>"));
-    expect(h.respond.mock.calls[0]![1]).toContain("/remote/projects/old");
-    expect(h.respond.mock.calls[0]![1]).toContain("/remote/projects/other repo");
-    expect(h.applyRepoChange).not.toHaveBeenCalled();
-    expect(h.configure).not.toHaveBeenCalled();
+    const result = await executeGoogleChatCommand({ ...command, command: kind, args: "" }, h.deps);
+    expect(result).toEqual({ command: "picker", requestedCommand: kind, channel });
+    expect(h.respond).not.toHaveBeenCalled();
+    expect(h.applyRepoChange).not.toHaveBeenCalled(); expect(h.configure).not.toHaveBeenCalled();
+    expect(h.applyAgentChange).not.toHaveBeenCalled(); expect(h.applyModelChange).not.toHaveBeenCalled();
   });
 
   it("delegates /repo unchanged to the shared thread-overlay operation with the real actor", async () => {
@@ -80,16 +83,6 @@ describe("Google Chat command -> existing core operations", () => {
     await executeGoogleChatCommand({ ...command, command: "repo", args: "/remote/projects/other repo" }, h.deps);
     expect(h.applyRepoChange).toHaveBeenCalledExactlyOnceWith(channel, record, "/remote/projects/other repo", command.user);
     expect(h.respond).toHaveBeenCalledWith(channel, "Repo changed; session reset.");
-    expect(h.configure).not.toHaveBeenCalled();
-  });
-
-  it("shows catalog effort levels for the effective agent/model on the bound host", async () => {
-    const h = harness();
-    await executeGoogleChatCommand({ ...command, command: "effort", args: "" }, h.deps);
-    expect(h.effortChoices).toHaveBeenCalledExactlyOnceWith({ agentId: "codex", location: "remote" }, "pinned-model");
-    expect(h.respond).toHaveBeenCalledWith(channel, expect.stringContaining("Usage: /effort <level>"));
-    expect(h.respond.mock.calls[0]![1]).toContain("low");
-    expect(h.respond.mock.calls[0]![1]).toContain("provider-special");
     expect(h.configure).not.toHaveBeenCalled();
   });
 
@@ -144,19 +137,6 @@ describe("Google Chat command -> existing core operations", () => {
     expect(h.createThread).not.toHaveBeenCalled();
   });
 
-  it.each(["agent", "model"] as const)("shows /%s usage and resolved identity without attempting an empty switch", async kind => {
-    const h = harness();
-    const before = structuredClone(record);
-    await executeGoogleChatCommand({ ...command, command: kind, args: "" }, h.deps);
-    expect(h.applyAgentChange).not.toHaveBeenCalled();
-    expect(h.applyModelChange).not.toHaveBeenCalled();
-    expect(h.describeConfig).toHaveBeenCalledExactlyOnceWith(record);
-    expect(h.respond).toHaveBeenCalledExactlyOnceWith(channel,
-      `Usage: /${kind} <id> — current: ${kind === "agent" ? "codex" : "pinned-model"}`);
-    expect(record).toEqual(before);
-    expect(h.cancelChannel).not.toHaveBeenCalled();
-  });
-
   it("preserves the core refusal and its response without claiming a successful switch", async () => {
     const h = harness();
     const failure = { ok: false as const, error: "Invalid params (code -32602): native model rejection" };
@@ -192,8 +172,8 @@ describe("Google Chat command -> existing core operations", () => {
     const parsed = parseGoogleChatCommand({ type: "MESSAGE", space: { name: command.space }, user: { name: command.user.id },
       message: { thread: { name: command.thread! }, slashCommand: { commandId: "2" }, argumentText: "/cancel" },
     });
-    if (!parsed) throw new Error("Expected command");
-    await executeGoogleChatCommand(parsed, h.deps);
+    if (!parsed || parsed.command !== "cancel") throw new Error("Expected cancel command");
+    await executeGoogleChatCommand({ ...parsed, command: parsed.command }, h.deps);
     expect(h.cancelChannel).toHaveBeenCalledExactlyOnceWith(channel);
   });
 });

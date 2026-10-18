@@ -1770,6 +1770,7 @@ export class DiscordAdapter implements ChatAdapter {
         messageId: msg.id,
         ...discordMessageLink(ch.guildId, threadId, msg.id),
         timestampMs: msg.createdTimestamp,
+        ...(msg.editedTimestamp != null ? { editedTimestampMs: msg.editedTimestamp } : {}),
         authorId: msg.author.id,
         authorName: this.resolveAuthorName(msg),
         authorType: this.isPersonAuthor(msg.author) ? "human" : "bot",

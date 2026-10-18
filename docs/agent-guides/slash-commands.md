@@ -98,10 +98,13 @@ never removed by cleanup.
 `/seamadmin rebuild` is deterministic Discord reconstruction (no summarizer; one destination seed turn that may consume up to 60% of the destination context window). `/seamadmin compact-thread` is the former model-assisted rebuild. `Premium Compact (Discord)` remains the AGY fan-out pipeline. `/seam config reset` starts a blank session with no history.
 
 Rebuild protects the first ten identifiable prompts (human posts or Seam-delivered
-dispatch-card prompts) and each one's first logical assistant response, with
-adjacent output fragments combined by the conversation projector. Delivered
+dispatch-card prompts) and each one's response. A terminal dispatch card's last
+edit bounds its multi-post response; when that evidence is unavailable, only
+the first logical response is mandatory. Adjacent output fragments are combined
+by the conversation projector. Delivered
 prompts retain their source/kind and are labeled as excerpts where Discord only
-recorded an excerpt, never as a human author. Leading and other unpaired output
+recorded an excerpt, never as a human author. Older cards without prompt text
+retain an explicit unavailable-text placeholder. Leading and other unpaired output
 is unprotected and packed backwards with recent history. Omitted ranges are
 marked where they occurred, without reordering the retained transcript. Only an
 oversized protected opening plus instructions/riders refuses the budget gate;

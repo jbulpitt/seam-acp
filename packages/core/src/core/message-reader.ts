@@ -14,6 +14,7 @@ export type MessageAuthorType = "human" | "bot";
 export interface MessagePageItem extends MessageLink {
   messageId: string;
   timestampMs: number;
+  editedTimestampMs?: number;
   authorId: string;
   authorName: string;
   authorType: MessageAuthorType;

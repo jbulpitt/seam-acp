@@ -11,6 +11,8 @@ export interface LogicalReconstructionMessage {
   role: ReconstructionRole;
   authorName: string;
   timestampMs: number;
+  /** Last edit of the terminal turn card; bounds multi-post responses. */
+  responseEndTimestampMs?: number;
   text: string;
 }
 

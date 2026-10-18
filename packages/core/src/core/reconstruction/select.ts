@@ -13,9 +13,13 @@ export function selectOpeningExchanges(
     if (prompts >= maxPrompts) break;
     prompts += 1;
     opening.push(message);
-    // The projector already combines adjacent response fragments. Unpaired
-    // output, before or after an exchange, remains budgeted recent history.
-    if (messages[i + 1]?.role === "assistant") opening.push(messages[++i]!);
+    // A terminal card bounds the whole response, including spaced progress
+    // posts. Without that evidence, preserve only the first logical response.
+    if (messages[i + 1]?.role === "assistant") {
+      opening.push(messages[++i]!);
+      while (messages[i + 1]?.role === "assistant" && message.responseEndTimestampMs != null
+        && messages[i + 1]!.timestampMs <= message.responseEndTimestampMs) opening.push(messages[++i]!);
+    }
   }
   return opening;
 }

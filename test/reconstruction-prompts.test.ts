@@ -14,6 +14,7 @@ type Row = ReturnType<typeof row>;
 function row(id: number, content: string, card?: Card, human = false) {
   return {
     id: String(id), type: MessageType.Default, createdTimestamp: epoch + id * 20_000,
+    editedTimestamp: card ? epoch + id * 20_000 + 30_000 : null,
     author: { id: human ? "human" : SEAM, bot: !human, username: human ? "Alex" : "Seam" },
     member: null, content, attachments: { map: () => [] },
     embeds: card ? [card] : [], components: [],
@@ -81,6 +82,51 @@ describe("Rebuild delivered prompt boundaries", () => {
     const foreign = prompt(1);
     foreign.author.id = "other-bot";
     expect((await project([foreign])).messages).toEqual([]);
+  });
+
+  it("counts historical handoff cards even when Discord never recorded their prompt text", async () => {
+    const { messages } = await project([row(1, "", { title: "📨 Handoff · Done", fields: [
+      { name: "Repo", value: "pronoa" }, { name: "Action", value: "end_turn" },
+    ] }), row(2, "response")]);
+    expect(messages.map(m => m.role)).toEqual(["prompt", "assistant"]);
+    expect(renderLogicalMessage(messages[0]!)).toContain("handoff");
+    expect(messages[0]?.text).toContain("not recorded");
+    expect(selectOpeningExchanges(messages)).toHaveLength(2);
+  });
+
+  it("recognizes the isolated-schedule announce card without inventing missing instructions", async () => {
+    const { messages } = await project([row(1, "", { title: "⏰ Running scheduled: morning task", fields: [
+      { name: "Schedule", value: "every 30 minutes (America/Chicago)" },
+    ] }), row(2, "schedule result")]);
+    expect(messages.map(m => m.role)).toEqual(["prompt", "assistant"]);
+    expect(renderLogicalMessage(messages[0]!)).toContain("scheduled");
+    expect(messages[0]?.text).toContain("not recorded");
+  });
+
+  it("protects a terminal card's whole multi-minute response, not just its first commentary fragment", async () => {
+    const card = prompt(1);
+    card.editedTimestamp = epoch + 120_000;
+    const { messages } = await project([
+      card, row(2, "first commentary"), row(3, "more progress"), row(4, "final answer part one"),
+      row(5, "final answer part two"), row(100, "later unpaired output"),
+    ]);
+    expect(selectOpeningExchanges(messages).map(m => m.text)).toEqual([
+      "directive 1", "first commentary", "more progress", "final answer part one", "final answer part two",
+    ]);
+  });
+
+  it("uses the ordinary terminal status card for a human-led multi-post response too", async () => {
+    const status = row(2, "", { title: "Done", fields: [
+      { name: "Repo", value: "pronoa" }, { name: "Action", value: "end_turn" },
+    ] });
+    status.editedTimestamp = epoch + 140_000;
+    const { messages } = await project([row(1, "human instruction", undefined, true), status,
+      row(3, "progress"), row(4, "human response part one"), row(5, "human response part two"),
+      row(100, "later unpaired output")]);
+    expect(selectOpeningExchanges(messages).map(m => m.text)).toEqual([
+      "human instruction", "progress", "human response part one", "human response part two",
+    ]);
+    expect(renderLogicalMessage(messages[0]!)).toContain("Human — Alex");
   });
 
   it("does not merge a response across an intervening delivered prompt", async () => {

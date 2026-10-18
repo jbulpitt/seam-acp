@@ -398,6 +398,7 @@ import {
   DISPATCH_CARD_WINDOW_CHARS,
   rollingLineWindow,
 } from "../../core/rolling-line-window.js";
+import { dispatchPanelTitle } from "../../core/dispatch/presentation.js";
 import { completionRoute, type CompletionRoute } from "../../core/dispatch/done-reconcile.js";
 import {
   deliveryChunkNonce,
@@ -11851,22 +11852,7 @@ export class Orchestrator {
    *  hop carrying a chainId reads as "🔗 Chain" regardless of its kind, mirroring
    *  {@link dispatchKindLabel}. */
   private dispatchPanelTitle(kind: DelegationKind | undefined, chained: boolean): string {
-    if (chained) return "🔗 Chain";
-    switch (kind) {
-      case "forward": return "📤 Forward";
-      case "wake": return "⏰ Wake";
-      case "watch": return "👁 Watch";
-      case "report_back": return "🔁 Report-back";
-      case "peek": return "🔍 Peek";
-      case "compact": return "🗜 Compact";
-      case "scheduled": return "📅 Scheduled";
-      case "parked": return "📥 Parked";
-      case "choice": return "🗳️ Choice";
-      case "ingest": return "🌐 Ingest";
-      case "migrate_self": return "🔀 Migration";
-      case "handoff":
-      default: return "📨 Handoff";
-    }
+    return dispatchPanelTitle(kind, chained);
   }
 
   /** Human label for a dispatch kind, used in the start indicator. A hop

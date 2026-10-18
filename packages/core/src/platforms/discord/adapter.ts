@@ -1777,6 +1777,10 @@ export class DiscordAdapter implements ChatAdapter {
         attachmentNames,
         hasEmbeds: msg.embeds.length > 0,
         hasComponents: msg.components.length > 0,
+        ...(msg.embeds.length ? { embeds: msg.embeds.map(embed => ({
+          title: embed.title, description: embed.description,
+          fields: embed.fields.map(({ name, value }) => ({ name, value })),
+        })) } : {}),
       });
     }
     return { messages, rawCount, oldestRawId, oldestRawTimestampMs };

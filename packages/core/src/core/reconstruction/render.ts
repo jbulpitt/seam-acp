@@ -16,7 +16,8 @@ export const RECONSTRUCTION_INSTRUCTIONS = [
 
 export function renderLogicalMessage(message: LogicalReconstructionMessage): string {
   const heading =
-    message.role === "user" ? `Human — ${message.authorName}` : "Assistant — Seam";
+    message.role === "user" ? `Human — ${message.authorName}`
+      : message.role === "prompt" ? `Prompt — ${message.authorName}` : "Assistant — Seam";
   return `${heading}\n\n${message.text}`;
 }
 
@@ -43,23 +44,36 @@ export function renderReconstructionSeed(opts: {
   sourceName?: string;
 }): ReconstructionSeed {
   const { selection } = opts;
-  const body = selection.complete
-    ? [...selection.opening, ...selection.recent].map(renderLogicalMessage).join("\n\n")
-    : [
-        selection.opening.length
-          ? `## Opening exchanges\n\n${selection.opening.map(renderLogicalMessage).join("\n\n")}`
-          : "",
-        `## Reconstruction boundary\n\n${formatOmissionMarker({
-          logicalCount: selection.omitted.length,
-          rawPostCount: selection.omitted.reduce((n, m) => n + m.sourcePostIds.length, 0),
+  const ordered = [...selection.opening, ...selection.recent, ...selection.omitted]
+    .sort((a, b) => a.timestampMs - b.timestampMs || a.id.localeCompare(b.id));
+  const openingIds = new Set(selection.opening.map(message => message.id));
+  const omittedIds = new Set(selection.omitted.map(message => message.id));
+  const blocks: string[] = [];
+  let group: LogicalReconstructionMessage[] = [];
+  let section: "opening" | "recent" | "omitted" | undefined;
+  const flush = () => {
+    if (!group.length) return;
+    blocks.push(section === "omitted"
+      ? `## Reconstruction boundary\n\n${formatOmissionMarker({
+          logicalCount: group.length,
+          rawPostCount: group.reduce((n, message) => n + message.sourcePostIds.length, 0),
           sourceName: opts.sourceName,
-        })}`,
-        selection.recent.length
-          ? `## Recent exchanges\n\n${selection.recent.map(renderLogicalMessage).join("\n\n")}`
-          : "",
-      ]
-        .filter(Boolean)
-        .join("\n\n");
+        })}`
+      : `## ${section === "opening" ? "Opening" : "Recent"} exchanges\n\n${group.map(renderLogicalMessage).join("\n\n")}`);
+    group = [];
+  };
+  if (!selection.complete) {
+    for (const message of ordered) {
+      const next = omittedIds.has(message.id) ? "omitted" : openingIds.has(message.id) ? "opening" : "recent";
+      if (next !== section) flush();
+      section = next;
+      group.push(message);
+    }
+    flush();
+  }
+  const body = selection.complete
+    ? ordered.map(renderLogicalMessage).join("\n\n")
+    : blocks.join("\n\n");
 
   const riderBlocks = [
     opts.riders?.channel ? `## Channel rider\n\n${opts.riders.channel}` : "",

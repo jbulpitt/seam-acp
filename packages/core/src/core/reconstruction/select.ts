@@ -1,23 +1,21 @@
-import { OPENING_HUMAN_PROMPTS, ReconstructionBudgetError, type LogicalReconstructionMessage, type ReconstructionRiders, type ReconstructionSelection } from "./types.js";
+import { OPENING_PROMPTS, ReconstructionBudgetError, type LogicalReconstructionMessage, type ReconstructionRiders, type ReconstructionSelection } from "./types.js";
 import { renderReconstructionSeed } from "./render.js";
 
 export function selectOpeningExchanges(
   messages: readonly LogicalReconstructionMessage[],
-  maxHumans = OPENING_HUMAN_PROMPTS
+  maxPrompts = OPENING_PROMPTS
 ): LogicalReconstructionMessage[] {
   const opening: LogicalReconstructionMessage[] = [];
-  let humans = 0;
-  for (const message of messages) {
-    if (message.role === "user") {
-      if (humans >= maxHumans) break;
-      humans += 1;
-      opening.push(message);
-      continue;
-    }
-    // Opening is always a chronological prefix: leading assistant fragments,
-    // the first N human-led exchanges, and that last exchange's trailing
-    // assistant fragments until the next human prompt.
+  let prompts = 0;
+  for (let i = 0; i < messages.length; i++) {
+    const message = messages[i]!;
+    if (message.role === "assistant") continue;
+    if (prompts >= maxPrompts) break;
+    prompts += 1;
     opening.push(message);
+    // The projector already combines adjacent response fragments. Unpaired
+    // output, before or after an exchange, remains budgeted recent history.
+    if (messages[i + 1]?.role === "assistant") opening.push(messages[++i]!);
   }
   return opening;
 }
@@ -83,13 +81,6 @@ export function selectReconstructionRanges(opts: {
     recent = trialRecent;
     omitted = trialOmitted;
     if (trial.complete) return trial;
-  }
-
-  if (rest.length > 0 && recent.length === 0) {
-    throw new ReconstructionBudgetError(
-      `Rebuild cannot preserve both the opening and recent history within the ${opts.budgetTokens}-token ` +
-        `(60% of ${opts.contextWindow}) destination budget. Nothing was changed.`
-    );
   }
 
   return { opening, recent, omitted, complete: omitted.length === 0 };

@@ -255,11 +255,11 @@ describe("opening block", () => {
     expect(opening[0]?.text).toBe(special.text);
   });
 
-  it("keeps leading assistant fragments so the opening stays a chronological prefix", () => {
+  it("keeps leading assistant output outside the protected opening without reordering it", () => {
     const messages = [msg("0", "assistant", "welcome"), ...conversation(11)];
     const opening = selectOpeningExchanges(messages);
-    expect(opening[0]?.text).toBe("welcome");
-    expect(opening).toHaveLength(21);
+    expect(opening[0]?.text).toContain("prompt 1");
+    expect(opening).toHaveLength(20);
     expect(opening.at(-1)?.text).toBe("reply 10");
     const seed = assembleReconstruction({
       messages,
@@ -352,20 +352,21 @@ describe("selectReconstructionRanges", () => {
     ).toThrow(ReconstructionBudgetError);
   });
 
-  it("refuses an opening-only selection when newer history cannot fit", () => {
+  it("omits an oversized recent message rather than refusing a fitting true opening", () => {
     const messages = [
       ...conversation(10),
       msg("21", "user", "recent oversized message ".repeat(5_000)),
     ];
 
-    expect(() =>
-      selectReconstructionRanges({
-        messages,
-        contextWindow: 2_000,
-        budgetTokens: reconstructionBudgetTokens(2_000),
-        sourcePostCount: messages.length,
-      })
-    ).toThrow(ReconstructionBudgetError);
+    const selection = selectReconstructionRanges({
+      messages,
+      contextWindow: 2_000,
+      budgetTokens: reconstructionBudgetTokens(2_000),
+      sourcePostCount: messages.length,
+    });
+    expect(selection.opening).toEqual(conversation(10));
+    expect(selection.recent).toEqual([]);
+    expect(selection.omitted).toEqual([messages.at(-1)]);
   });
 });
 

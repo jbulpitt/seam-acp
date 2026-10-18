@@ -360,7 +360,8 @@ describe("reconstructSessionFromDiscord", () => {
     expect(t.seedCalls[0].summary).toContain("1 logical messages (1 Discord posts) were omitted");
     expect(t.seedCalls[0].summary).not.toContain("recent oversized message");
     expect(result.seed.estimatedTokens).toBeLessThanOrEqual(1_200);
-    expect(t.attachCalls).toHaveLength(0);
+    expect(t.attachCalls).toHaveLength(1);
+    expect(t.attachCalls[0]).toMatchObject({ sourceId: "acp-active", newId: "sess-new", intent: "attach" });
     expect(t.casCalls).toEqual([{ expected: "acp-active", next: "sess-new", ok: true }]);
     expect(t.bound.value).toBe("sess-new");
   });

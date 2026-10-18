@@ -1,4 +1,5 @@
 import { isMessageCardOrNoise, type MessagePageItem } from "../message-reader.js";
+import { DISPATCH_PANEL_TITLES } from "../dispatch/presentation.js";
 import {
   ASSISTANT_FRAGMENT_GAP_MS,
   type LogicalReconstructionMessage,
@@ -9,6 +10,31 @@ const HARNESS_UNCLOSED = /<seam-harness\b[^>]*>[\s\S]*$/gi;
 
 export function stripSeamHarness(text: string): string {
   return text.replace(HARNESS_BLOCK, "").replace(HARNESS_UNCLOSED, "").replace(/^\s+|\s+$/g, "");
+}
+
+function deliveredPrompt(post: MessagePageItem): {
+  text: string; authorName: string; responseEndTimestampMs?: number;
+} | undefined {
+  for (const embed of post.embeds ?? []) {
+    const prefix = Object.values(DISPATCH_PANEL_TITLES).find(title => embed.title?.startsWith(`${title} · `));
+    if (embed.title?.startsWith("⏰ Running scheduled: ") && embed.fields.some(field => field.name === "Schedule")) {
+      return { text: "[Scheduled prompt text was not recorded in this Discord card.]",
+        authorName: `scheduled — ${embed.title.slice("⏰ Running scheduled: ".length)}` };
+    }
+    if (!prefix) continue;
+    const lines = embed.description?.split("\n") ?? [];
+    const text = embed.fields.find(field => field.name === "Prompt")?.value
+      ?? lines.find(line => line.startsWith("💬 "))?.slice("💬 ".length);
+    const source = embed.fields.find(field => field.name === "From")?.value
+      ?? lines.find(line => line.startsWith("↩ "))?.slice("↩ ".length);
+    const kind = prefix.slice(prefix.indexOf(" ") + 1).toLowerCase();
+    const terminal = embed.title?.endsWith(" · Done") || embed.title?.endsWith(" · Failed");
+    return {
+      text: text?.trim() || "[Prompt text was not recorded in this Discord card.]",
+      authorName: `${kind}${source ? ` from ${source}` : ""}${text?.trim() ? " (Discord prompt excerpt)" : ""}`,
+      ...(terminal && post.editedTimestampMs != null ? { responseEndTimestampMs: post.editedTimestampMs } : {}),
+    };
+  }
 }
 
 export function projectDiscordConversation(
@@ -23,11 +49,20 @@ export function projectDiscordConversation(
 
   const logical: LogicalReconstructionMessage[] = [];
   for (const post of chronological) {
-    if (isMessageCardOrNoise(post)) continue;
     const ownOutput = post.isOwnOutput || (post.authorType === "bot" && post.authorId === seamBotId);
     if (post.authorType === "bot" && !ownOutput) continue;
+    const prompt = ownOutput ? deliveredPrompt(post) : undefined;
+    if (!prompt && isMessageCardOrNoise(post)) {
+      const previous = logical.at(-1);
+      if (ownOutput && previous?.role === "user" && post.editedTimestampMs != null && post.embeds?.some(embed =>
+        (embed.title === "Done" || embed.title === "Failed")
+        && embed.fields.some(field => field.name === "Repo") && embed.fields.some(field => field.name === "Action"))) {
+        previous.responseEndTimestampMs = post.editedTimestampMs;
+      }
+      continue;
+    }
 
-    const raw = post.content.trim();
+    const raw = prompt?.text ?? post.content.trim();
     const attachmentNote =
       post.attachmentNames.length > 0
         ? `[attachment: ${post.attachmentNames.map((name) => name || "unnamed").join(", ")}]`
@@ -37,8 +72,7 @@ export function projectDiscordConversation(
     if (!text) continue;
 
     const role: LogicalReconstructionMessage["role"] =
-      ownOutput ? "assistant" : "user";
-    if (post.authorType === "bot" && role !== "assistant") continue;
+      prompt ? "prompt" : ownOutput ? "assistant" : "user";
 
     const previous = logical[logical.length - 1];
     const sameAssistantFragment =
@@ -58,8 +92,9 @@ export function projectDiscordConversation(
       id: post.messageId,
       sourcePostIds: [post.messageId],
       role,
-      authorName: role === "user" ? post.authorName || "Human" : "Seam",
+      authorName: prompt?.authorName ?? (role === "user" ? post.authorName || "Human" : "Seam"),
       timestampMs: post.timestampMs,
+      ...(prompt?.responseEndTimestampMs != null ? { responseEndTimestampMs: prompt.responseEndTimestampMs } : {}),
       text,
     });
   }

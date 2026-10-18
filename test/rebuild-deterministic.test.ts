@@ -338,7 +338,7 @@ describe("reconstructSessionFromDiscord", () => {
     expect(t.bound.value).toBe("acp-active");
   });
 
-  it("refuses an opening-only rebuild before seeding, attaching, or CAS", async () => {
+  it("seeds a fitting true opening while disclosing oversized recent output", async () => {
     const posts = [
       ...Array.from({ length: 20 }, (_, index) => {
         const id = index + 1;
@@ -348,18 +348,22 @@ describe("reconstructSessionFromDiscord", () => {
     ];
     const t = makeOrch({ posts, staticContextLimit: 2_000 });
 
-    await expect(
-      (t.orch as any).reconstructSessionFromDiscord({
+    const result = await (t.orch as any).reconstructSessionFromDiscord({
         record: t.rec,
         channel: { platform: "discord", id: "thread-r" },
         observedAtStart: "acp-active",
         attachIntent: "attach",
-      })
-    ).rejects.toThrow(/cannot preserve both the opening and recent history/);
-    expect(t.seedCalls).toHaveLength(0);
-    expect(t.attachCalls).toHaveLength(0);
-    expect(t.casCalls).toHaveLength(0);
-    expect(t.bound.value).toBe("acp-active");
+      });
+    expect(t.seedCalls).toHaveLength(1);
+    expect(t.seedCalls[0].summary).toContain("opening 1");
+    expect(t.seedCalls[0].summary).toContain("opening 20");
+    expect(t.seedCalls[0].summary).toContain("1 logical messages (1 Discord posts) were omitted");
+    expect(t.seedCalls[0].summary).not.toContain("recent oversized message");
+    expect(result.seed.estimatedTokens).toBeLessThanOrEqual(1_200);
+    expect(t.attachCalls).toHaveLength(1);
+    expect(t.attachCalls[0]).toMatchObject({ sourceId: "acp-active", newId: "sess-new", intent: "attach" });
+    expect(t.casCalls).toEqual([{ expected: "acp-active", next: "sess-new", ok: true }]);
+    expect(t.bound.value).toBe("sess-new");
   });
 
   it("fails closed when the Seam bot id is unknown", async () => {

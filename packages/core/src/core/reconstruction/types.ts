@@ -1,9 +1,9 @@
 export const RECONSTRUCTION_BUDGET_FRACTION = 0.6;
-export const OPENING_HUMAN_PROMPTS = 10;
+export const OPENING_PROMPTS = 10;
 /** Adjacent Seam-bot posts closer than this are one assistant response. */
 export const ASSISTANT_FRAGMENT_GAP_MS = 10_000;
 
-export type ReconstructionRole = "user" | "assistant";
+export type ReconstructionRole = "user" | "prompt" | "assistant";
 
 export interface LogicalReconstructionMessage {
   id: string;
@@ -11,6 +11,8 @@ export interface LogicalReconstructionMessage {
   role: ReconstructionRole;
   authorName: string;
   timestampMs: number;
+  /** Last edit of the terminal turn card; bounds multi-post responses. */
+  responseEndTimestampMs?: number;
   text: string;
 }
 

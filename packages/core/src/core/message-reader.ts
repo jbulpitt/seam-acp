@@ -14,6 +14,7 @@ export type MessageAuthorType = "human" | "bot";
 export interface MessagePageItem extends MessageLink {
   messageId: string;
   timestampMs: number;
+  editedTimestampMs?: number;
   authorId: string;
   authorName: string;
   authorType: MessageAuthorType;
@@ -23,6 +24,12 @@ export interface MessagePageItem extends MessageLink {
   attachmentNames: string[];
   hasEmbeds: boolean;
   hasComponents: boolean;
+  /** Structured provenance retained for reconstruction; cards remain noise to search. */
+  embeds?: ReadonlyArray<{
+    title?: string | null;
+    description?: string | null;
+    fields: ReadonlyArray<{ name: string; value: string }>;
+  }>;
 }
 
 export interface MessagePageRequest {

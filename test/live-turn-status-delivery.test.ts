@@ -289,7 +289,8 @@ describe("live-turn status and answer delivery", () => {
     expect(h.store.turnAttempts.get("inbound-1")?.state).toBe("active");
     expect(h.messages).toEqual([]);
     expect(h.orch.inspectChannelQueue("100")).toMatchObject({ state: "runtime_busy", epoch: 0 });
-    expect(await h.orch.recoverChannel("100", "auto")).toMatchObject({ ok: false, epoch: 0 });
+    expect(await h.orch.sweepWedgedQueues()).toEqual([]);
+    expect(h.router.abortTurn).not.toHaveBeenCalled();
 
     h.fileGate.resolve();
     await running;

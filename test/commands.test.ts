@@ -528,9 +528,9 @@ describe("/seamadmin — operator surface (#151)", () => {
     expect(recover?.options?.map((o) => o.name)).toEqual(["thread", "mode"]);
     expect(recover?.options?.[0]).toMatchObject({ required: true, autocomplete: true });
     expect(recover?.options?.[1]?.choices?.map((choice) => choice.value)).toEqual([
-      "auto",
       "force",
     ]);
+    expect(recover?.options?.[1]?.required).toBe(true);
 
     const restart = slot(admin(), "bridge")?.options?.find((o) => o.name === "restart");
     expect(restart?.options ?? []).toEqual([]);

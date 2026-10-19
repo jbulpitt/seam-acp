@@ -192,7 +192,7 @@ describe("#180 channel queue fencing", () => {
     expect(store.getInbound("300")?.state).toBe("pending");
   });
 
-  it("reports a first-observed idle tail from its last progress without mutating inspection state", () => {
+  it("starts idle age at observation, not the tail's admission or last progress", () => {
     const { host } = makeHost();
     (host as any).channelQueues.set("100", new Promise<void>(() => {}));
     const meta = {
@@ -205,11 +205,11 @@ describe("#180 channel queue fencing", () => {
     (host as any).channelQueueEpochs.set("100", 4);
 
     expect(host.inspectChannelQueue("100", 2_000)).toMatchObject({
-      state: "wedged",
+      state: "queued",
       epoch: 4,
-      ageMs: 1_000,
+      ageMs: 0,
     });
-    expect((host as any).channelQueueMeta.get("100")).toEqual(meta);
+    expect(host.inspectChannelQueue("100", 3_000)).toMatchObject({ state: "wedged", ageMs: 1_000 });
   });
 
   it("keeps a crash-window durable admission visible without an in-memory tail", () => {
@@ -217,10 +217,11 @@ describe("#180 channel queue fencing", () => {
     const created = "2026-09-03T00:00:00.000Z";
     expect(admit("7", "pre-queue crash", created)).toBe(true);
     expect(host.isChannelBusy("100")).toBe(true);
-    expect(host.inspectChannelQueue("100", Date.parse(created) + 999).state).toBe("queued");
+    expect(host.inspectChannelQueue("100", Date.parse(created) + 999)).toMatchObject({ state: "queued", ageMs: 0 });
     expect(host.inspectChannelQueue("100", Date.parse(created) + 1_000)).toMatchObject({
-      state: "wedged",
+      state: "queued",
       queued: 1,
+      ageMs: 1,
     });
   });
 
@@ -291,6 +292,10 @@ describe("#180 channel queue fencing", () => {
     expect(host.inspectChannelQueue("100", now + 62_000).ageMs).toBe(0);
     router.isBusy = () => false;
     expect(host.inspectChannelQueue("100", now + 63_000).ageMs).toBe(0);
+    store.claimInbound("7", 0);
+    store.completeInbound("7", 0);
+    expect(host.inspectChannelQueue("100", now + 64_000).state).toBe("idle");
+    expect((host as any).channelQueueMeta.has("100")).toBe(false);
   });
 
   it("detaches a stuck active finalizer and lets the recovered epoch run immediately", async () => {
@@ -385,7 +390,7 @@ describe("#180 channel queue fencing", () => {
     expect((host as any).handleIncomingMessageInner).not.toHaveBeenCalled();
   });
 
-  it("auto recovery refuses a healthy runtime; force fences locally and preserves durable work", async () => {
+  it("operator force recovery fences locally and preserves durable work", async () => {
     const { host, router } = makeHost();
     expect(admit("9", "recover me")).toBe(true);
     (host as any).channelQueues.set("100", new Promise<void>(() => {}));
@@ -404,10 +409,6 @@ describe("#180 channel queue fencing", () => {
     (host as any).dispatchWatcher = { fenceTarget, recoverTarget, releaseTargetFence, tick };
     const startRecovered = vi.fn();
     (host as any).startRecoveredInbound = startRecovered;
-
-    const refused = await host.recoverChannel("100", "auto");
-    expect(refused).toMatchObject({ ok: false, before: { state: "runtime_busy" } });
-    expect(recoverTarget).not.toHaveBeenCalled();
 
     const repaired = await host.recoverChannel("100", "force", { id: "1", name: "Admin" });
     expect(repaired).toMatchObject({ ok: true, epoch: 1 });
@@ -1000,17 +1001,27 @@ describe("#180 dispatch and restart recovery", () => {
       user: { id: "guild-manager", username: "manager", globalName: null },
       member: null,
       options: {
-        getString: (name: string) => (name === "thread" ? "100" : "auto"),
+        getString: (name: string) => (name === "thread" ? "100" : "force"),
       },
       deferReply: async () => undefined,
       editReply: async (text: string) => void replies.push(text),
       reply: async ({ content }: { content: string }) => void replies.push(content),
     });
-    expect(recover).toHaveBeenCalledWith("100", "auto", {
+    expect(recover).toHaveBeenCalledWith("100", "force", {
       id: "guild-manager",
       name: "manager",
     });
     expect(replies).toEqual(["🛠️ recovered"]);
+
+    recover.mockClear();
+    replies.length = 0;
+    await (host as any).cmdRecover({
+      user: { id: "guild-manager", username: "manager", globalName: null }, member: null,
+      options: { getString: (name: string) => name === "thread" ? "100" : "auto" },
+      reply: async ({ content }: { content: string }) => void replies.push(content),
+    });
+    expect(recover).not.toHaveBeenCalled();
+    expect(replies).toEqual(["Elapsed-time auto recovery is removed. Inspect the thread, then explicitly choose mode:force to recover it."]);
 
     (host as any).config.SEAM_CONFIG_ADMIN_USER_IDS = new Set(["configured-admin"]);
     recover.mockClear();

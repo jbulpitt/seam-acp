@@ -629,25 +629,15 @@ const Schema = z.object({
 
 
   TURN_TIMEOUT_SECONDS: z.coerce.number().int().min(10).max(604800).default(900),
-  /** Runtime-idle channel tails older than this are reported as wedged and may
-   * be repaired by `/seamadmin recover` in auto mode. */
+  /** Warn about observed runtime-idle queue tails after this long; never cancel them. */
   CHANNEL_QUEUE_WEDGE_GRACE_SECONDS: z.coerce
     .number()
     .int()
     .min(1)
     .max(3600)
     .default(30),
-  /** #423: how often the wedge sweep runs. A runtime-idle channel whose queue
-   * tail is past the grace period is, by the definition above, wedged — this is
-   * how often anybody actually looks. 0 disables the sweep entirely. */
+  /** How often to inspect idle queues for diagnostics. 0 disables the sweep. */
   CHANNEL_QUEUE_SWEEP_SECONDS: z.coerce.number().int().min(0).max(3600).default(60),
-  /** #423: auto-apply `mode:auto` recovery to an unambiguous wedge. Off means
-   * the wedge is still detected and logged, but waits for a human — which is
-   * the behaviour that silently held threads for 7-13 hours. */
-  CHANNEL_QUEUE_AUTO_RECOVER: z
-    .enum(["true", "false"])
-    .default("true")
-    .transform((v) => v === "true"),
   /**
    * #174: ceiling on the pre-close quiesce barrier — how long shutdown waits
    * for claimed dispatches, active channel turns and post-turn continuations

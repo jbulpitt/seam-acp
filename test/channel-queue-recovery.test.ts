@@ -33,6 +33,7 @@ const flush = async (turns = 6) => {
 
 let dir: string;
 let store: SessionStore;
+const hosts: Orchestrator[] = [];
 
 beforeEach(async () => {
   dir = await mkdtemp(path.join(tmpdir(), "seam-180-"));
@@ -40,6 +41,8 @@ beforeEach(async () => {
 });
 
 afterEach(async () => {
+  await Promise.all(hosts.splice(0).map(host => host.loadPlugins()));
+  vi.restoreAllMocks();
   store.close();
   await rm(dir, { recursive: true, force: true });
 });
@@ -147,6 +150,7 @@ describe("#180 channel queue fencing", () => {
       store,
       renderer: {} as never,
     });
+    hosts.push(host);
     Object.assign(host as never, {
       tryConsumeConfigEditorRiderUpload: async () => false,
       wouldParkForOfflineBridge: () => false,
@@ -292,8 +296,8 @@ describe("#180 channel queue fencing", () => {
     expect(host.inspectChannelQueue("100", now + 62_000).ageMs).toBe(0);
     router.isBusy = () => false;
     expect(host.inspectChannelQueue("100", now + 63_000).ageMs).toBe(0);
-    store.claimInbound("7", 0);
-    store.completeInbound("7", 0);
+    store.claimInbound("7", 0, new Date(now + 63_000).toISOString());
+    store.completeInbound("7", 0, new Date(now + 64_000).toISOString());
     expect(host.inspectChannelQueue("100", now + 64_000).state).toBe("idle");
     expect((host as any).channelQueueMeta.has("100")).toBe(false);
   });
@@ -637,6 +641,7 @@ describe("#180 dispatch and restart recovery", () => {
         store,
         renderer: {} as never,
       });
+      hosts.push(host);
       return { host, router: (host as any).router };
     })();
     host.setDispatchWatcher(watcher);
@@ -955,6 +960,7 @@ describe("#180 dispatch and restart recovery", () => {
       store,
       renderer: {} as never,
     });
+    hosts.push(host);
     const replies: string[] = [];
     const interaction = {
       user: { id: "1", username: "admin", globalName: null },
@@ -987,6 +993,7 @@ describe("#180 dispatch and restart recovery", () => {
         store,
         renderer: {} as never,
       });
+      hosts.push(host);
       return { host };
     })();
     const recover = vi.fn(async () => ({

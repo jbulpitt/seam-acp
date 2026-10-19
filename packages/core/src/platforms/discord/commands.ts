@@ -487,10 +487,9 @@ export function buildSeamAdminCommand(): SlashCommandBuilder {
       .addStringOption((o) =>
         o
           .setName("mode")
-          .setDescription("auto refuses healthy work; force invalidates it")
-          .setRequired(false)
+          .setDescription("Explicitly fence this queue and invalidate its runtime")
+          .setRequired(true)
           .addChoices(
-            { name: "auto", value: "auto" },
             { name: "force", value: "force" }
           )
       )

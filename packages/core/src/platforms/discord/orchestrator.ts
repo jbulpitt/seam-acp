@@ -584,51 +584,8 @@ function ingestFailureText(err: unknown): string {
   return (raw.trim() || "unknown failure").replace(/\s+/g, " ").slice(0, 1_000);
 }
 
-// `stalled` remains accepted at the MCP compatibility boundary; queue inspection
-// no longer emits it. Retention is an attempt diagnostic, not a queue state.
+// `stalled` identifies a provider-sign-in wait; other retained attempts stay diagnostic.
 export type ChannelQueueState = "idle" | "runtime_busy" | "queued" | "wedged" | "stalled";
-
-/**
- * The system identity an automatic queue recovery is recorded under (#423).
- *
- * A bumped queue epoch with no actor reads as a mystery in the audit log, so
- * the automatic path uses this in place of the operator's Discord identity and
- * is otherwise recorded identically.
- */
-export const AUTO_RECOVERY_ACTOR = Object.freeze({
-  id: "system:channel-queue-sweep",
-  name: "Seam auto-recovery",
-});
-
-/**
- * May the sweep repair this channel without asking a human? (#423)
- *
- * Exactly one state qualifies: `wedged`, which `inspectChannelQueue` only
- * reports when the runtime is IDLE and the queue tail is older than
- * `CHANNEL_QUEUE_WEDGE_GRACE_SECONDS`. That is the mechanically decidable case
- * `mode:auto` was built for, and `recoverChannel` independently refuses auto
- * on anything else — this predicate decides whether to *ask*, not whether it is
- * safe, so the two are deliberately not the same check.
- *
- * What stays manual, and why:
- *   - `runtime_busy` — a live turn is running. Fencing it would discard work
- *     that is making progress, and "stuck" is a judgement a human makes.
- *   - `queued` — still inside the grace period. Recovering here would fight
- *     normal queueing.
- *   - `idle` / `stalled` — nothing to fence, or already quarantined and
- *     surfaced through `/seam workflows`.
- *
- * A wedge whose durable items cannot be re-queued is also left to a human, but
- * that is decided inside `recoverChannel` (a legacy running admission with no
- * frozen execution identity refuses there) rather than here, because it needs
- * the store.
- */
-export function shouldAutoRecoverQueue(
-  health: Pick<ChannelQueueHealth, "state">,
-  enabled: boolean
-): boolean {
-  return enabled && health.state === "wedged";
-}
 
 export interface ChannelQueueHealth {
   state: ChannelQueueState;
@@ -659,20 +616,8 @@ interface ChannelQueueMeta {
   inboundMessageIds?: Set<string>;
   epoch: number;
   queued: number;
-  admittedAtMs: number;
-  lastProgressAtMs: number;
   runtimeIdleSinceMs?: number;
-  /**
-   * #570: channel turns currently EXECUTING, not merely admitted.
-   *
-   * `router.isBusy` answers "is the ACP runtime mid-prompt", which a long
-   * tool-using turn drops to false between segments. That is not idleness, and
-   * treating it as such let the wedge sweep fence a turn that was running: the
-   * epoch moved underneath it, its post-turn `assertQueueFence` threw, the
-   * result was discarded and the throw escaped as a crashed message handler.
-   * Execution is a fact this queue owns directly, so read it here instead of
-   * inferring it from the runtime.
-   */
+  /** Includes post-release presentation and wrap-up until the handler settles. */
   executing?: number;
 }
 
@@ -2080,18 +2025,13 @@ export class Orchestrator {
       ?? this.platformForChannel(attempt.spec.target);
   }
 
-  /** Read-only truth used by MCP status, cancel copy, and admin recovery. */
+  /** Queue ownership and observed idle time used by status and operator recovery. */
   inspectChannelQueue(channelRef: string, nowMs = Date.now()): ChannelQueueHealth {
     this.channelQueueMeta ??= new Map<string, ChannelQueueMeta>();
     const record = this.recordForChannel(channelRef);
-    const meta = this.channelQueueMeta.get(this.queueChannelRef(channelRef));
-    // #570: a turn this queue is executing counts as busy even while the ACP
-    // runtime reports idle between tool segments. Asking only the runtime let
-    // the sweep fence work that was actively running.
-    // A turn its bridge is finishing across a controller restart is executing
-    // too: this controller only holds a read-only link to it, not a runtime.
-    // Calling that "wedged" restarted the turn beside the one still running
-    // and discarded its finished answer.
+    const queueRef = this.queueChannelRef(channelRef);
+    let meta = this.channelQueueMeta.get(queueRef);
+    // Execution includes post-prompt wrap-up and bridge-owned restart recovery.
     const bridgeOwned = this.store.turnAttempts.list("suspended")
       .some((attempt) => attempt.remoteRecovery && attempt.spec?.target === channelRef);
     const runtimeBusy = (record ? this.router.isBusy(record.id) : false)
@@ -2103,15 +2043,21 @@ export class Orchestrator {
     const awaitingReauth = newestInbound && stalled.some(attempt =>
       attempt.id === inboundAttemptId(newestInbound.messageId) && isAwaitingReauth(attempt.stalledReason));
     const unsettled = this.store.turnAttempts.listUnsettledCompletions(channelRef);
-    const durableSince = durable.length > 0 ? Date.parse(durable[0]!.updatedUtc) : Number.NaN;
-    const idleSince = meta?.runtimeIdleSinceMs ?? meta?.lastProgressAtMs;
-    const ageMs = runtimeBusy
-      ? 0
-      : idleSince !== undefined
-        ? Math.max(0, nowMs - idleSince)
-        : Number.isFinite(durableSince)
-          ? Math.max(0, nowMs - durableSince)
-          : 0;
+    // Admission time says nothing about when a runtime became idle.
+    if (!meta && durable.length > 0) {
+      meta = { epoch: this.queueEpoch(channelRef), queued: 0 };
+      this.channelQueueMeta.set(queueRef, meta);
+    }
+    if (meta) {
+      if (runtimeBusy) meta.runtimeIdleSinceMs = undefined;
+      else meta.runtimeIdleSinceMs ??= nowMs;
+      if (meta.queued === 0 && !runtimeBusy && durable.length === 0 && !this.channelQueues.has(queueRef)) {
+        this.channelQueueMeta.delete(queueRef);
+        meta = undefined;
+      }
+    }
+    const ageMs = runtimeBusy || meta?.runtimeIdleSinceMs === undefined
+      ? 0 : Math.max(0, nowMs - meta.runtimeIdleSinceMs);
     const graceMs = (this.config.CHANNEL_QUEUE_WEDGE_GRACE_SECONDS ?? 30) * 1000;
     const state: ChannelQueueState = runtimeBusy
       ? "runtime_busy"
@@ -2330,19 +2276,9 @@ export class Orchestrator {
     return [...refs];
   }
 
-  /**
-   * One pass of the wedge sweep (#423).
-   *
-   * The detector and the repair both already existed; nothing ran them. The
-   * detector fired only when a human typed `/seam cancel`, and the repair only
-   * when an admin typed back the command Seam had just printed for them — so a
-   * thread stayed dead for as long as nobody happened to look.
-   *
-   * Separate from the timer so a test can drive exactly one pass.
-   */
+  /** Report idle queued work; elapsed time never transfers or cancels ownership. */
   async sweepWedgedQueues(): Promise<string[]> {
-    const enabled = this.config?.CHANNEL_QUEUE_AUTO_RECOVER !== false;
-    const recovered: string[] = [];
+    const detected: string[] = [];
     for (const channelRef of this.wedgeSweepCandidates()) {
       let health: ChannelQueueHealth;
       try {
@@ -2354,38 +2290,16 @@ export class Orchestrator {
         continue;
       }
       if (health.state !== "wedged") continue;
-      if (!shouldAutoRecoverQueue(health, enabled)) {
-        // Detected but not repaired. Logged either way, so turning auto-repair
-        // off degrades to visibility rather than back to silence.
-        this.logger.warn(
-          { channelRef, queued: health.queued, ageMs: health.ageMs, epoch: health.epoch },
-          "queue sweep: wedged channel detected; automatic recovery is disabled"
-        );
-        continue;
-      }
-      try {
-        const result = await this.recoverChannel(channelRef, "auto", AUTO_RECOVERY_ACTOR);
-        if (result.ok) {
-          recovered.push(channelRef);
-          this.logger.warn(
-            { channelRef, queued: health.queued, ageMs: health.ageMs,
-              oldEpoch: health.epoch, newEpoch: result.epoch },
-            "queue sweep: recovered a wedged channel automatically"
-          );
-        } else {
-          // `recoverChannel` refused — e.g. a legacy running admission whose
-          // durable work cannot be safely replayed. That is the boundary where
-          // a human is still required, and it is stated rather than retried.
-          this.logger.warn(
-            { channelRef, reason: result.message },
-            "queue sweep: wedged channel needs an operator"
-          );
-        }
-      } catch (err) {
-        this.logger.error({ err, channelRef }, "queue sweep: recovery threw");
-      }
+      detected.push(channelRef);
+      this.logger.warn(
+        { channelRef, queued: health.queued, ageMs: health.ageMs, epoch: health.epoch,
+          stalledAttempts: this.store.turnAttempts.listStalled(channelRef)
+            .map(attempt => ({ id: attempt.id, reason: attempt.stalledReason })),
+          unsettledDispatchIds: health.unsettledDispatchIds },
+        "queue sweep: queued work has no observed active owner; operator inspection needed"
+      );
     }
-    return recovered;
+    return detected;
   }
 
   private watchQueueWedges(): void {
@@ -2699,11 +2613,11 @@ export class Orchestrator {
       !existingMeta || existingMeta.epoch === epoch
         ? this.channelQueues.get(channelId) ?? Promise.resolve()
         : Promise.resolve();
-    const now = Date.now();
     const meta: ChannelQueueMeta =
       existingMeta?.epoch === epoch
-        ? { ...existingMeta, queued: existingMeta.queued + 1 }
-        : { epoch, queued: 1, admittedAtMs: now, lastProgressAtMs: now };
+        ? existingMeta
+        : { epoch, queued: 0 };
+    meta.queued++;
     this.channelQueueMeta.set(channelId, meta);
     if (inboundMessageId) {
       meta.inboundMessageIds ??= new Set();
@@ -2714,17 +2628,12 @@ export class Orchestrator {
     const fence: ChannelQueueFence = { channelId, epoch, release: () => releaseLink() };
     const result = existing.then(async () => {
       this.assertQueueFence(fence);
-      const activeMeta = this.channelQueueMeta.get(channelId);
-      if (activeMeta?.epoch === epoch) {
-        activeMeta.lastProgressAtMs = Date.now();
-        activeMeta.runtimeIdleSinceMs = undefined;
-      }
+      meta.runtimeIdleSinceMs = undefined;
       // Tracked by the bounded shutdown barrier.
       const endTurn = this.beginTurn();
       // #570: from here the turn is executing. Released in the finally below,
       // on every path including the watchdog and a fence thrown after the turn.
-      const executingMeta = this.channelQueueMeta.get(channelId);
-      if (executingMeta) executingMeta.executing = (executingMeta.executing ?? 0) + 1;
+      meta.executing = (meta.executing ?? 0) + 1;
       let work!: Promise<T>;
       try {
         await prepare?.(fence);
@@ -2768,15 +2677,13 @@ export class Orchestrator {
         }
         throw err;
       } finally {
-        // #570: release execution against the meta the increment ran on, which
-        // is not necessarily the current one — a recovery may have replaced it
-        // mid-turn, and leaking the count there would wedge-proof the channel
-        // forever. `queued`/`lastProgressAtMs` stay epoch-scoped as before.
-        if (executingMeta) executingMeta.executing = Math.max(0, (executingMeta.executing ?? 1) - 1);
-        const currentMeta = this.channelQueueMeta.get(channelId);
-        if (currentMeta?.epoch === epoch) {
-          currentMeta.queued = Math.max(0, currentMeta.queued - 1);
-          currentMeta.lastProgressAtMs = Date.now();
+        // Every handler in this epoch shares this object, even after FIFO release.
+        meta.executing = (meta.executing ?? 1) - 1;
+        meta.queued--;
+        if (meta.executing === 0) meta.runtimeIdleSinceMs = Date.now();
+        if (this.channelQueueMeta.get(channelId) === meta && meta.queued === 0 &&
+            !this.channelQueues.has(channelId)) {
+          this.channelQueueMeta.delete(channelId);
         }
         endTurn();
         if (inboundMessageId) meta.inboundMessageIds?.delete(inboundMessageId);
@@ -2983,13 +2890,10 @@ export class Orchestrator {
     return true;
   }
 
-  /**
-   * Fence and repair exactly one thread. Auto mode only acts on a proven
-   * runtime-idle wedge; force is the explicit operator override.
-   */
+  /** Fence and repair exactly one thread at an operator's explicit request. */
   async recoverChannel(
     channelRef: string,
-    mode: "auto" | "force",
+    mode: "force",
     actor?: { id: string; name: string }
   ): Promise<{
     ok: boolean;
@@ -2999,19 +2903,6 @@ export class Orchestrator {
   }> {
     const before = this.inspectChannelQueue(channelRef);
     const currentEpoch = this.queueEpoch(channelRef);
-    if (mode === "auto" && before.state !== "wedged") {
-      return {
-        ok: false,
-        before,
-        epoch: currentEpoch,
-        message:
-          before.state === "runtime_busy"
-            ? "Refused: this thread has a healthy active runtime. Use force only after verifying it is stuck."
-            : before.state === "queued"
-              ? "Refused: queued work is still inside the recovery grace period."
-              : "Nothing is queued for this thread.",
-      };
-    }
 
     const record = this.recordForChannel(channelRef);
     if (!record) {
@@ -3156,14 +3047,14 @@ export class Orchestrator {
    * fire hook alongside `onBridgeReady`.
    */
   private releaseChannelQueue(channelId: string, link: Promise<void>): void {
-    // This runs after the turn token is released, so track it separately
-    // for the bounded shutdown quiesce.
+    // FIFO release can precede handler settlement; track these hooks separately.
     const settled = link.then(async () => {
       if (this.channelQueues.get(channelId) !== link) return;
       this.channelQueues.delete(channelId);
       this.channelQueueMeta ??= new Map<string, ChannelQueueMeta>();
       const meta = this.channelQueueMeta.get(channelId);
-      if (meta && meta.epoch === this.queueEpoch(channelId)) {
+      if (meta && meta.epoch === this.queueEpoch(channelId) && meta.queued === 0 &&
+          (meta.executing ?? 0) === 0) {
         this.channelQueueMeta.delete(channelId);
       }
       await this.voiceConsole
@@ -14690,9 +14581,11 @@ export class Orchestrator {
       await replyToInteraction(i, { content: "Thread must be a Discord thread id.", flags: MessageFlags.Ephemeral });
       return;
     }
-    const mode = i.options.getString("mode") === "force" ? "force" : "auto";
-
-    const result = await this.recoverChannel(thread, mode, {
+    if (i.options.getString("mode", true) !== "force") {
+      await replyToInteraction(i, "Elapsed-time auto recovery is removed. Inspect the thread, then explicitly choose mode:force to recover it.");
+      return;
+    }
+    const result = await this.recoverChannel(thread, "force", {
       id: i.user.id,
       name: this.interactionSpeakerName(i),
     });
@@ -14792,7 +14685,7 @@ export class Orchestrator {
           : parked
           ? this.parkedCancelMessage(parked)
           : queue.state === "wedged"
-            ? `No ACP turn is active, but the channel queue is wedged with ${queue.queued} durable item(s). An admin can run \`/seamadmin recover thread:${record.channelRef} mode:auto\`.`
+            ? `No ACP turn is active, but the channel queue has ${queue.queued} durable item(s) without an observed active owner. An admin can inspect it and run \`/seamadmin recover thread:${record.channelRef} mode:force\`.`
             : queue.state === "queued"
               ? `No ACP turn is active, but ${queue.queued} durable item(s) remain queued. Nothing was discarded.`
               : "No active turn."
@@ -14843,7 +14736,7 @@ export class Orchestrator {
           : parked
           ? this.parkedCancelMessage(parked)
           : queue.state === "wedged"
-            ? `No ACP runtime is active, but the channel queue is wedged with ${queue.queued} durable item(s). Force-cancel cannot discard them; use \`/seamadmin recover thread:${record.channelRef} mode:auto\`.`
+            ? `No ACP runtime is active, but the channel queue has ${queue.queued} durable item(s) without an observed active owner. Force-cancel cannot discard them; an admin can inspect it and use \`/seamadmin recover thread:${record.channelRef} mode:force\`.`
             : queue.state === "queued"
               ? `No ACP runtime is active; ${queue.queued} durable item(s) remain queued.`
               : "No active turn.",

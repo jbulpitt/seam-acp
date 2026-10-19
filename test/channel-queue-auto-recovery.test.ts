@@ -1,22 +1,5 @@
 import { testSessionRouter } from "./helpers/session-fixture.js";
-/**
- * #423 — "the silent death": a card sits at Working… forever.
- *
- * The mechanism, confirmed live on 2026-09-19/20: something suspends an attempt
- * on a thread, that attempt holds the thread's queue with no timeout and no
- * retry, and every later message admits an attempt that stays `state=pending`,
- * `prompt_started=0` indefinitely. The card is rendered at ADMISSION, so it
- * shows Working… and never changes. Two of Alex's threads sat that way for 7
- * and 13 hours while unrelated threads completed turns normally.
- *
- * Nothing about detection or repair was missing. `inspectChannelQueue` already
- * computed `state: "wedged"`, `CHANNEL_QUEUE_WEDGE_GRACE_SECONDS` already
- * defined it, and `recoverChannel(ref, "auto")` already fixed it. The detector
- * ran only when a human typed `/seam cancel`, and the repair only when an admin
- * typed back the command Seam had just printed. So these tests are about the
- * wiring, and the headline one is behavioural: build a real wedge, run one
- * sweep, assert the thread is live again and the audit says why.
- */
+// Queue diagnostics must not transfer ownership or cancel a live handler.
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -24,12 +7,8 @@ import path from "node:path";
 import { pino } from "pino";
 import { SessionStore } from "../packages/core/src/core/session-store.js";
 import { inboundAttemptId } from "../packages/core/src/core/dispatch/attempt-store.js";
-import { REAUTH_WAITING_TEXT } from "../packages/core/src/core/reauth-negotiation.js";
-import {
-  AUTO_RECOVERY_ACTOR,
-  Orchestrator,
-  shouldAutoRecoverQueue,
-} from "../packages/core/src/platforms/discord/orchestrator.js";
+import { REAUTH_CHECKING_TEXT, REAUTH_WAITING_TEXT } from "../packages/core/src/core/reauth-negotiation.js";
+import { Orchestrator } from "../packages/core/src/platforms/discord/orchestrator.js";
 import { fixtureModelCatalog } from "./model-catalog-fixture.js";
 import type { Logger } from "../packages/core/src/lib/logger.js";
 
@@ -99,16 +78,36 @@ function makeHost(config: Record<string, unknown> = {}) {
   return { host, router, record };
 }
 
-/** A durable admission old enough to be past the grace period. */
 function admitStale(messageId: string, createdUtc = "2026-09-19T00:00:00.000Z"): boolean {
-  return store.admitInbound({
+  const admitted = store.admitInbound({
     messageId, platform: "discord", channelRef: CHANNEL, parentRef: "10",
     sessionRecordId: "discord:auto", authorId: "user", text: `message ${messageId}`,
     createdUtc,
   } as never);
+  // The fixture has observed this admission idle for longer than its diagnostic grace.
+  hosts.at(-1)!.inspectChannelQueue(CHANNEL, Date.now() - 1_001);
+  return admitted;
 }
 
-describe("#423 a wedged thread self-heals without an operator", () => {
+describe("queue sweeps diagnose without fencing owners", () => {
+  it("never fences an auth-recheck owner whose attempt has temporarily left the waiting state", async () => {
+    const { host, router } = makeHost();
+    admitStale("auth-rechecking");
+    store.claimInbound("auth-rechecking", 0, "2026-09-19T00:00:00.000Z");
+    store.turnAttempts.claim({ id: inboundAttemptId("auth-rechecking"), target: CHANNEL,
+      prompt: "continue", session: "live" }, "identity", "boot", "inbound");
+    store.turnAttempts.markStalled(inboundAttemptId("auth-rechecking"), REAUTH_CHECKING_TEXT);
+    const admission = store.getInbound("auth-rechecking");
+    const recovery = vi.spyOn(host, "recoverChannel");
+    for (let tick = 0; tick < 5; tick++) await host.sweepWedgedQueues();
+    expect(recovery).not.toHaveBeenCalled();
+    expect(router.abortTurn).not.toHaveBeenCalled();
+    expect(router.invalidate).not.toHaveBeenCalled();
+    expect(host.inspectChannelQueue(CHANNEL).epoch).toBe(0);
+    expect(store.getInbound("auth-rechecking")).toEqual(admission);
+    expect(store.listConfigMutations()).toEqual([]);
+  });
+
   it.each([
     [false, false], [false, true], [true, false], [true, true],
   ])("leaves a reauth-waiting inbound parked across sweeps (promptStarted=%s, queueMeta=%s)", async (promptStarted, queueMeta) => {
@@ -154,7 +153,7 @@ describe("#423 a wedged thread self-heals without an operator", () => {
     expect(store.turnAttempts.get(id)).toEqual(parked);
   });
 
-  it("recovers a replacement inbound instead of inheriting the old authentication wait", async () => {
+  it("reports a replacement inbound without inheriting the old authentication wait", async () => {
     const { host } = makeHost();
     admitStale("old-auth");
     const id = inboundAttemptId("old-auth");
@@ -188,7 +187,7 @@ describe("#423 a wedged thread self-heals without an operator", () => {
     expect(store.listConfigMutations()).toEqual([]);
   });
 
-  it("recovers a real wedge in one sweep, with no human action", async () => {
+  it("reports idle queued work without changing its epoch", async () => {
     // The acceptance case, built rather than asserted: a durable admission
     // sitting behind an idle runtime, older than the grace period.
     const { host } = makeHost();
@@ -197,32 +196,21 @@ describe("#423 a wedged thread self-heals without an operator", () => {
     expect(store.getInbound("300")?.state).toBe("pending");
 
     // Exactly what the timer does, once. Nobody typed anything.
-    const recovered = await host.sweepWedgedQueues();
+    const detected = await host.sweepWedgedQueues();
 
-    expect(recovered).toEqual([CHANNEL]);
-    // The thread is live again: the epoch moved, so new turns are admitted
-    // into a generation the dead tail cannot fence.
-    expect(host.inspectChannelQueue(CHANNEL).state).not.toBe("wedged");
+    expect(detected).toEqual([CHANNEL]);
+    // Detection does not grant ownership or move the epoch.
+    expect(host.inspectChannelQueue(CHANNEL)).toMatchObject({ state: "wedged", epoch: 0 });
   });
 
-  it("writes an audit row naming the system actor and the prior state", async () => {
-    // A bumped epoch with no explanation is how an operator loses trust in the
-    // thing that is supposed to be helping them.
-    const { host } = makeHost();
+  it("does not write a recovery audit or cancel an ownerless queue", async () => {
+    const { host, router } = makeHost();
     admitStale("301");
-    await host.sweepWedgedQueues();
-
-    const audit = store.listConfigMutations().filter((m) => m.scope === `thread:${CHANNEL}`);
-    expect(audit).toHaveLength(1);
-    expect(audit[0]).toMatchObject({
-      tier: "operator",
-      actorId: AUTO_RECOVERY_ACTOR.id,
-      actorName: AUTO_RECOVERY_ACTOR.name,
-      summary: "Recovered channel queue (auto)",
-    });
-    // The "why": the state it was in before, so the row stands on its own.
-    expect(JSON.parse(audit[0]!.beforeJson!).state).toBe("wedged");
-    expect(JSON.parse(audit[0]!.afterJson!).priorState).toBe("wedged");
+    expect(await host.sweepWedgedQueues()).toEqual([CHANNEL]);
+    expect(store.getInbound("301")?.state).toBe("pending");
+    expect(store.listConfigMutations()).toEqual([]);
+    expect(router.abortTurn).not.toHaveBeenCalled();
+    expect(router.invalidate).not.toHaveBeenCalled();
   });
 
   it("does nothing at all to a healthy thread", async () => {
@@ -240,7 +228,7 @@ describe("#423 a wedged thread self-heals without an operator", () => {
     expect(await host.sweepWedgedQueues()).toEqual([]);
   });
 
-  it("refuses to fence a busy runtime, which stays a human's call", async () => {
+  it("does not report or fence a busy runtime", async () => {
     const { host, router } = makeHost();
     admitStale("303");
     router.isBusy = () => true;
@@ -249,7 +237,7 @@ describe("#423 a wedged thread self-heals without an operator", () => {
     expect(store.listConfigMutations()).toHaveLength(0);
   });
 
-  it("leaves a wedge it cannot safely replay to a human, and does not claim success", async () => {
+  it("reports a legacy running admission without attempting an unsafe replay", async () => {
     // The boundary #423 asks to be stated explicitly. `recoverChannel` refuses
     // a legacy `running` admission that has no frozen execution identity,
     // because replaying it is not provably safe. The sweep must report that as
@@ -263,7 +251,7 @@ describe("#423 a wedged thread self-heals without an operator", () => {
       .run("306");
     expect(host.inspectChannelQueue(CHANNEL).state).toBe("wedged");
 
-    expect(await host.sweepWedgedQueues()).toEqual([]);
+    expect(await host.sweepWedgedQueues()).toEqual([CHANNEL]);
     // Nothing was fenced and no epoch moved, so a human still has a thread to
     // look at rather than a silently-altered one.
     expect(store.listConfigMutations()).toHaveLength(0);
@@ -316,12 +304,12 @@ describe("#423 a wedged thread self-heals without an operator", () => {
     expect(store.listConfigMutations()).toHaveLength(0);
   });
 
-  it("detects but does not repair when auto-recovery is switched off", async () => {
+  it("detects but never automatically repairs idle queued work", async () => {
     // Degrading to visibility, not back to silence.
-    const { host } = makeHost({ CHANNEL_QUEUE_AUTO_RECOVER: false });
+    const { host } = makeHost();
     admitStale("304");
     expect(host.inspectChannelQueue(CHANNEL).state).toBe("wedged");
-    expect(await host.sweepWedgedQueues()).toEqual([]);
+    expect(await host.sweepWedgedQueues()).toEqual([CHANNEL]);
     expect(store.listConfigMutations()).toHaveLength(0);
   });
 });
@@ -356,10 +344,9 @@ describe("#423 the sweep finds threads a restart would have hidden", () => {
     const { host } = makeHost();
     admitStale("305");
     const real = host.inspectChannelQueue.bind(host);
-    let first = true;
     (host as never as { inspectChannelQueue: unknown }).inspectChannelQueue =
       (ref: string, now?: number) => {
-        if (first) { first = false; throw new Error("unreadable"); }
+        if (ref === "poison") throw new Error("unreadable");
         return real(ref, now);
       };
     (host as never as { channelQueueMeta: Map<string, unknown> })
@@ -368,37 +355,7 @@ describe("#423 the sweep finds threads a restart would have hidden", () => {
   });
 });
 
-describe("#423 the auto-apply condition", () => {
-  it.each([
-    ["wedged", true],
-    ["runtime_busy", false],
-    ["queued", false],
-    ["idle", false],
-    ["stalled", false],
-  ])("%s -> %s", (state, expected) => {
-    expect(shouldAutoRecoverQueue({ state } as never, true)).toBe(expected);
-  });
-
-  it("is off for every state when auto-recovery is disabled", () => {
-    for (const state of ["wedged", "runtime_busy", "queued", "idle", "stalled"]) {
-      expect(shouldAutoRecoverQueue({ state } as never, false)).toBe(false);
-    }
-  });
-});
-
 describe("#570 a turn that is executing is never wedged", () => {
-  /**
-   * Observed live on 2026-09-23 on the orchestrator thread: the sweep declared
-   * the channel wedged WHILE a turn was running, bumped the epoch, and the
-   * turn's post-execution `assertQueueFence` then threw — discarding a finished
-   * turn's result and escaping as `level:50 message handler crashed`. The card
-   * went green and the user's message was dropped.
-   *
-   * The cause was the busy signal, not the sweep: `router.isBusy` reports the
-   * ACP runtime mid-prompt, which a long tool-using turn drops between
-   * segments. Idle runtime plus a stale durable admission satisfied "wedged"
-   * while the queue was demonstrably executing.
-   */
   it("does not classify a channel wedged while its turn is still running", async () => {
     const { host } = makeHost();
     // A stale durable admission — the other half of the wedge predicate.
@@ -422,9 +379,10 @@ describe("#570 a turn that is executing is never wedged", () => {
 
     release();
     await expect(running).resolves.toBe("done");
-    // Once the turn ends the channel is judged on its own merits again, so a
-    // genuine wedge is still recoverable — the fix must not wedge-proof it.
-    expect(host.inspectChannelQueue(CHANNEL).state).toBe("wedged");
+    // After settlement, an idle admission remains visible without being replayed.
+    expect(host.inspectChannelQueue(CHANNEL)).toMatchObject({ state: "queued", runtimeBusy: false });
+    const observedAt = Date.now();
+    vi.spyOn(Date, "now").mockReturnValue(observedAt + 1_001);
     expect(await host.sweepWedgedQueues()).toEqual([CHANNEL]);
   });
 });

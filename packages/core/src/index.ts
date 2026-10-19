@@ -1060,9 +1060,7 @@ async function main(): Promise<void> {
         describeConfig: (session) => router.describeConfig(session),
         isRuntimeBusy: (sessionId) => router.isBusy(sessionId),
         adapter: chatAdapter,
-        inspectQueue: (channelRef) => orchestrator.inspectChannelQueue(channelRef),
-        inspectWorkProgress: (channelRef, nowMs, queue) =>
-          orchestrator.inspectThreadWorkProgress(channelRef, nowMs, queue),
+        inspectChannels: channelRefs => orchestrator.inspectChannelQueues(channelRefs),
         locationFor: (channelRef) => {
           const location = resolveThreadLocation(config, channelRef);
           const host = location === "local" ? undefined : config.bridgePresets.get(location);

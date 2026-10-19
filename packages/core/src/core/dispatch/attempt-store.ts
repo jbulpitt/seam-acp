@@ -194,6 +194,19 @@ export class DispatchSuspendedError extends Error {
   }
 }
 
+interface TurnAttemptRow {
+  id: string; generation: number; owner_boot: string; state: TurnAttempt["state"];
+  identity: string; spec_json: string; acp_session_id: string | null;
+  prompt_started: number; outcome_json: string | null; runtime_json: string | null; provider_identity: string | null;
+  source: TurnAttempt["source"]; delivery_done: number; delivery_protocol: number; updated_utc: string;
+  delivery_nonce: string | null; delivery_channel: string | null;
+  delivery_payload_json: string | null; delivery_started_utc: string | null;
+  delivery_abandoned_reason: string | null; delivery_uncertain_reason: string | null;
+  stalled_utc: string | null; stalled_reason: string | null;
+  stall_notice_utc: string | null; stall_notice_reason: string | null;
+  status_card_channel: string | null; status_card_message: string | null; status_card_state_json: string | null;
+}
+
 export class TurnAttemptStore {
   private readonly settledListeners = new Set<(id: string) => void>();
   onSettled(listener: (id: string) => void): () => void {
@@ -238,6 +251,10 @@ export class TurnAttemptStore {
         if (!(err instanceof Error) || !err.message.includes("duplicate column name")) throw err;
       }
     }
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_turn_attempt_state_id ON turn_attempts(state,id);
+      CREATE INDEX IF NOT EXISTS idx_turn_attempt_unsettled ON turn_attempts(state,updated_utc,id)
+      WHERE state='completed' AND delivery_done=0
+        AND delivery_abandoned_reason IS NULL AND delivery_uncertain_reason IS NULL;`);
   }
 
   registerOwner(id: string): void {
@@ -275,19 +292,31 @@ export class TurnAttemptStore {
   }
 
   get(id: string): TurnAttempt | null {
-    const row = this.db.prepare("SELECT * FROM turn_attempts WHERE id = ?").get(id) as
-      { id: string; generation: number; owner_boot: string; state: TurnAttempt["state"];
-        identity: string; spec_json: string; acp_session_id: string | null;
-        prompt_started: number; outcome_json: string | null; runtime_json: string | null; provider_identity: string | null;
-        source: TurnAttempt["source"]; delivery_done: number; delivery_protocol: number; updated_utc: string;
-        delivery_nonce: string | null; delivery_channel: string | null;
-        delivery_payload_json: string | null; delivery_started_utc: string | null;
-        delivery_abandoned_reason: string | null;
-        delivery_uncertain_reason: string | null;
-        stalled_utc: string | null; stalled_reason: string | null;
-        stall_notice_utc: string | null; stall_notice_reason: string | null;
-        status_card_channel: string | null; status_card_message: string | null;
-        status_card_state_json: string | null } | undefined;
+    const row = this.db.prepare("SELECT * FROM turn_attempts WHERE id = ?").get(id) as TurnAttemptRow | undefined;
+    return row ? this.decode(row) : null;
+  }
+
+  /** One operation's diagnostic input, without reading historical outcomes per target. */
+  readQueueDiagnostics(onUnreadable: (id: string, err: unknown) => void): {
+    nonterminal: TurnAttempt[]; unsettled: TurnAttempt[];
+  } {
+    const read = (sql: string): TurnAttempt[] => {
+      const attempts: TurnAttempt[] = [];
+      for (const row of this.db.prepare(sql).all() as TurnAttemptRow[]) {
+        try { attempts.push(this.decode(row)); }
+        catch (err) { onUnreadable(row.id, err); }
+      }
+      return attempts;
+    };
+    return {
+      nonterminal: read(`SELECT * FROM turn_attempts
+        WHERE state IN ('pending','active','suspended') ORDER BY state,id`),
+      unsettled: read(`SELECT * FROM turn_attempts WHERE state='completed' AND delivery_done=0
+        AND delivery_abandoned_reason IS NULL AND delivery_uncertain_reason IS NULL ORDER BY updated_utc,id`),
+    };
+  }
+
+  private decode(row: TurnAttemptRow): TurnAttempt {
     const runtime = row?.runtime_json ? JSON.parse(row.runtime_json) : null;
     // Remote runtimes can have telemetry but no local process owner. Recognize
     // only that new exact shape; do not turn malformed legacy ownership into
@@ -295,7 +324,7 @@ export class TurnAttemptStore {
     const evidenceOnly = runtime && typeof runtime === "object"
       && Object.keys(runtime).length > 0
       && Object.keys(runtime).every(key => key === "stdoutFallback" || key === "submissions" || key === "remoteRecovery");
-    return row ? {
+    return {
       id: row.id, generation: row.generation, ownerBoot: row.owner_boot,
       state: row.state, identity: row.identity, spec: JSON.parse(row.spec_json),
       acpSessionId: row.acp_session_id, promptStarted: row.prompt_started === 1,
@@ -323,7 +352,7 @@ export class TurnAttemptStore {
       stalledReason: row.stalled_reason,
       stallNoticeUtc: row.stall_notice_utc,
       stallNoticeReason: row.stall_notice_reason,
-    } : null;
+    };
   }
 
   claim(spec: DispatchSpec, identity: string, ownerBoot: string, source: TurnAttempt["source"] = "dispatch", operatorResume = false): TurnAttempt {

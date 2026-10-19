@@ -3,6 +3,7 @@ import type { SessionRecord } from "../types.js";
 import type { ChatAdapter } from "../../platforms/chat-adapter.js";
 import type { ThreadEntry } from "./seam-mcp-server.js";
 import type { ThreadWorkProgress } from "../dispatch/types.js";
+import { setImmediate } from "node:timers/promises";
 
 type QueueHealth = {
   state: NonNullable<ThreadEntry["queueState"]>;
@@ -21,33 +22,21 @@ export interface ThreadInventoryDeps {
   describeConfig: (record: SessionRecord) => ConfigDescription;
   isRuntimeBusy: (sessionId: string) => boolean;
   adapter: Pick<ChatAdapter, "getThreadName" | "getThreadLiveState">;
-  inspectQueue: (channelRef: string) => QueueHealth;
-  inspectWorkProgress: (
-    channelRef: string,
-    nowMs: number,
-    queue: QueueHealth
-  ) => ThreadWorkProgress;
+  inspectChannels: (channelRefs: readonly string[]) => Promise<ReadonlyMap<string, {
+    queue: QueueHealth; workProgress: ThreadWorkProgress;
+  }>>;
   locationFor: (channelRef: string) => { location: string; hostEmoji: string };
-  now?: () => number;
 }
 
-/**
- * Production composer for the agent-facing `threads()` inventory (#530).
- *
- * Keeping this as one callable path is what makes the progress contract
- * testable at its real consumer. Removing `inspectWorkProgress` from here
- * restores the incident: the underlying classifier can remain correct while
- * every orchestrator still sees only routing `busy`.
- */
+/** Compose platform presence with one batched queue/progress read per inventory. */
 export async function listSiblingThreadEntries(
   caller: SessionRecord,
   deps: ThreadInventoryDeps
 ): Promise<ThreadEntry[]> {
   if (!caller.parentRef) return [];
   const siblings = deps.listSessionsByParent(caller.platform, caller.parentRef);
-  return Promise.all(
+  const presentation = await Promise.all(
     siblings.map(async (session) => {
-      const cfg = deps.describeConfig(session);
       let name: string | null = null;
       let status: ThreadEntry["status"] = "active";
       try {
@@ -73,39 +62,43 @@ export async function listSiblingThreadEntries(
         // confirmed deletion. The existing active fallback remains unchanged.
         status = "active";
       }
-      const queue = deps.inspectQueue(session.channelRef);
-      const workProgress = deps.inspectWorkProgress(
-        session.channelRef,
-        (deps.now ?? Date.now)(),
-        queue
-      );
-      const runtimeBusy = deps.isRuntimeBusy(session.id);
-      const location = deps.locationFor(session.channelRef);
-      return {
-        id: session.channelRef,
-        name,
-        isSelf: session.id === caller.id,
-        agent: cfg.agent.value,
-        model: cfg.model.value,
-        effort: cfg.effort.value,
-        fastMode: cfg.fastMode?.value === true,
-        cwd: cfg.cwd.value,
-        // Bridge recovery stays off this flag. A retry the local runtime has
-        // already called stalled must not read as "wait for the live turn".
-        busy: runtimeBusy || (queue.state !== "idle" && queue.state !== "stalled"),
-        queueState: queue.state,
-        queueAgeMs: queue.ageMs,
-        queueEpoch: queue.epoch,
-        stalledDispatchCount: queue.stalledDispatchCount,
-        stalledDispatchIds: queue.stalledDispatchIds,
-        unsettledDispatchCount: queue.unsettledDispatchCount,
-        unsettledDispatchIds: queue.unsettledDispatchIds,
-        workProgress,
-        status,
-        lastActivityUtc: session.updatedUtc,
-        location: location.location,
-        hostEmoji: location.hostEmoji,
-      };
+      return { name, status };
     })
   );
+  const inspections = await deps.inspectChannels(siblings.map(session => session.channelRef));
+  const entries: ThreadEntry[] = [];
+  for (let i = 0; i < siblings.length; i++) {
+    if (i > 0 && i % 8 === 0) await setImmediate();
+    const session = siblings[i]!;
+    const { name, status } = presentation[i]!;
+    const cfg = deps.describeConfig(session);
+    const { queue, workProgress } = inspections.get(session.channelRef)!;
+    const runtimeBusy = deps.isRuntimeBusy(session.id);
+    const location = deps.locationFor(session.channelRef);
+    entries.push({
+      id: session.channelRef,
+      name,
+      isSelf: session.id === caller.id,
+      agent: cfg.agent.value,
+      model: cfg.model.value,
+      effort: cfg.effort.value,
+      fastMode: cfg.fastMode?.value === true,
+      cwd: cfg.cwd.value,
+      // A bridge-owned retry is distinct from a locally running turn.
+      busy: runtimeBusy || (queue.state !== "idle" && queue.state !== "stalled"),
+      queueState: queue.state,
+      queueAgeMs: queue.ageMs,
+      queueEpoch: queue.epoch,
+      stalledDispatchCount: queue.stalledDispatchCount,
+      stalledDispatchIds: queue.stalledDispatchIds,
+      unsettledDispatchCount: queue.unsettledDispatchCount,
+      unsettledDispatchIds: queue.unsettledDispatchIds,
+      workProgress,
+      status,
+      lastActivityUtc: session.updatedUtc,
+      location: location.location,
+      hostEmoji: location.hostEmoji,
+    });
+  }
+  return entries;
 }

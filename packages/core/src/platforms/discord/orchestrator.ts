@@ -7,6 +7,7 @@ import { promises as fsp } from "node:fs";
 import path from "node:path";
 import os from "node:os";
 import { randomUUID } from "node:crypto";
+import { setImmediate as yieldToEventLoop } from "node:timers/promises";
 import { ActionCardManager } from "../../core/action-cards/manager.js";
 import { SessionActions, attachCompactedSession, fitTranscriptToWindow } from "../../core/session-actions.js";
 import { browserReplyFromInteraction, browserClick } from "./browser-reply.js";
@@ -620,6 +621,15 @@ interface ChannelQueueMeta {
   /** Includes post-release presentation and wrap-up until the handler settles. */
   executing?: number;
 }
+
+interface QueueDiagnosticRows {
+  inbound: InboundAdmission[];
+  attempts: TurnAttempt[];
+  unsettled: TurnAttempt[];
+}
+
+const emptyQueueRows = (): QueueDiagnosticRows => ({ inbound: [], attempts: [], unsettled: [] });
+const QUEUE_INSPECTION_BATCH_SIZE = 8;
 
 export class ChannelQueueFencedError extends Error {
   constructor(readonly channelId: string, readonly epoch: number) {
@@ -1595,11 +1605,12 @@ export class Orchestrator {
       }
     });
 
-    this.autocomplete.register(null, "steer", "thread", "opaque", (ctx) => {
+    this.autocomplete.register(null, "steer", "thread", "opaque", async (ctx) => {
       try {
         const parent = ctx.projectScopeId ?? ctx.parentId;
         if (!parent) return [];
         const siblings = this.store.listSessionsByParent(PLATFORM, parent);
+        const inspections = await this.inspectChannelQueues(siblings.map(s => s.channelRef));
         return labeledAutocompleteChoices(
           siblings.map((s) => {
             let agent = s.agentId;
@@ -1609,7 +1620,7 @@ export class Orchestrator {
             } catch {
               /* mock routers */
             }
-            const queue = this.inspectChannelQueue(s.channelRef);
+            const queue = inspections.get(s.channelRef)!.queue;
             const busy =
               queue.state === "idle"
                 ? "idle"
@@ -1627,13 +1638,15 @@ export class Orchestrator {
         return [];
       }
     });
-    this.autocomplete.register(null, "recover", "thread", "opaque", (ctx) => {
+    this.autocomplete.register(null, "recover", "thread", "opaque", async (ctx) => {
       try {
         const parent = ctx.projectScopeId ?? ctx.parentId;
         if (!parent) return [];
+        const siblings = this.store.listSessionsByParent(PLATFORM, parent);
+        const inspections = await this.inspectChannelQueues(siblings.map(record => record.channelRef));
         return labeledAutocompleteChoices(
-          this.store.listSessionsByParent(PLATFORM, parent).map((record) => {
-            const health = this.inspectChannelQueue(record.channelRef);
+          siblings.map((record) => {
+            const health = inspections.get(record.channelRef)!.queue;
             return {
               name: `${record.channelRef} · ${health.state} · epoch ${health.epoch}`,
               value: record.channelRef,
@@ -2026,23 +2039,23 @@ export class Orchestrator {
   }
 
   /** Queue ownership and observed idle time used by status and operator recovery. */
-  inspectChannelQueue(channelRef: string, nowMs = Date.now()): ChannelQueueHealth {
+  inspectChannelQueue(channelRef: string, nowMs = Date.now(), rows?: QueueDiagnosticRows): ChannelQueueHealth {
     this.channelQueueMeta ??= new Map<string, ChannelQueueMeta>();
     const record = this.recordForChannel(channelRef);
     const queueRef = this.queueChannelRef(channelRef);
     let meta = this.channelQueueMeta.get(queueRef);
     // Execution includes post-prompt wrap-up and bridge-owned restart recovery.
-    const bridgeOwned = this.store.turnAttempts.list("suspended")
-      .some((attempt) => attempt.remoteRecovery && attempt.spec?.target === channelRef);
+    const bridgeOwned = (rows?.attempts ?? this.store.turnAttempts.list("suspended"))
+      .some((attempt) => attempt.state === "suspended" && attempt.remoteRecovery && attempt.spec?.target === channelRef);
     const runtimeBusy = (record ? this.router.isBusy(record.id) : false)
       || (meta?.executing ?? 0) > 0
       || bridgeOwned;
-    const durable = this.store.listInboundNonterminal(channelRef);
-    const stalled = this.store.turnAttempts.listStalled(channelRef);
+    const durable = rows?.inbound ?? this.store.listInboundNonterminal(channelRef);
+    const stalled = rows ? this.stalledQueueAttempts(rows) : this.store.turnAttempts.listStalled(channelRef);
     const newestInbound = durable.at(-1);
     const awaitingReauth = newestInbound && stalled.some(attempt =>
       attempt.id === inboundAttemptId(newestInbound.messageId) && isAwaitingReauth(attempt.stalledReason));
-    const unsettled = this.store.turnAttempts.listUnsettledCompletions(channelRef);
+    const unsettled = rows?.unsettled ?? this.store.turnAttempts.listUnsettledCompletions(channelRef);
     // Admission time says nothing about when a runtime became idle.
     if (!meta && durable.length > 0) {
       meta = { epoch: this.queueEpoch(channelRef), queued: 0 };
@@ -2085,6 +2098,43 @@ export class Orchestrator {
     };
   }
 
+  private stalledQueueAttempts(rows: QueueDiagnosticRows): TurnAttempt[] {
+    return rows.attempts.filter(attempt => attempt.state === "suspended" && attempt.stalledUtc !== null)
+      .sort((a, b) => a.stalledUtc!.localeCompare(b.stalledUtc!) || a.id.localeCompare(b.id));
+  }
+
+  private readQueueDiagnostics(): Map<string, QueueDiagnosticRows> {
+    const groups = new Map<string, QueueDiagnosticRows>();
+    const group = (ref: string) => {
+      let rows = groups.get(ref);
+      if (!rows) groups.set(ref, rows = emptyQueueRows());
+      return rows;
+    };
+    const attempts = this.store.turnAttempts.readQueueDiagnostics((id, err) =>
+      this.logger.warn({ id, err }, "queue diagnostics: attempt row unreadable"));
+    for (const attempt of attempts.nonterminal) group(attempt.spec.target).attempts.push(attempt);
+    for (const attempt of attempts.unsettled) group(attempt.spec.target).unsettled.push(attempt);
+    for (const inbound of this.store.listInboundNonterminal()) group(inbound.channelRef).inbound.push(inbound);
+    return groups;
+  }
+
+  /** Read durable inputs once per request, then let I/O run between channel batches. */
+  async inspectChannelQueues(channelRefs: readonly string[]): Promise<Map<string, {
+    queue: ChannelQueueHealth; workProgress: ThreadWorkProgress;
+  }>> {
+    const rows = this.readQueueDiagnostics();
+    const inspections = new Map<string, { queue: ChannelQueueHealth; workProgress: ThreadWorkProgress }>();
+    for (let i = 0; i < channelRefs.length; i++) {
+      if (i > 0 && i % QUEUE_INSPECTION_BATCH_SIZE === 0) await yieldToEventLoop();
+      const ref = channelRefs[i]!;
+      const diagnostic = rows.get(ref) ?? emptyQueueRows();
+      const now = Date.now();
+      const queue = this.inspectChannelQueue(ref, now, diagnostic);
+      inspections.set(ref, { queue, workProgress: this.inspectThreadWorkProgress(ref, now, queue, diagnostic) });
+    }
+    return inspections;
+  }
+
   /**
    * The single composed answer to "is work on this thread progressing?" (#530).
    *
@@ -2100,9 +2150,12 @@ export class Orchestrator {
   inspectThreadWorkProgress(
     channelRef: string,
     nowMs = Date.now(),
-    queue = this.inspectChannelQueue(channelRef, nowMs)
+    queue = this.inspectChannelQueue(channelRef, nowMs),
+    rows?: QueueDiagnosticRows
   ): ThreadWorkProgress {
-    const attempts = this.store.turnAttempts.listNonterminalDispatches(channelRef, (id, err) =>
+    const attempts = rows ? rows.attempts.filter(attempt => attempt.source === "dispatch")
+      .sort((a, b) => a.updatedUtc.localeCompare(b.updatedUtc) || a.id.localeCompare(b.id))
+      : this.store.turnAttempts.listNonterminalDispatches(channelRef, (id, err) =>
       this.logger.warn({ id, err, channelRef }, "thread progress: attempt row unreadable")
     );
     const watcherOwnedDispatchIds = this.dispatchWatcher?.inFlightIdsForTarget(channelRef) ?? [];
@@ -2263,14 +2316,11 @@ export class Orchestrator {
    * and found nothing at all for a thread whose only trace was a pending
    * admission — which is the commonest shape of this bug.
    */
-  private wedgeSweepCandidates(): string[] {
+  private wedgeSweepCandidates(diagnostics: Map<string, QueueDiagnosticRows>): string[] {
     const refs = new Set<string>(this.channelQueueMeta?.keys() ?? []);
-    for (const row of this.store.listInboundNonterminal()) {
-      if (row.channelRef) refs.add(row.channelRef);
-    }
-    for (const state of ["pending", "suspended"] as const) {
-      for (const attempt of this.store.turnAttempts.list(state, () => {})) {
-        if (attempt.spec?.target) refs.add(attempt.spec.target);
+    for (const [ref, rows] of diagnostics) {
+      if (rows.inbound.length || rows.attempts.some(attempt => attempt.state === "pending" || attempt.state === "suspended")) {
+        refs.add(ref);
       }
     }
     return [...refs];
@@ -2279,10 +2329,15 @@ export class Orchestrator {
   /** Report idle queued work; elapsed time never transfers or cancels ownership. */
   async sweepWedgedQueues(): Promise<string[]> {
     const detected: string[] = [];
-    for (const channelRef of this.wedgeSweepCandidates()) {
+    const diagnostics = this.readQueueDiagnostics();
+    const candidates = this.wedgeSweepCandidates(diagnostics);
+    for (let i = 0; i < candidates.length; i++) {
+      if (i > 0 && i % QUEUE_INSPECTION_BATCH_SIZE === 0) await yieldToEventLoop();
+      const channelRef = candidates[i]!;
+      const rows = diagnostics.get(channelRef) ?? emptyQueueRows();
       let health: ChannelQueueHealth;
       try {
-        health = this.inspectChannelQueue(channelRef);
+        health = this.inspectChannelQueue(channelRef, Date.now(), rows);
       } catch (err) {
         // One unreadable channel must never stop the sweep: the whole point is
         // that nobody is watching, so a throw here restores the silence.
@@ -2293,7 +2348,7 @@ export class Orchestrator {
       detected.push(channelRef);
       this.logger.warn(
         { channelRef, queued: health.queued, ageMs: health.ageMs, epoch: health.epoch,
-          stalledAttempts: this.store.turnAttempts.listStalled(channelRef)
+          stalledAttempts: this.stalledQueueAttempts(rows)
             .map(attempt => ({ id: attempt.id, reason: attempt.stalledReason })),
           unsettledDispatchIds: health.unsettledDispatchIds },
         "queue sweep: queued work has no observed active owner; operator inspection needed"

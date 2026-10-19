@@ -130,9 +130,7 @@ describe("#530 composed thread work progress", () => {
         getThreadName: async () => "worker",
         getThreadLiveState: async () => ({ locked: false, archived: false }),
       },
-      inspectQueue: (channelRef) => host.inspectChannelQueue(channelRef),
-      inspectWorkProgress: (channelRef, nowMs, queue) =>
-        host.inspectThreadWorkProgress(channelRef, nowMs, queue),
+      inspectChannels: channelRefs => host.inspectChannelQueues(channelRefs),
       locationFor: () => ({ location: "local", hostEmoji: "🏠" }),
     });
 
@@ -313,9 +311,7 @@ describe("#530 composed thread work progress", () => {
         getThreadName: async () => "worker",
         getThreadLiveState: async () => ({ locked: false, archived: false }),
       },
-      inspectQueue: (channelRef) => host.inspectChannelQueue(channelRef),
-      inspectWorkProgress: (channelRef, nowMs, queue) =>
-        host.inspectThreadWorkProgress(channelRef, nowMs, queue),
+      inspectChannels: channelRefs => host.inspectChannelQueues(channelRefs),
       locationFor: () => ({ location: "remote-one", hostEmoji: "" }),
     });
     expect(entries[0]).toMatchObject({

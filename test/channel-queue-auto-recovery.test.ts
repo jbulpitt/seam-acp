@@ -315,18 +315,19 @@ describe("queue sweeps diagnose without fencing owners", () => {
 });
 
 describe("#423 the sweep finds threads a restart would have hidden", () => {
-  it("considers channels known only from durable attempts, not just the hot set", () => {
+  it("considers channels known only from durable attempts, not just the hot set", async () => {
     // The 7-and-13-hour threads. `channelQueueMeta` is in-memory and empty
     // after a restart; the attempts are in SQL and are the only trace left.
     const { host } = makeHost();
     const spec = { id: "574a377f", target: CHANNEL, prompt: "p", session: "live" } as never;
     store.turnAttempts.admit(spec);
     expect(store.turnAttempts.get("574a377f")?.state).toBe("pending");
-    expect((host as never as { wedgeSweepCandidates(): string[] })
-      .wedgeSweepCandidates()).toContain(CHANNEL);
+    const inspect = vi.spyOn(host, "inspectChannelQueue");
+    await host.sweepWedgedQueues();
+    expect(inspect.mock.calls.map(([ref]) => ref)).toContain(CHANNEL);
   });
 
-  it("considers suspended attempts too, which hold a queue just as effectively", () => {
+  it("considers suspended attempts too, which hold a queue just as effectively", async () => {
     // #423 is explicit that a BENIGN suspension with no stalled_reason wedges a
     // thread exactly as well as a quarantine does.
     const { host } = makeHost();
@@ -334,8 +335,9 @@ describe("#423 the sweep finds threads a restart would have hidden", () => {
     store.turnAttempts.admit(spec);
     const claimed = store.turnAttempts.claim(spec, "identity", "boot-1");
     store.turnAttempts.suspend(claimed.id, "boot-1");
-    expect((host as never as { wedgeSweepCandidates(): string[] })
-      .wedgeSweepCandidates()).toContain("1543324940713988188");
+    const inspect = vi.spyOn(host, "inspectChannelQueue");
+    await host.sweepWedgedQueues();
+    expect(inspect.mock.calls.map(([ref]) => ref)).toContain("1543324940713988188");
   });
 
   it("keeps sweeping after one channel throws", async () => {
@@ -345,9 +347,9 @@ describe("#423 the sweep finds threads a restart would have hidden", () => {
     admitStale("305");
     const real = host.inspectChannelQueue.bind(host);
     (host as never as { inspectChannelQueue: unknown }).inspectChannelQueue =
-      (ref: string, now?: number) => {
-        if (ref === "poison") throw new Error("unreadable");
-        return real(ref, now);
+      (...args: Parameters<Orchestrator["inspectChannelQueue"]>) => {
+        if (args[0] === "poison") throw new Error("unreadable");
+        return real(...args);
       };
     (host as never as { channelQueueMeta: Map<string, unknown> })
       .channelQueueMeta.set("poison", { epoch: 1, queued: 1, admittedAtMs: 0, lastProgressAtMs: 0 });

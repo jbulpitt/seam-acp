@@ -174,6 +174,8 @@ beforeEach(() => {
   dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "seam-stream-test-"));
 });
 afterEach(() => {
+  vi.useRealTimers();
+  vi.restoreAllMocks();
   fs.rmSync(dataDir, { recursive: true, force: true });
 });
 
@@ -495,6 +497,38 @@ describe("scheduled visible output speech", () => {
 });
 
 describe('dispatchInjectTurn: plain "messages" style (default)', () => {
+  it("keeps a dispatch's post-release presentation owned across sweeps", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    const log: string[] = [];
+    const rt = fakeRuntime(["finished answer"], log);
+    const { adapter, calls } = spyAdapter(log);
+    const orch = makeOrch({ dataDir, rt, adapter });
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    let entered!: () => void;
+    const presenting = new Promise<void>(resolve => { entered = resolve; });
+    const internal = orch as any;
+    const finalize = internal.finalizeMessagesStream.bind(orch);
+    vi.spyOn(internal, "finalizeMessagesStream").mockImplementation(async (...args: unknown[]) => {
+      entered(); await gate; return finalize(...args);
+    });
+    const abort = vi.spyOn(internal.router, "abortTurn");
+    const turn = orch.dispatchInjectTurn(baseSpec());
+    try {
+      await presenting;
+      // Let the released FIFO link settle; the presentation promise stays held.
+      for (let tick = 0; tick < 8; tick++) await new Promise(resolve => setImmediate(resolve));
+      expect(internal.channelQueues.has("thread-w")).toBe(false);
+      vi.setSystemTime(Date.now() + 45_000);
+      expect(orch.inspectChannelQueue("thread-w")).toMatchObject({ runtimeBusy: true, epoch: 0, ageMs: 0 });
+      expect(await orch.sweepWedgedQueues()).toEqual([]);
+      expect(abort).not.toHaveBeenCalled();
+    } finally { release(); await turn; }
+    expect(log.filter(entry => entry === "prompt-start")).toHaveLength(1);
+    expect(calls.sendMessage.filter(call => call.text === "finished answer")).toHaveLength(1);
+    expect(orch.inspectChannelQueue("thread-w").runtimeBusy).toBe(false);
+  });
+
   it("posts a PLAIN start indicator and streams a short answer as ONE real message — no embeds, no tail-capped edit", async () => {
     const log: string[] = [];
     const rt = fakeRuntime(["Hello ", "world"], log);

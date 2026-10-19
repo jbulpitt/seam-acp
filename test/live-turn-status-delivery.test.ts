@@ -31,8 +31,8 @@ afterEach(async () => {
   vi.restoreAllMocks();
 });
 
-function setup(mode: "held-status" | "failed-status" | "held-file" | "fast" = "fast",
-  logger = pino({ level: "silent" })) {
+function setup(mode: "held-status" | "failed-status" | "held-file" | "held-wrap-up" | "fast" = "fast",
+  logger = pino({ level: "silent" }), platform: "discord" | "google-chat" = "discord") {
   vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout", "setInterval", "clearInterval"] });
   const dir = mkdtempSync(path.join(tmpdir(), "seam-live-delivery-"));
   const store = new SessionStore(path.join(dir, "test.db"));
@@ -40,6 +40,8 @@ function setup(mode: "held-status" | "failed-status" | "held-file" | "fast" = "f
   const fileGate = deferred();
   const statusStarted = deferred();
   const fileStarted = deferred();
+  const wrapUpGate = deferred();
+  const wrapUpStarted = deferred();
   let inPrompt = false;
   let heldStatus = false;
   let statusReleased = false;
@@ -73,11 +75,11 @@ function setup(mode: "held-status" | "failed-status" | "held-file" | "fast" = "f
   Object.assign(runtime, { connection: { prompt }, sessionId: "fixture-acp", promptCapabilities: {},
     sessionInfo: { sessionId: "fixture-acp", availableModels: [], currentModelId: "fixture-model" } });
   const now = new Date().toISOString();
-  const record = { id: "discord:100", platform: "discord", channelRef: "100", parentRef: null,
+  const record = { id: `${platform}:100`, platform, channelRef: "100", parentRef: null,
     agentId: "claude", acpSessionId: "fixture-acp", repoPath: dir, configJson: "{}",
     createdUtc: now, updatedUtc: now };
   store.upsert(record);
-  store.admitInbound({ messageId: "1", platform: "discord", channelRef: record.channelRef,
+  store.admitInbound({ messageId: "1", platform, channelRef: record.channelRef,
     parentRef: null, sessionRecordId: record.id, authorId: "user", authorName: "User",
     text: "synthetic task", attachments: [], createdUtc: now });
   store.claimInbound("1", 0, now);
@@ -117,24 +119,32 @@ function setup(mode: "held-status" | "failed-status" | "held-file" | "fast" = "f
     config: { DATA_DIR: dir, REPOS_ROOT: dir, TURN_TIMEOUT_SECONDS: 60, REPO_EMOJIS: new Map(),
       DEFAULT_MODEL: "fixture-model", CHANNEL_QUEUE_WEDGE_GRACE_SECONDS: 1,
       channelPresets: new Map(), threadPresets: new Map() } as never });
+  if (mode === "held-wrap-up") orch.setVoiceConsoleController({
+    hasActiveBinding: () => true,
+    beginVisibleTurn: () => ({ consoleId: "c", bindingId: "b", turnId: "inbound-1" }),
+    acceptVisibleAgentText: () => {},
+    finishVisibleTurn: async () => { wrapUpStarted.resolve(); await wrapUpGate.promise; },
+    cancelVisibleTurn: async () => {}, markBindingActivitySettled: async () => {},
+  } as never);
   const internals = orch as unknown as {
     queueOnChannel<T>(channel: string, task: (fence: { channelId: string; epoch: number }) => Promise<T>): Promise<T>;
     handleIncomingMessageInner(message: IncomingMessage, fence: { channelId: string; epoch: number }): Promise<void>;
   };
   const releaseStatus = () => { statusReleased = true; statusGate.resolve(); };
   cleanups.push(async () => {
-    releaseStatus(); fileGate.resolve();
+    releaseStatus(); fileGate.resolve(); wrapUpGate.resolve();
     await Promise.allSettled([...pending, ...(run ? [run] : [])]);
     await flush();
     orch.stopSentinelWatcher();
     store.close(); rmSync(dir, { recursive: true, force: true });
   });
   return { store, runtime, router, adapter, orch, prompt, messages, edits, feed, fileGate, releaseStatus,
+    wrapUpStarted: wrapUpStarted.promise, releaseWrapUp: wrapUpGate.resolve,
     statusStarted: statusStarted.promise, fileStarted: fileStarted.promise,
     heldStatus: () => heldStatus,
     run: () => {
       run = internals.queueOnChannel("100", async (fence) => {
-        await internals.handleIncomingMessageInner({ messageId: "1", channel: { platform: "discord", id: "100" },
+        await internals.handleIncomingMessageInner({ messageId: "1", channel: { platform, id: "100" },
           authorId: "user", authorIsBot: false, text: "synthetic task" }, fence);
         store.completeInbound("1", fence.epoch, new Date().toISOString());
       });
@@ -145,6 +155,26 @@ function setup(mode: "held-status" | "failed-status" | "held-file" | "fast" = "f
 }
 
 describe("live-turn status and answer delivery", () => {
+  it.each(["google-chat", "discord"] as const)("keeps %s wrap-up owned after early FIFO release, past the old sweep grace", async platform => {
+    const h = setup("held-wrap-up", undefined, platform);
+    const running = h.run();
+    await h.wrapUpStarted;
+    await flush();
+    expect(h.messages).toEqual([ANSWER]);
+    expect(h.runtime.busy).toBe(false);
+    await vi.advanceTimersByTimeAsync(45_000);
+    expect(await h.orch.sweepWedgedQueues()).toEqual([]);
+    expect(h.orch.inspectChannelQueue("100")).toMatchObject({ runtimeBusy: true, epoch: 0, ageMs: 0 });
+    expect(h.router.abortTurn).not.toHaveBeenCalled();
+    expect(h.store.getInbound("1")).toMatchObject({ state: "running", queueEpoch: 0 });
+    h.releaseWrapUp();
+    await running;
+    expect(h.store.getInbound("1")?.state).toBe("completed");
+    expect(h.store.turnAttempts.get("inbound-1")?.deliveryDone).toBe(true);
+    expect(h.prompt).toHaveBeenCalledOnce();
+    expect(h.messages).toEqual([ANSWER]);
+  });
+
   it("records successful incremental text before the ACP terminal response", async () => {
     const h = setup();
     const terminal = deferred();

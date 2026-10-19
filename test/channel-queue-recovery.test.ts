@@ -244,6 +244,55 @@ describe("#180 channel queue fencing", () => {
     expect(order).toEqual(["first answered", "second ran", "first wrapped up"]);
   });
 
+  it("shares the epoch's execution count across overlapping released wrap-ups", async () => {
+    const { host, router } = makeHost();
+    const firstTail = deferred();
+    const secondTail = deferred();
+    const firstStarted = deferred();
+    const secondStarted = deferred();
+    const queue = (host as any).queueOnChannel.bind(host);
+    const first = queue("100", async (fence: { release(): void }) => {
+      fence.release(); firstStarted.resolve(); await firstTail.promise;
+    });
+    await firstStarted.promise;
+    const firstMeta = (host as any).channelQueueMeta.get("100");
+    const second = queue("100", async (fence: { release(): void }) => {
+      fence.release(); secondStarted.resolve(); await secondTail.promise;
+    });
+    try {
+      await secondStarted.promise;
+      await flush();
+      expect((host as any).channelQueueMeta.get("100")).toBe(firstMeta);
+      expect(firstMeta.executing).toBe(2);
+      firstTail.resolve(); await first;
+      expect(host.inspectChannelQueue("100")).toMatchObject({ runtimeBusy: true, ageMs: 0 });
+      expect(firstMeta.executing).toBe(1);
+      expect(await host.sweepWedgedQueues()).toEqual([]);
+      expect(router.abortTurn).not.toHaveBeenCalled();
+    } finally {
+      firstTail.resolve(); secondTail.resolve();
+      await Promise.allSettled([first, second]);
+    }
+    await flush();
+    expect(host.inspectChannelQueue("100").runtimeBusy).toBe(false);
+    expect((host as any).channelQueueMeta.has("100")).toBe(false);
+  });
+
+  it("measures observed runtime idleness, never a durable admission's age", () => {
+    const { host, router } = makeHost();
+    admit("7", "old admission", "2026-09-03T00:00:00.000Z");
+    const now = Date.parse("2026-10-19T05:00:00.000Z");
+    router.isBusy = () => true;
+    expect(host.inspectChannelQueue("100", now).ageMs).toBe(0);
+    router.isBusy = () => false;
+    expect(host.inspectChannelQueue("100", now + 60_000).ageMs).toBe(0);
+    expect(host.inspectChannelQueue("100", now + 61_000).ageMs).toBe(1_000);
+    router.isBusy = () => true;
+    expect(host.inspectChannelQueue("100", now + 62_000).ageMs).toBe(0);
+    router.isBusy = () => false;
+    expect(host.inspectChannelQueue("100", now + 63_000).ageMs).toBe(0);
+  });
+
   it("detaches a stuck active finalizer and lets the recovered epoch run immediately", async () => {
     const { host } = makeHost();
     const oldRelease = deferred();

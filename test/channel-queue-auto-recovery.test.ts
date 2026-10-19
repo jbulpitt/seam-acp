@@ -109,6 +109,23 @@ function admitStale(messageId: string, createdUtc = "2026-09-19T00:00:00.000Z"):
 }
 
 describe("#423 a wedged thread self-heals without an operator", () => {
+  it("never fences an auth-recheck owner whose attempt has temporarily left the waiting state", async () => {
+    const { host, router } = makeHost();
+    admitStale("auth-rechecking");
+    store.claimInbound("auth-rechecking", 0, "2026-09-19T00:00:00.000Z");
+    store.turnAttempts.claim({ id: inboundAttemptId("auth-rechecking"), target: CHANNEL,
+      prompt: "continue", session: "live" }, "identity", "boot", "inbound");
+    const admission = store.getInbound("auth-rechecking");
+    const recovery = vi.spyOn(host, "recoverChannel");
+    for (let tick = 0; tick < 5; tick++) await host.sweepWedgedQueues();
+    expect(recovery).not.toHaveBeenCalled();
+    expect(router.abortTurn).not.toHaveBeenCalled();
+    expect(router.invalidate).not.toHaveBeenCalled();
+    expect(host.inspectChannelQueue(CHANNEL).epoch).toBe(0);
+    expect(store.getInbound("auth-rechecking")).toEqual(admission);
+    expect(store.listConfigMutations()).toEqual([]);
+  });
+
   it.each([
     [false, false], [false, true], [true, false], [true, true],
   ])("leaves a reauth-waiting inbound parked across sweeps (promptStarted=%s, queueMeta=%s)", async (promptStarted, queueMeta) => {

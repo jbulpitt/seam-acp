@@ -7,7 +7,7 @@ import { promises as fsp } from "node:fs";
 import path from "node:path";
 import os from "node:os";
 import { randomUUID } from "node:crypto";
-import { setImmediate } from "node:timers/promises";
+import { setImmediate as yieldToEventLoop } from "node:timers/promises";
 import { ActionCardManager } from "../../core/action-cards/manager.js";
 import { SessionActions, attachCompactedSession, fitTranscriptToWindow } from "../../core/session-actions.js";
 import { browserReplyFromInteraction, browserClick } from "./browser-reply.js";
@@ -2125,7 +2125,7 @@ export class Orchestrator {
     const rows = this.readQueueDiagnostics();
     const inspections = new Map<string, { queue: ChannelQueueHealth; workProgress: ThreadWorkProgress }>();
     for (let i = 0; i < channelRefs.length; i++) {
-      if (i > 0 && i % QUEUE_INSPECTION_BATCH_SIZE === 0) await setImmediate();
+      if (i > 0 && i % QUEUE_INSPECTION_BATCH_SIZE === 0) await yieldToEventLoop();
       const ref = channelRefs[i]!;
       const diagnostic = rows.get(ref) ?? emptyQueueRows();
       const now = Date.now();
@@ -2332,7 +2332,7 @@ export class Orchestrator {
     const diagnostics = this.readQueueDiagnostics();
     const candidates = this.wedgeSweepCandidates(diagnostics);
     for (let i = 0; i < candidates.length; i++) {
-      if (i > 0 && i % QUEUE_INSPECTION_BATCH_SIZE === 0) await setImmediate();
+      if (i > 0 && i % QUEUE_INSPECTION_BATCH_SIZE === 0) await yieldToEventLoop();
       const channelRef = candidates[i]!;
       const rows = diagnostics.get(channelRef) ?? emptyQueueRows();
       let health: ChannelQueueHealth;

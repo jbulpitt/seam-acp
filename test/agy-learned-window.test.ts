@@ -235,16 +235,16 @@ async function windowSubject(age?: number, unavailable = false) {
     },
     onCatalogRefresh: async observed => { if (observed) { known = observed; publications.push(observed); } },
   });
+  let usage: number[] = [];
+  runtime.onEvent(async event => { if (event.kind === "usage-update") usage.push(event.size); });
   try { await runtime.start(); } catch (error) { await runtime.dispose(); fixture.cleanup(); throw error; }
   return { runtime, publications, value,
     known: () => known,
     requests: () => fs.existsSync(requests) ? fs.readFileSync(requests, "utf8").trim().split("\n").length : 0,
     async turn(model = "fixture-native-model") {
       await runtime.newSession({ cwd: dir, model, strictModel: true });
-      const usage: number[] = [];
-      const off = runtime.onEvent(async event => { if (event.kind === "usage-update") usage.push(event.size); });
-      try { await runtime.prompt("capability-turn-one"); await runtime.idle(); return usage; }
-      finally { if (typeof off === "function") off(); }
+      usage = [];
+      await runtime.prompt("capability-turn-one"); await runtime.idle(); return usage;
     },
     async close() { await runtime.dispose(); fixture.cleanup(); },
   };
@@ -279,7 +279,7 @@ describe.sequential("durable AGY window TTL", () => {
       expect(h.requests()).toBe(1); expect(h.publications).toHaveLength(1);
       const row = h.known().models.find(row => row.id === "fixture-native-model")!;
       expect(row.context.effective).toBe(resolved);
-      expect(Date.parse(row.evidence![0]!.observedAt)).toBeGreaterThanOrEqual(before);
+      expect(Date.parse(row.evidence![0]!.observedAt!)).toBeGreaterThanOrEqual(before);
       expect(usage.at(-1)).toBe(resolved);
       await h.turn();
       expect(h.requests()).toBe(1); expect(h.publications).toHaveLength(1);
@@ -297,7 +297,7 @@ describe.sequential("durable AGY window TTL", () => {
       offset = ttl + 60_000;
       await h.turn();
       expect(h.requests()).toBe(2); expect(h.publications).toHaveLength(2);
-      expect(Date.parse(h.known().models[0]!.evidence![0]!.observedAt)).toBeGreaterThan(realNow() + ttl);
+      expect(Date.parse(h.known().models[0]!.evidence![0]!.observedAt!)).toBeGreaterThan(realNow() + ttl);
       await h.turn();
       expect(h.requests()).toBe(2); expect(h.publications).toHaveLength(2);
     } finally { vi.restoreAllMocks(); await h.close(); }

@@ -103,6 +103,14 @@ export class AgyNativeTranslator {
 
   constructor(private readonly options: AgyNativeTranslatorOptions) {}
 
+  /** Correct prior telemetry even when learning arrives after the last token. */
+  setContextWindow(size: number): { used: number; size: number } | undefined {
+    if (this.options.maxTokens === size) return;
+    this.options.maxTokens = size;
+    const used = this.usageHighWater.live;
+    return used > 0 ? { used, size } : undefined;
+  }
+
   translate(stepIndex: number, step: AgyStep): AgyTranslationBatch {
     // A resumed LS demonstrably replays old trajectory indices. Preserve their
     // typed history for deterministic replay consumers, but label it historical

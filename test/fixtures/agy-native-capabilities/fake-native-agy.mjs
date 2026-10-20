@@ -8,6 +8,8 @@ import { createHash } from "node:crypto";
 const args = process.argv.slice(2);
 const fixtureDir = process.env.SEAM_AGY_CAPABILITY_FIXTURE_DIR;
 const invocationLog = process.env.SEAM_AGY_CAPABILITY_INVOCATIONS;
+let streamFinished;
+const afterStream = new Promise(resolve => { streamFinished = resolve; });
 
 if (!fixtureDir) {
   process.stderr.write("missing sanitized capability fixture directory\n");
@@ -239,13 +241,20 @@ const server = http.createServer(async (request, response) => {
   }
 
   if (request.url?.endsWith("/GetAvailableModels")) {
-    if (process.env.SEAM_AGY_R4B_METADATA_MODE === "unavailable") {
+    if (process.env.SEAM_AGY_WINDOW_REQUESTS) {
+      fs.appendFileSync(process.env.SEAM_AGY_WINDOW_REQUESTS, `${JSON.stringify({ rpc, pid: process.pid })}\n`);
+    }
+    const metadataMode = process.env.SEAM_AGY_R4B_METADATA_MODE_FILE
+      ? fs.readFileSync(process.env.SEAM_AGY_R4B_METADATA_MODE_FILE, "utf8").trim()
+      : process.env.SEAM_AGY_R4B_METADATA_MODE;
+    if (metadataMode === "late") await afterStream;
+    if (metadataMode === "unavailable") {
       response.statusCode = 403;
       response.end();
       return;
     }
     response.setHeader("content-type", "application/json");
-    const primaryModelId = process.env.SEAM_AGY_R4B_METADATA_MODE === "mismatch"
+    const primaryModelId = metadataMode === "mismatch"
       ? "fixture-native-model-alias"
       : "fixture-native-model";
     response.end(JSON.stringify({
@@ -253,7 +262,9 @@ const server = http.createServer(async (request, response) => {
         models: {
           [primaryModelId]: {
             displayName: "Fixture Native Model",
-            maxTokens: 4096,
+            maxTokens: Number(process.env.SEAM_AGY_WINDOW_VALUE_FILE
+              ? fs.readFileSync(process.env.SEAM_AGY_WINDOW_VALUE_FILE, "utf8")
+              : process.env.SEAM_AGY_R4B_CONTEXT_WINDOW ?? 4096),
             recommended: true,
             supportsThinking: true,
             supportsImages: false,
@@ -261,7 +272,7 @@ const server = http.createServer(async (request, response) => {
           },
           "fixture-native-model-low": {
             displayName: "Fixture Native Model (Low)",
-            maxTokens: 4096,
+            maxTokens: Number(process.env.SEAM_AGY_R4B_CONTEXT_WINDOW ?? 4096),
             recommended: false,
             supportsThinking: true,
             supportsImages: false,
@@ -359,6 +370,7 @@ const server = http.createServer(async (request, response) => {
     for (const update of trace.updates) {
       await writeFragmented(response, envelope(0, { update }));
     }
+    streamFinished();
     if (trace.holdOpen) return;
     response.end(envelope(2, {}));
     if (trace.stdoutEnvelope) {

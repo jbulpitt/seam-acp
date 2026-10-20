@@ -53,6 +53,8 @@ export function assessModelSelection(
 export type CatalogRefreshReason = "startup" | "scheduled" | "manual" | "session";
 
 export interface CatalogRefreshOptions {
+  /** Observation from the already-running adapter, not a new catalog process. */
+  candidate?: AdapterCatalogCandidate;
   /**
    * Operator acceptance of a quarantined reduction (#236). Bounded by
    * construction: it applies to this ONE refresh of this ONE binding and is
@@ -458,7 +460,8 @@ export class ModelCatalogService {
     const key = bindingKey(binding);
     // An accepting refresh must not be satisfied by an in-flight non-accepting
     // one (or vice versa), so acceptance is part of the single-flight identity.
-    const flightKey = opts.acceptReduction ? `${key}|accept` : key;
+    const flightKey = `${key}${opts.acceptReduction ? "|accept" : ""}`
+      + (opts.candidate ? `|session:${candidateChecksum(opts.candidate)}` : "");
     const existing = this.inFlight.get(flightKey);
     if (existing) return existing;
     if (this.stopped) {
@@ -520,12 +523,31 @@ export class ModelCatalogService {
       return { ...base, ok: Boolean(prior), result: "unavailable", error };
     }
     try {
-      const { candidate: fetched, fetchedBy } = await this.fetchCandidate(source);
+      const { candidate: fetched, fetchedBy } = await this.fetchCandidate(source, opts.candidate);
       // The portable screen runs again here: a candidate may have arrived over
       // the bridge, and a remote host is not a trust boundary we defer past.
       // Normalization returns the sanitized, canonically ordered candidate that
       // is what actually gets checksummed and persisted.
       const candidate = normalizeCatalogCandidate(fetched);
+      const known = this.lookup(binding).snapshot?.candidate;
+      if (candidate.scope.provider === "google-antigravity"
+        && known?.scope.fingerprint === candidate.scope.fingerprint) {
+        candidate.models = candidate.models.map(model => {
+          const priorModel = known.models.find(row => row.id === model.id);
+          const evidence = priorModel?.evidence?.filter(row => row.kind === "live-observation"
+            && row.source === "agy language server" && row.resolvedModel === model.id
+            && row.scopeRef === candidate.scope.fingerprint && row.context?.effective);
+          const observedAt = model.evidence?.filter(row => row.kind === "live-observation"
+            && row.source === "agy language server" && row.resolvedModel === model.id
+            && row.scopeRef === candidate.scope.fingerprint && row.context?.effective)
+            .map(row => row.observedAt).sort().at(-1);
+          const priorObservedAt = evidence?.map(row => row.observedAt).sort().at(-1);
+          const retain = model.context.effective === null || !observedAt || (priorObservedAt && observedAt < priorObservedAt);
+          return retain && priorModel?.context.effective && evidence?.length
+            ? { ...model, context: priorModel.context, evidence: [...model.evidence ?? [], ...evidence] }
+            : model;
+        });
+      }
       validateCandidate(candidate);
       const checksum = candidateChecksum(candidate);
       const declaredScope = shareableScope(candidate.scope)
@@ -772,7 +794,7 @@ export class ModelCatalogService {
     this.options.store.clearReductionQuarantine(key);
   }
 
-  private async fetchCandidate(binding: CatalogBinding): Promise<FetchedCatalogCandidate> {
+  private async fetchCandidate(binding: CatalogBinding, observed?: AdapterCatalogCandidate): Promise<FetchedCatalogCandidate> {
     // #339 rules 11-12: dedupe concurrent refreshes of the SAME source binding,
     // and never infer that source from a provider/scope label.
     //
@@ -783,10 +805,10 @@ export class ModelCatalogService {
     // sole exception: it names the one adapter that actually performs the
     // fetch, so all consumers of that authority may share its in-flight work.
     const declared = this.options.scope ? await this.options.scope(binding) : null;
-    const fetchKey = bindingKey(binding);
+    const fetchKey = observed ? `${bindingKey(binding)}|session:${candidateChecksum(observed)}` : bindingKey(binding);
     const existing = this.fetchInFlight.get(fetchKey);
     if (existing) return existing;
-    const promise = this.options.fetch(binding).then((candidate) => {
+    const promise = (observed ? Promise.resolve(observed) : this.options.fetch(binding)).then((candidate) => {
       if (
         declared && (
           candidate.scope.sharing !== declared.sharing ||
@@ -797,7 +819,7 @@ export class ModelCatalogService {
           `adapter catalog scope changed during fetch (${declared.fingerprint} → ${candidate.scope.fingerprint})`
         );
       }
-      return { candidate, fetchedBy: fetchKey };
+      return { candidate, fetchedBy: bindingKey(binding) };
     }).finally(() => this.fetchInFlight.delete(fetchKey));
     this.fetchInFlight.set(fetchKey, promise);
     return promise;

@@ -3948,9 +3948,7 @@ export class Orchestrator {
     let sawTool = false;
     let agentAudioSent = false;
     let totalAgentChars = 0;
-    // Set true mid-turn (in the usage-update handler) when agy's context
-    // usage crosses AGY_AUTO_COMPACT_THRESHOLD; consumed post-turn to run
-    // the /compact flow before the next prompt.
+    // Latest usage/window decides end-of-turn compaction; metadata may correct size.
     let agyAutoCompactNeeded = false;
     // Streaming fence extractor: pulls every ```lang ... ``` block out
     // of the agent's text and emits ordered segments. Fence-close
@@ -4501,15 +4499,11 @@ export class Orchestrator {
             const size = event.size;
             status.contextWindowSize = size;
             status.context = formatContextUsage(used, size);
-            // agy has no built-in auto-compaction. Mark the turn for an
-            // end-of-turn /compact when usage crosses the configured threshold.
-            if (
+            // A corrected window can clear an earlier conservative estimate.
+            agyAutoCompactNeeded =
               this.config.AGY_AUTO_COMPACT_THRESHOLD > 0 &&
               described.agent.value.startsWith("agy") &&
-              used / size >= this.config.AGY_AUTO_COMPACT_THRESHOLD
-            ) {
-              agyAutoCompactNeeded = true;
-            }
+              used / size >= this.config.AGY_AUTO_COMPACT_THRESHOLD;
             void refresh();
             return;
           }

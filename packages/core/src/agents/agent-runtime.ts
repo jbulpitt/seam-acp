@@ -33,6 +33,9 @@ import {
 import {
   SEAM_AGY_JSON_SCHEMA_META,
   SEAM_AGY_CATALOG_REFRESH_META,
+  SEAM_AGY_CONTEXT_WINDOW_META,
+  type AgyContextWindowSeed,
+  type AdapterCatalogCandidate,
   SEAM_AGY_STDOUT_FALLBACK_META,
   permitsAgyStdoutFallback,
   attachErrorClassification,
@@ -443,7 +446,8 @@ export class AgentRuntime {
   private readonly onSessionModes?: (info: SessionInfo) => void;
   private readonly mcpServers: McpServer[];
   private readonly onDead?: () => void;
-  private readonly onCatalogRefresh?: () => void | Promise<void>;
+  private readonly onCatalogRefresh?: (candidate?: AdapterCatalogCandidate) => void | Promise<void>;
+  private readonly catalogContext?: (model: string) => AgyContextWindowSeed | undefined;
   private readonly elicitationHandler?: ElicitationHandler;
   private readonly completeElicitationHandler?: (
     notification: CompleteElicitationNotification
@@ -629,7 +633,8 @@ export class AgentRuntime {
     /** Called when the agent process exits after a successful initialize. */
     onDead?: () => void;
     /** Refresh this runtime's exact host binding after adapter-owned metadata changes. */
-    onCatalogRefresh?: () => void | Promise<void>;
+    onCatalogRefresh?: (candidate?: AdapterCatalogCandidate) => void | Promise<void>;
+    catalogContext?: (model: string) => AgyContextWindowSeed | undefined;
     /** Spawn through the process that owns the child (a bridge in production). */
     spawnFn: (
       model?: string,
@@ -659,6 +664,7 @@ export class AgentRuntime {
     this.claudeCredentialFacts = opts.claudeCredentialFacts;
     this.onDead = opts.onDead;
     this.onCatalogRefresh = opts.onCatalogRefresh;
+    this.catalogContext = opts.catalogContext;
     this.spawnFn = opts.spawnFn;
     this.elicitationHandler = opts.elicitationHandler;
     this.completeElicitationHandler = opts.completeElicitationHandler;
@@ -1479,13 +1485,17 @@ export class AgentRuntime {
         new Promise<{ stopReason: string }>((resolve, reject) => {
           this.rejectInFlightPrompt = reject;
           this.providerReplyGate = this.profile.id === "codex" && !this.sessionFailuresSupported ? new CodexReplyGate() : undefined;
+          const context = this.profile.id === "agy" ? this.catalogContext?.(
+            this.sessionInfo?.currentModelId ?? this.modelOverride ?? this.profile.defaultModel ?? "default") : undefined;
+          const meta = {
+            ...(opts?.jsonSchema ? { [SEAM_AGY_JSON_SCHEMA_META]: opts.jsonSchema } : {}),
+            ...(context ? { [SEAM_AGY_CONTEXT_WINDOW_META]: context } : {}),
+          };
           const params = {
             sessionId: sid,
             // Unknown acceptance continues the same transcript, never the brief.
             prompt: continuing ? [{ type: "text" as const, text: this.continuationText }] : prompt,
-            ...(opts?.jsonSchema
-              ? { _meta: { [SEAM_AGY_JSON_SCHEMA_META]: opts.jsonSchema } }
-              : {}),
+            ...(Object.keys(meta).length ? { _meta: meta } : {}),
           };
           this.submissionRequests.set(params, receipt.submission);
           conn.prompt(params).then(async result => {
@@ -2493,9 +2503,10 @@ export class AgentRuntime {
         }
         await this.emit({ kind: "config-options", options: opts });
         const meta = (update as unknown as { _meta?: Record<string, unknown> | null })._meta;
-        if (meta?.[SEAM_AGY_CATALOG_REFRESH_META] === true && this.onCatalogRefresh) {
+        const catalog = meta?.[SEAM_AGY_CATALOG_REFRESH_META];
+        if (catalog && this.onCatalogRefresh) {
           try {
-            await this.onCatalogRefresh();
+            await this.onCatalogRefresh(typeof catalog === "object" ? catalog as unknown as AdapterCatalogCandidate : undefined);
           } catch (err) {
             // Blast radius: refuse only this catalog publication. The live AGY
             // session and its conservative in-session sizing keep working.

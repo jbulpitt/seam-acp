@@ -1708,8 +1708,15 @@ export class SessionRouter {
         this.logger.info({ sessionId: record.id }, "agent process died; evicting runtime for auto-resume");
         this.runtimes.delete(record.id);
       },
-      onCatalogRefresh: async () => {
-        await this.modelCatalog.refresh({ agentId, location }, "session");
+      onCatalogRefresh: async candidate => {
+        await this.modelCatalog.refresh({ agentId, location }, "session", { candidate });
+      },
+      catalogContext: model => {
+        const snapshot = this.modelCatalog.lookup({ agentId, location }).snapshot;
+        const scope = this.getProfile(agentId, location)?.catalog.scope();
+        if (!snapshot || snapshot.candidate.scope.fingerprint !== scope?.fingerprint) return;
+        const maxTokens = snapshot.candidate.models.find(row => row.id === model)?.context.effective;
+        return maxTokens ? { modelId: model, scopeRef: scope.fingerprint, maxTokens } : undefined;
       },
       ...this.clientOptions(record),
       onSessionModes: info => {

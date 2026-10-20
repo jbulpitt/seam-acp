@@ -644,21 +644,19 @@ async function deleteNativeSessionArtifacts(cascadeId: string | undefined): Prom
 
 export interface AgyNativeCatalogScopeOptions {
   credentialScope?: string;
+  runtimeIdentity?: string;
   defaultModel: string;
   staticModels?: ReadonlyArray<{ modelId: string; name: string; contextLimit?: number }>;
 }
 
-/**
- * Semantic native-runtime identity. Location and paths are deliberately absent:
- * equivalent hosts share, while account/default/configured-selection changes
- * cannot contend for one canonical generation.
- */
+/** Binding-local runtime/account/selection identity for catalog observations. */
 export function agyNativeCatalogScope(opts: AgyNativeCatalogScopeOptions): CatalogScope {
   const credentialProfile = opts.credentialScope?.trim() || "antigravity-oauth:default";
   if (!/^[A-Za-z0-9][A-Za-z0-9._:/-]{0,63}$/.test(credentialProfile) || path.isAbsolute(credentialProfile)) {
     throw new Error("AGY_CREDENTIAL_SCOPE must be a non-secret semantic identifier");
   }
   const selection = {
+    runtimeIdentity: opts.runtimeIdentity ?? null,
     defaultModel: opts.defaultModel,
     source: opts.staticModels?.length ? "configured+live-context" : "live-discovery",
     models: (opts.staticModels ?? []).map((model) => ({
@@ -710,6 +708,7 @@ export function makeAgyProfile(opts: {
   const defaultModel = opts.defaultModel ?? "antigravity";
   const catalogScope = agyNativeCatalogScope({
     credentialScope: runtime.credentialScope,
+    runtimeIdentity: `${runtime.identityKey}:${runtime.descriptor.provenance.version}`,
     defaultModel,
     staticModels: opts.staticModels,
   });
@@ -720,7 +719,7 @@ export function makeAgyProfile(opts: {
     mappingFile,
     mappingFile === LEGACY_MAPPING_FILE ? undefined : LEGACY_MAPPING_FILE,
   );
-  return asLocalAdapter({
+  const profile: AgentProfile = asLocalAdapter({
     id: "agy",
     displayName: "Antigravity",
     defaultModel,
@@ -780,6 +779,7 @@ export function makeAgyProfile(opts: {
     spawn() {
       return makeFakeAgyProcess(
         runtime,
+        profile.catalog,
         sessionStore,
         defaultModel,
         opts.printTimeoutSeconds,
@@ -1031,6 +1031,7 @@ export function makeAgyProfile(opts: {
       },
     },
   });
+  return profile;
 }
 
 // ---------------------------------------------------------------------------
@@ -1041,6 +1042,7 @@ type FakeProc = ChildProcessByStdio<Writable, Readable, Readable>;
 
 function makeFakeAgyProcess(
   runtime: AgyLaunchRuntime,
+  catalog: AgentProfile["catalog"],
   sessionStore: AgySessionStore,
   defaultModel: string,
   printTimeoutSeconds?: number,
@@ -1056,6 +1058,7 @@ function makeFakeAgyProcess(
 
   const agent = new AgyAgent(
     runtime,
+    catalog,
     sessionStore,
     defaultModel,
     printTimeoutSeconds,
@@ -1251,10 +1254,17 @@ export const SEAM_AGY_JSON_SCHEMA_META = "seam/agyJsonSchema";
 /**
  * ACP extension carried on a normal config-option update after a real AGY
  * session has learned richer catalog metadata from its own language server.
- * The controller responds by refreshing this exact binding through the normal
- * catalog service; no catalog candidate crosses this private notification.
+ * Carries the actual candidate to the normal catalog service; older adapters
+ * may still send true to request a separate fetch.
  */
 export const SEAM_AGY_CATALOG_REFRESH_META = "seam/agyCatalogRefresh";
+export const SEAM_AGY_CONTEXT_WINDOW_META = "seam/agyContextWindow";
+
+export interface AgyContextWindowSeed {
+  modelId: string;
+  scopeRef: string;
+  maxTokens: number;
+}
 
 /**
  * Pure argv for one print-mode turn, so the flag set stays directly
@@ -1372,6 +1382,7 @@ class AgyAgent implements Agent {
 
   constructor(
     private readonly runtime: AgyLaunchRuntime,
+    private readonly catalog: AgentProfile["catalog"],
     private readonly sessionStore: AgySessionStore,
     private readonly defaultModel: string,
     private readonly printTimeoutSeconds?: number,
@@ -1749,7 +1760,10 @@ class AgyAgent implements Agent {
     // A turn without an exact model would let the native CLI consult global
     // settings; deleting this guard breaks isolation even if selection failed.
     if (!currentModel) throw new Error("AGY session has no model selection");
-    let maxTokens = agyContextWindow(catalog, currentModel);
+    const seed = params._meta?.[SEAM_AGY_CONTEXT_WINDOW_META] as AgyContextWindowSeed | undefined;
+    const seededWindow = seed?.modelId === currentModel.modelId && seed.scopeRef === this.catalog.scope().fingerprint
+      && Number.isSafeInteger(seed.maxTokens) && seed.maxTokens > 0 ? seed.maxTokens : undefined;
+    let maxTokens = currentModel.maxTokens || seededWindow || agyContextWindow(catalog, currentModel);
 
     // Linux limits each individual argv/envp string to MAX_ARG_STRLEN
     // (PAGE_SIZE * 32 = 131,072 bytes on x86-64), independent of the overall
@@ -1813,6 +1827,7 @@ class AgyAgent implements Agent {
     // Clean post-discovery exit lets the LS flush its final frames. Abnormal
     // exit, timeout and external cancellation abort all turn-owned IO.
     const cancelAbort = runRef.abort;
+    let translator: AgyNativeTranslator | undefined;
 
     try {
       const ls = await discoverAgyLs({
@@ -1829,14 +1844,19 @@ class AgyAgent implements Agent {
         if (!available) return;
         const enriched = await getCatalog(this.runtime);
         const enrichedCurrent = enriched.find((entry) => entry.modelId === currentModel.modelId);
-        maxTokens = agyContextWindow(enriched, enrichedCurrent ?? currentModel);
+        maxTokens = enrichedCurrent?.maxTokens || seededWindow || agyContextWindow(enriched, currentModel);
+        const corrected = translator?.setContextWindow(maxTokens);
+        if (corrected && this.conn) {
+          await this.conn.sessionUpdate({ sessionId: params.sessionId,
+            update: { sessionUpdate: "usage_update", ...corrected } as any });
+        }
         if (this.catalogRefreshSignalled || !this.conn) return;
         await this.conn.sessionUpdate({
           sessionId: params.sessionId,
           update: {
             sessionUpdate: "config_option_update",
             configOptions: buildAgyConfigOptions(enriched, sess.modelId),
-            _meta: { [SEAM_AGY_CATALOG_REFRESH_META]: true },
+            _meta: { [SEAM_AGY_CATALOG_REFRESH_META]: await this.catalog.fetch() },
           },
         });
         this.catalogRefreshSignalled = true;
@@ -1877,7 +1897,7 @@ class AgyAgent implements Agent {
         }
       }
 
-      const translator = new AgyNativeTranslator({
+      translator = new AgyNativeTranslator({
         sessionId: params.sessionId,
         replayThrough: skipUpTo,
         maxTokens,

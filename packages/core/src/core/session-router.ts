@@ -1717,11 +1717,12 @@ export class SessionRouter {
         if (!snapshot || snapshot.candidate.scope.fingerprint !== scope?.fingerprint) return;
         const row = snapshot.candidate.models.find(row => row.id === model);
         const maxTokens = row?.context.effective;
-        const observedAt = row?.evidence?.filter(evidence => evidence.kind === "live-observation"
+        const observation = row?.evidence?.filter(evidence => evidence.kind === "live-observation"
           && evidence.scopeRef === scope.fingerprint && evidence.resolvedModel === model
           && evidence.context?.effective === maxTokens)
-          .map(evidence => evidence.observedAt).sort().at(-1);
-        return maxTokens ? { modelId: model, scopeRef: scope.fingerprint, maxTokens, observedAt } : undefined;
+          .sort((a, b) => (a.observedAt ?? "").localeCompare(b.observedAt ?? "")).at(-1);
+        return maxTokens ? { modelId: model, scopeRef: scope.fingerprint, maxTokens,
+          observedAt: observation?.observedAt, runtimeVersion: observation?.runtimeVersion } : undefined;
       },
       ...this.clientOptions(record),
       onSessionModes: info => {

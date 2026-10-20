@@ -644,19 +644,17 @@ async function deleteNativeSessionArtifacts(cascadeId: string | undefined): Prom
 
 export interface AgyNativeCatalogScopeOptions {
   credentialScope?: string;
-  runtimeIdentity?: string;
   defaultModel: string;
   staticModels?: ReadonlyArray<{ modelId: string; name: string; contextLimit?: number }>;
 }
 
-/** Binding-local runtime/account/selection identity for catalog observations. */
+/** Binding-local account/selection identity, independent of CLI upgrades. */
 export function agyNativeCatalogScope(opts: AgyNativeCatalogScopeOptions): CatalogScope {
   const credentialProfile = opts.credentialScope?.trim() || "antigravity-oauth:default";
   if (!/^[A-Za-z0-9][A-Za-z0-9._:/-]{0,63}$/.test(credentialProfile) || path.isAbsolute(credentialProfile)) {
     throw new Error("AGY_CREDENTIAL_SCOPE must be a non-secret semantic identifier");
   }
   const selection = {
-    runtimeIdentity: opts.runtimeIdentity ?? null,
     defaultModel: opts.defaultModel,
     source: opts.staticModels?.length ? "configured+live-context" : "live-discovery",
     models: (opts.staticModels ?? []).map((model) => ({
@@ -708,7 +706,6 @@ export function makeAgyProfile(opts: {
   const defaultModel = opts.defaultModel ?? "antigravity";
   const catalogScope = agyNativeCatalogScope({
     credentialScope: runtime.credentialScope,
-    runtimeIdentity: `${runtime.identityKey}:${runtime.descriptor.provenance.version}`,
     defaultModel,
     staticModels: opts.staticModels,
   });
@@ -1266,6 +1263,7 @@ export interface AgyContextWindowSeed {
   scopeRef: string;
   maxTokens: number;
   observedAt?: string;
+  runtimeVersion?: string;
 }
 
 /**
@@ -1767,11 +1765,13 @@ class AgyAgent implements Agent {
       && Number.isSafeInteger(seed.maxTokens) && seed.maxTokens > 0 ? seed : undefined;
     const local = currentModel.maxTokens > 0 ? {
       maxTokens: currentModel.maxTokens, observedAt: currentModel.metadataObservedAt,
+      runtimeVersion: currentModel.metadataRuntimeVersion,
     } : undefined;
     const known = local && (!cached || Date.parse(local.observedAt ?? "") > (Date.parse(cached.observedAt ?? "") || 0))
       ? local : cached ?? local;
     const observedAt = Date.parse(known?.observedAt ?? "");
     const reverify = !known || !Number.isFinite(observedAt) || Date.now() - observedAt >= AGY_CONTEXT_WINDOW_TTL_MS
+      || known.runtimeVersion !== this.runtime.descriptor.provenance.version
       || (this.catalogModel !== undefined && this.catalogModel !== currentModel.modelId);
     this.catalogModel = currentModel.modelId;
     // Expiry requests verification; it never discards an observed capacity.
@@ -2597,6 +2597,7 @@ export interface AgyCatalogEntry {
   maxTokens: number;
   /** Present only when rich fields came from this runtime's real-session LS. */
   metadataObservedAt?: string;
+  metadataRuntimeVersion?: string;
 }
 
 function agyManifestModel(
@@ -2610,7 +2611,7 @@ function agyManifestModel(
     kind: "live-observation",
     source: "agy language server",
     observedAt: row.metadataObservedAt,
-    runtimeVersion,
+    runtimeVersion: row.metadataRuntimeVersion ?? runtimeVersion,
     adapterVersion: AGENT_ADAPTER_VERSION,
     scopeRef,
     resolvedModel: configured.modelId,
@@ -2751,6 +2752,7 @@ const catalogRowsPromises = new Map<string, Promise<AgyCatalogEntry[]>>();
 const sessionCatalogMetadata = new Map<string, {
   rows: AgyCatalogEntry[];
   observedAt: string;
+  runtimeVersion: string;
 }>();
 
 function catalogFailure(error: unknown): never {
@@ -2786,7 +2788,7 @@ async function getCatalogRows(runtime: AgyLaunchRuntime): Promise<AgyCatalogEntr
   if (!cached) catalogRowsPromises.set(runtime.identityKey, base);
   const rows = await base;
   const observed = sessionCatalogMetadata.get(runtime.identityKey);
-  return observed ? mergeAgyCatalogMetadata(rows, observed.rows, observed.observedAt) : rows;
+  return observed ? mergeAgyCatalogMetadata(rows, observed.rows, observed.observedAt, observed.runtimeVersion) : rows;
 }
 
 /**
@@ -3088,6 +3090,7 @@ export function mergeAgyCatalogMetadata(
   selectable: ReadonlyArray<AgyCatalogEntry>,
   observed: ReadonlyArray<AgyCatalogEntry>,
   observedAt?: string,
+  runtimeVersion?: string,
 ): AgyCatalogEntry[] {
   const byId = new Map(observed.map((row) => [row.modelId, row]));
   return selectable.map((row) => {
@@ -3101,6 +3104,7 @@ export function mergeAgyCatalogMetadata(
       supportsImages: rich.supportsImages,
       maxTokens: rich.maxTokens,
       ...(observedAt ? { metadataObservedAt: observedAt } : {}),
+      ...(runtimeVersion ? { metadataRuntimeVersion: runtimeVersion } : {}),
     };
   });
 }
@@ -3135,7 +3139,8 @@ async function learnAgyCatalogFromSession(
         (await readAgyJsonResponse(response)) as { response?: { models?: Record<string, AgyRawModel> } },
       ).filter((row) => selectableIds.has(row.modelId));
       if (parsed.length > 0) {
-        sessionCatalogMetadata.set(runtime.identityKey, { rows: parsed, observedAt: new Date(Date.now()).toISOString() });
+        sessionCatalogMetadata.set(runtime.identityKey, { rows: parsed,
+          observedAt: new Date(Date.now()).toISOString(), runtimeVersion: runtime.descriptor.provenance.version });
         return true;
       }
     } else {

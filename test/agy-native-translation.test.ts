@@ -47,6 +47,17 @@ function events(batches: AgyTranslationBatch[], delivery = "live"): AgyNativeEve
 }
 
 describe("AGY R6 native translation", () => {
+  it("corrects a late-learned window without requiring another token or replaying historical usage", () => {
+    const translator = new AgyNativeTranslator({ sessionId: "late-window", replayThrough: 0, maxTokens: 128_000 });
+    const step = (used: string): AgyStep => ({ type: "CORTEX_STEP_TYPE_PLANNER_RESPONSE",
+      metadata: { modelUsage: { inputTokens: used, outputTokens: "0" } } });
+    translator.translate(0, step("250000"));
+    translator.translate(1, step("120000"));
+    expect((translator as any).setContextWindow(1_048_576)).toEqual({ used: 120_000, size: 1_048_576 });
+    expect(translator.translate(2, step("120001")).events).toContainEqual(expect.objectContaining({
+      kind: "usage", used: 120_001, size: 1_048_576 }));
+  });
+
   it("deterministically translates the observed trace without duplicate thought or tool polls", () => {
     const first = events(translateTrace("turn-one.json"));
     const second = events(translateTrace("turn-one.json"));

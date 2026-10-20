@@ -32,7 +32,7 @@ afterEach(async () => {
 });
 
 function setup(mode: "held-status" | "failed-status" | "held-file" | "held-wrap-up" | "fast" = "fast",
-  logger = pino({ level: "silent" }), platform: "discord" | "google-chat" = "discord") {
+  logger = pino({ level: "silent" }), platform: "discord" | "google-chat" = "discord", agentId = "claude") {
   vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout", "setInterval", "clearInterval"] });
   const dir = mkdtempSync(path.join(tmpdir(), "seam-live-delivery-"));
   const store = new SessionStore(path.join(dir, "test.db"));
@@ -47,7 +47,7 @@ function setup(mode: "held-status" | "failed-status" | "held-file" | "held-wrap-
   let statusReleased = false;
   let run: Promise<void> | undefined;
   const pending: Promise<void>[] = [];
-  const profile = { id: "claude", defaultModel: "fixture-model" } as AgentProfile;
+  const profile = { id: agentId, defaultModel: "fixture-model" } as AgentProfile;
   const runtime = new AgentRuntime({ profile, logger: logger as never,
     spawnFn: () => { throw new Error("provider spawning forbidden"); } });
   const feed = (update: SessionUpdate) => {
@@ -76,7 +76,7 @@ function setup(mode: "held-status" | "failed-status" | "held-file" | "held-wrap-
     sessionInfo: { sessionId: "fixture-acp", availableModels: [], currentModelId: "fixture-model" } });
   const now = new Date().toISOString();
   const record = { id: `${platform}:100`, platform, channelRef: "100", parentRef: null,
-    agentId: "claude", acpSessionId: "fixture-acp", repoPath: dir, configJson: "{}",
+    agentId, acpSessionId: "fixture-acp", repoPath: dir, configJson: "{}",
     createdUtc: now, updatedUtc: now };
   store.upsert(record);
   store.admitInbound({ messageId: "1", platform, channelRef: record.channelRef,
@@ -89,7 +89,7 @@ function setup(mode: "held-status" | "failed-status" | "held-file" | "held-wrap-
     listProfiles: () => [profile], ensureSessionRecord: () => record, getProfile: () => profile,
     getRuntime: () => runtime, getOrStartRuntime: async () => runtime, isBusy: () => runtime.busy,
     abortTurn: vi.fn(async () => "idle"), invalidate: vi.fn(async () => {}),
-    describeConfig: () => ({ agent: { value: "claude" }, location: { value: "local" },
+    describeConfig: () => ({ agent: { value: agentId }, location: { value: "local" },
       model: { value: "fixture-model" }, effort: { value: null }, cwd: { value: dir }, fastMode: { value: false } }),
   });
   const adapter = {
@@ -117,7 +117,7 @@ function setup(mode: "held-status" | "failed-status" | "held-file" | "held-wrap-
   const orch = new Orchestrator({ logger: logger as never, store, renderer: discordRenderer,
     modelCatalog: fixtureModelCatalog([profile]), router: router as never, adapter: adapter as never,
     config: { DATA_DIR: dir, REPOS_ROOT: dir, TURN_TIMEOUT_SECONDS: 60, REPO_EMOJIS: new Map(),
-      DEFAULT_MODEL: "fixture-model", CHANNEL_QUEUE_WEDGE_GRACE_SECONDS: 1,
+      DEFAULT_MODEL: "fixture-model", AGY_AUTO_COMPACT_THRESHOLD: 0.8,
       channelPresets: new Map(), threadPresets: new Map() } as never });
   if (mode === "held-wrap-up") orch.setVoiceConsoleController({
     hasActiveBinding: () => true,
@@ -155,6 +155,19 @@ function setup(mode: "held-status" | "failed-status" | "held-file" | "held-wrap-
 }
 
 describe("live-turn status and answer delivery", () => {
+  it.each([1_048_576, 128_000])("uses the latest AGY window %i for end-of-turn compaction", async size => {
+    const h = setup("fast", undefined, "google-chat", "agy");
+    const compact = vi.spyOn(h.orch as any, "runAgyAutoCompact").mockResolvedValue(undefined);
+    h.prompt.mockImplementationOnce(async () => {
+      await h.feed({ sessionUpdate: "usage_update", used: 120_000, size: 128_000 } as SessionUpdate);
+      await h.feed({ sessionUpdate: "usage_update", used: 120_000, size } as SessionUpdate);
+      await h.feed({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: ANSWER } });
+      return { stopReason: "end_turn" };
+    });
+    await h.run();
+    expect(compact).toHaveBeenCalledTimes(size === 128_000 ? 1 : 0);
+    expect(h.messages).toEqual([ANSWER]);
+  });
   it.each(["google-chat", "discord"] as const)("keeps %s wrap-up owned after early FIFO release, past the old sweep grace", async platform => {
     const h = setup("held-wrap-up", undefined, platform);
     const running = h.run();

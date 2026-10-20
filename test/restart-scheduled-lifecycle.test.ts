@@ -441,9 +441,10 @@ describe("#252 actual isolated scheduler + injectTurn, synthetic transport", () 
     h.adapter.sendPanel.mockRejectedValue(new Error("synthetic output outage"));
     await h.make().runScheduledPrompt(h.row.id, key);
     expect(h.store.turnAttempts.get(key.id)).toMatchObject({ state: "completed", deliveryDone: false });
+    expect(h.store.scheduledOccurrences.get(key.id)?.settled).toBe(true);
     expect(transport.delete).toHaveBeenCalledTimes(1);
     h.adapter.sendPanel.mockImplementation(async channel => ({ channel, id: "recovered" }));
-    await h.make().runScheduledPrompt(h.row.id, key);
+    await h.make().recoverInterruptedTurns();
     expect(transport.prompt).toHaveBeenCalledTimes(1);
     expect(h.store.scheduledOccurrences.get(key.id)?.settled).toBe(true);
     const deliveryCalls = h.adapter.sendPanel.mock.calls.filter(call => call[2]);

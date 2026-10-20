@@ -12532,7 +12532,15 @@ export class Orchestrator {
       });
       await this.runDurableScheduledPrompt(row, key, manualResume, queueFence);
     } finally {
-      try { endActivity(); } finally { endTurn(); }
+      try {
+        const terminal = this.store.turnAttempts.get(key.id);
+        if (terminal?.state === "cancelled") {
+          const occurrence = this.store.scheduledOccurrences.get(key.id);
+          if (occurrence && !occurrence.settled) await this.settleScheduleCancellation(occurrence);
+        } else if (terminal?.state === "completed") this.store.scheduledOccurrences.settle(key.id);
+      } finally {
+        try { endActivity(); } finally { endTurn(); }
+      }
     }
   }
 
@@ -12554,8 +12562,8 @@ export class Orchestrator {
     const saved = this.store.scheduledOccurrences.get(key.id);
     const prior = this.store.turnAttempts.get(key.id);
     const reauthAccepted = prior?.stalledReason?.startsWith(REAUTH_COMPLETED_PREFIX) === true;
-    if (saved?.settled) return;
     if (saved && prior?.state === "completed") { await this.deliverScheduledCompletion(saved, prior); return; }
+    if (saved?.settled) return;
     if (saved && prior?.state === "cancelled") { await this.settleScheduleCancellation(saved); return; }
     if (saved && prior?.state === "suspended" && prior.remoteRecovery) {
       await this.adoptRemoteRecovery(prior);
@@ -12647,11 +12655,6 @@ export class Orchestrator {
             status: "failed", error: "scheduled execution failed", finishedUtc: new Date().toISOString() });
         }
         throw err;
-      }
-      const terminal = this.store.turnAttempts.get(key.id)!;
-      if (terminal.state === "cancelled") await this.settleScheduleCancellation(occurrence);
-      else if (terminal.state === "completed" && terminal.deliveryDone) {
-        this.store.scheduledOccurrences.settle(key.id);
       }
     } catch (err) {
       if (!(err instanceof DispatchSuspendedError)) throw err;
@@ -15963,6 +15966,7 @@ export class Orchestrator {
    * Two processes on one DATA_DIR would double-resume everything.
    */
   async recoverInterruptedTurns(): Promise<void> {
+    await this.recoverScheduledOutput();
     const enabled = this.config.SEAM_TURN_RESUME_ENABLED === true;
     const maxAge =
       this.config.SEAM_TURN_RESUME_MAX_AGE_SECONDS ?? TURN_RESUME_MAX_AGE_SECONDS;
@@ -16287,6 +16291,28 @@ export class Orchestrator {
     }
     this.store.turnAttempts.markDeliveryDone(attempt.id);
     return "delivered";
+  }
+
+  /** Release terminal occurrences before timers start; delivery remains recoverable. */
+  private async recoverScheduledOutput(): Promise<void> {
+    for (const state of ["cancelled", "completed"] as const) {
+      for (const attempt of this.store.turnAttempts.list(state)) {
+        if (attempt.source !== "schedule") continue;
+        const occurrence = this.store.scheduledOccurrences.get(attempt.id);
+        if (!occurrence) continue;
+        if (state === "cancelled") {
+          if (!occurrence.settled) await this.settleScheduleCancellation(occurrence);
+          continue;
+        }
+        if (occurrence.settled && this.store.turnAttempts.isDeliveryDispositionTerminal(attempt.id)) continue;
+        this.store.scheduledOccurrences.settle(attempt.id);
+        try {
+          await this.deliverScheduledCompletion(occurrence, attempt);
+        } catch (err) {
+          this.logger.warn({ id: attempt.id, err }, "captured scheduled output delivery deferred");
+        }
+      }
+    }
   }
 
   /** Deliver the captured winner, never re-enter a provider. */

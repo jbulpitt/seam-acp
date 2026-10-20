@@ -9,7 +9,7 @@ function worker(eligible = true) {
   const child = Object.assign(new EventEmitter(), { stdin: new PassThrough(), stdout: new PassThrough(), stderr: new PassThrough() });
   child.stdin.on("finish", () => child.emit("close", 0, null));
   const launch = vi.fn(() => {
-    queueMicrotask(() => child.stdout.write(`${JSON.stringify({ eligible, reason: eligible ? "AC power" : "battery 49% (requires 50% or AC)" })}\n`));
+    queueMicrotask(() => child.stdout.write(`${JSON.stringify({ eligible, reason: eligible ? "AC power" : "battery 14% (requires 15% or AC)" })}\n`));
     return child;
   });
   return { child, launch };
@@ -18,8 +18,8 @@ function worker(eligible = true) {
 describe("Mac rollout power and awake lifetime", () => {
   it.each([
     ["Now drawing from 'AC Power'\n20%; charging", true],
-    ["Now drawing from 'Battery Power'\n50%; discharging", true],
-    ["Now drawing from 'Battery Power'\n49%; discharging", false],
+    ["Now drawing from 'Battery Power'\n15%; discharging", true],
+    ["Now drawing from 'Battery Power'\n14%; discharging", false],
   ])("reads the actual pmset output %s", (text, eligible) => expect(macPowerStatus(text).eligible).toBe(eligible));
 
   it("reports the unreadable/unrecognized power state instead of treating it as safe", () => {

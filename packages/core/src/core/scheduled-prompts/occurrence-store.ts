@@ -33,6 +33,9 @@ export class ScheduledOccurrenceStore {
   /** Per-schedule durable overlap guard, preserving skip-not-stack policy. */
   reserve(key: ScheduledOccurrenceKey, row: ScheduledPrompt, execution: ScheduledExecutionIdentity | null = null): ScheduledOccurrence | null {
     return this.db.transaction(() => {
+      this.db.prepare(`UPDATE scheduled_occurrences SET settled=1 WHERE schedule_id=? AND settled=0
+        AND EXISTS (SELECT 1 FROM turn_attempts WHERE turn_attempts.id=scheduled_occurrences.id
+          AND state IN ('cancelled','completed'))`).run(row.id);
       const old = this.get(key.id);
       if (old) return old.scheduleId === row.id ? old : null;
       if (this.db.prepare("SELECT 1 FROM scheduled_occurrences WHERE schedule_id=? AND settled=0").get(row.id)) return null;

@@ -241,6 +241,9 @@ const server = http.createServer(async (request, response) => {
   }
 
   if (request.url?.endsWith("/GetAvailableModels")) {
+    if (process.env.SEAM_AGY_WINDOW_REQUESTS) {
+      fs.appendFileSync(process.env.SEAM_AGY_WINDOW_REQUESTS, `${JSON.stringify({ rpc, pid: process.pid })}\n`);
+    }
     const metadataMode = process.env.SEAM_AGY_R4B_METADATA_MODE_FILE
       ? fs.readFileSync(process.env.SEAM_AGY_R4B_METADATA_MODE_FILE, "utf8").trim()
       : process.env.SEAM_AGY_R4B_METADATA_MODE;
@@ -259,7 +262,9 @@ const server = http.createServer(async (request, response) => {
         models: {
           [primaryModelId]: {
             displayName: "Fixture Native Model",
-            maxTokens: Number(process.env.SEAM_AGY_R4B_CONTEXT_WINDOW ?? 4096),
+            maxTokens: Number(process.env.SEAM_AGY_WINDOW_VALUE_FILE
+              ? fs.readFileSync(process.env.SEAM_AGY_WINDOW_VALUE_FILE, "utf8")
+              : process.env.SEAM_AGY_R4B_CONTEXT_WINDOW ?? 4096),
             recommended: true,
             supportsThinking: true,
             supportsImages: false,

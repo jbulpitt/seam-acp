@@ -3,7 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { pino } from "pino";
 import { agyNativeCatalogScope, makeAgyProfile, manifestCatalogSource,
   type AdapterCatalogCandidate, type AgentProfile } from "@seam/adapters";
@@ -13,6 +13,7 @@ import { SessionStore } from "../packages/core/src/core/session-store.js";
 import { SessionRouter } from "../packages/core/src/core/session-router.js";
 import { createOrdinaryAgyFixture } from "./helpers/agy-runtime-fixture.js";
 import { localBridgeWiring } from "./local-bridge-fixture.js";
+import { AgentRuntime } from "../packages/core/src/agents/agent-runtime.js";
 import type { Logger } from "../packages/core/src/lib/logger.js";
 
 const logger = pino({ level: "silent" }) as unknown as Logger;
@@ -20,7 +21,7 @@ const window = 1_048_576;
 const binding = { agentId: "agy", location: "gh-server" };
 const dirs: string[] = [];
 const temporary = () => { const dir = fs.mkdtempSync(path.join(os.tmpdir(), "seam-agy-window-")); dirs.push(dir); return dir; };
-afterEach(() => { for (const dir of dirs.splice(0)) fs.rmSync(dir, { recursive: true, force: true }); });
+afterEach(() => { vi.restoreAllMocks(); for (const dir of dirs.splice(0)) fs.rmSync(dir, { recursive: true, force: true }); });
 
 async function candidate(limit?: number, identity = "runtime-a"): Promise<AdapterCatalogCandidate> {
   const source = manifestCatalogSource({ provider: "google-antigravity", backend: "agy-native-language-server-v1",
@@ -106,6 +107,20 @@ describe("durable AGY learned context windows", () => {
     } finally { store.close(); }
   });
 
+  it("keeps a newer observation when an older resolution finishes last", async () => {
+    const store = new ModelCatalogStore(path.join(temporary(), "seam.db"));
+    const newer = await candidate(window);
+    newer.models[0]!.evidence![0]!.observedAt = "2026-10-20T00:00:00.000Z";
+    const older = await candidate(200_000);
+    const catalog = service(store, async () => newer);
+    try {
+      await catalog.refresh(binding);
+      await catalog.refresh(binding, "session", { candidate: older } as never);
+      expect(catalog.model(binding, "argon-high")?.context.effective).toBe(window);
+      expect(catalog.model(binding, "argon-high")?.evidence![0]!.observedAt).toBe("2026-10-20T00:00:00.000Z");
+    } finally { store.close(); }
+  });
+
   it("does not let an in-flight cold refresh swallow the real session observation", async () => {
     const store = new ModelCatalogStore(path.join(temporary(), "seam.db"));
     const cold = await candidate(), rich = await candidate(window);
@@ -188,4 +203,115 @@ describe("durable AGY learned context windows", () => {
       expect(secondUsage.every(size => size === window)).toBe(true);
     } finally { await h.router.disposeAll(); catalogs.close(); sessions.close(); fixture.cleanup(); }
   }, 45_000);
+});
+
+const ttl = 14 * 24 * 60 * 60 * 1_000;
+
+async function windowSubject(age?: number, unavailable = false) {
+  const dir = temporary();
+  const requests = path.join(dir, "requests.ndjson"), value = path.join(dir, "window");
+  fs.writeFileSync(value, String(window));
+  const fixtureDir = fileURLToPath(new URL("./fixtures/agy-native-capabilities/", import.meta.url));
+  const fixture = createOrdinaryAgyFixture({ source: path.join(fixtureDir, "fake-native-agy.mjs"), cwd: dir,
+    environment: { SEAM_AGY_CAPABILITY_FIXTURE_DIR: fixtureDir, SEAM_AGY_WINDOW_REQUESTS: requests,
+      SEAM_AGY_WINDOW_VALUE_FILE: value, SEAM_AGY_R4B_CONTEXT_WINDOW: String(window),
+      ...(unavailable ? { SEAM_AGY_R4B_METADATA_MODE: "unavailable" } : {}) } });
+  const profile = makeAgyProfile({ runtime: fixture.runtime, dataDir: dir,
+    defaultModel: "fixture-native-model", exposeGlobalStaging: false });
+  let known = await profile.catalog.fetch();
+  if (age !== undefined) for (const row of known.models) {
+    row.context = { native: window, maximum: window, effective: window };
+    row.evidence = [{ kind: "live-observation", source: "agy language server",
+      observedAt: new Date(Date.now() - age).toISOString(), resolvedModel: row.id,
+      scopeRef: known.scope.fingerprint, adapterVersion: 4,
+      context: { native: window, maximum: window, effective: window, method: "GetAvailableModels" } }];
+  }
+  const publications: AdapterCatalogCandidate[] = [];
+  const runtime = new AgentRuntime({ profile, logger, spawnFn: profile.spawn.bind(profile),
+    catalogContext: model => {
+      const row = known.models.find(row => row.id === model);
+      return row?.context.effective ? { modelId: model, scopeRef: known.scope.fingerprint,
+        maxTokens: row.context.effective, observedAt: row.evidence?.[0]?.observedAt } as never : undefined;
+    },
+    onCatalogRefresh: async observed => { if (observed) { known = observed; publications.push(observed); } },
+  });
+  try { await runtime.start(); } catch (error) { await runtime.dispose(); fixture.cleanup(); throw error; }
+  return { runtime, publications, value,
+    known: () => known,
+    requests: () => fs.existsSync(requests) ? fs.readFileSync(requests, "utf8").trim().split("\n").length : 0,
+    async turn(model = "fixture-native-model") {
+      await runtime.newSession({ cwd: dir, model, strictModel: true });
+      const usage: number[] = [];
+      const off = runtime.onEvent(async event => { if (event.kind === "usage-update") usage.push(event.size); });
+      try { await runtime.prompt("capability-turn-one"); await runtime.idle(); return usage; }
+      finally { if (typeof off === "function") off(); }
+    },
+    async close() { await runtime.dispose(); fixture.cleanup(); },
+  };
+}
+
+describe.sequential("durable AGY window TTL", () => {
+  it("does not resolve or re-signal on each prompt while the persisted window is fresh", async () => {
+    const h = await windowSubject(ttl - 60_000);
+    try {
+      expect((await h.turn())[0]).toBe(window);
+      expect((await h.turn())[0]).toBe(window);
+      expect(h.requests()).toBe(0); expect(h.publications).toHaveLength(0);
+    } finally { await h.close(); }
+  }, 30_000);
+
+  it("keeps an expired value and timestamp when verification fails", async () => {
+    const h = await windowSubject(ttl + 60_000, true);
+    const before = h.known().models[0]!.evidence![0]!.observedAt;
+    try {
+      expect((await h.turn()).every(size => size === window)).toBe(true);
+      expect(h.requests()).toBe(1); expect(h.publications).toHaveLength(0);
+      expect(h.known().models[0]!.evidence![0]!.observedAt).toBe(before);
+    } finally { await h.close(); }
+  }, 30_000);
+
+  it.each([window, 200_000])("reverifies an expired value, publishes %i and refreshes its LS timestamp", async resolved => {
+    const h = await windowSubject(ttl + 60_000);
+    fs.writeFileSync(h.value, String(resolved));
+    const before = Date.now();
+    try {
+      const usage = await h.turn();
+      expect(h.requests()).toBe(1); expect(h.publications).toHaveLength(1);
+      const row = h.known().models.find(row => row.id === "fixture-native-model")!;
+      expect(row.context.effective).toBe(resolved);
+      expect(Date.parse(row.evidence![0]!.observedAt)).toBeGreaterThanOrEqual(before);
+      expect(usage.at(-1)).toBe(resolved);
+      await h.turn();
+      expect(h.requests()).toBe(1); expect(h.publications).toHaveLength(1);
+    } finally { await h.close(); }
+  }, 30_000);
+
+  it("reverifies in a long-lived child only after the actual LS observation expires", async () => {
+    const h = await windowSubject();
+    const realNow = Date.now.bind(Date);
+    let offset = 0;
+    vi.spyOn(Date, "now").mockImplementation(() => realNow() + offset);
+    try {
+      await h.turn(); await h.turn();
+      expect(h.requests()).toBe(1); expect(h.publications).toHaveLength(1);
+      offset = ttl + 60_000;
+      await h.turn();
+      expect(h.requests()).toBe(2); expect(h.publications).toHaveLength(2);
+      expect(Date.parse(h.known().models[0]!.evidence![0]!.observedAt)).toBeGreaterThan(realNow() + ttl);
+      await h.turn();
+      expect(h.requests()).toBe(2); expect(h.publications).toHaveLength(2);
+    } finally { vi.restoreAllMocks(); await h.close(); }
+  }, 45_000);
+
+  it("reverifies when the exact selected model changes even with fresh cached rows", async () => {
+    const h = await windowSubject(60_000);
+    try {
+      await h.turn();
+      expect(h.requests()).toBe(0);
+      await h.turn("fixture-native-model-low");
+      expect(h.requests()).toBe(1); expect(h.publications).toHaveLength(1);
+      await h.turn("fixture-native-model-low");
+      expect(h.requests()).toBe(1);
+    } finally { await h.close(); }
+  }, 30_000);
 });

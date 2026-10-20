@@ -549,7 +549,7 @@ determines "outdated": a newer bridge is not rolled back during a bridges-first,
 controller-last deployment.
 
 For Darwin, mutating rollout phases read `pmset -g batt` and proceed only on AC
-or at least 50% battery. A separate SSH worker holds
+or at least 15% battery. A separate SSH worker holds
 `caffeinate -i -s -w <worker-pid>` across upload, install, cutover and verification.
 Closing that worker releases the inhibitor on success or failure. A low-power
 host is reported as skipped, not updated. Rollback still requires its exact

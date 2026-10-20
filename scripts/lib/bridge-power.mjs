@@ -5,7 +5,7 @@ export function macPowerStatus(text) {
   const percent = /(\d+)%/.exec(text)?.[1];
   if (!text.includes("'Battery Power'") || percent === undefined) throw new Error(`unrecognized pmset power state: ${text.trim()}`);
   const battery = Number(percent);
-  return { eligible: battery >= 50, reason: `battery ${battery}% (requires 50% or AC)` };
+  return { eligible: battery >= 15, reason: `battery ${battery}% (requires 15% or AC)` };
 }
 
 export class MacPowerSkip extends Error {}

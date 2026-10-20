@@ -117,7 +117,9 @@ describe("durable AGY learned context windows", () => {
       await catalog.refresh(binding);
       await catalog.refresh(binding, "session", { candidate: older } as never);
       expect(catalog.model(binding, "argon-high")?.context.effective).toBe(window);
-      expect(catalog.model(binding, "argon-high")?.evidence![0]!.observedAt).toBe("2026-10-20T00:00:00.000Z");
+      expect(catalog.model(binding, "argon-high")?.evidence).toContainEqual(expect.objectContaining({
+        observedAt: "2026-10-20T00:00:00.000Z", context: expect.objectContaining({ effective: window }),
+      }));
     } finally { store.close(); }
   });
 

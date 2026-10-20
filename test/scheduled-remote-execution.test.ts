@@ -8,7 +8,7 @@ import { EventEmitter } from "node:events";
 import { PassThrough, Readable, Writable } from "node:stream";
 import { setTimeout as delay } from "node:timers/promises";
 import { agent, methods, ndJsonStream, PROTOCOL_VERSION, RequestError } from "@agentclientprotocol/sdk";
-import { BridgeUnreachableError, classifyAgyError, readErrorClassification, SEAM_AGY_STDOUT_FALLBACK_META, type AgentProfile } from "@seam/adapters";
+import { BridgeUnreachableError, classifyAgyError, manifestCatalogSource, readErrorClassification, SEAM_AGY_STDOUT_FALLBACK_META, type AgentProfile } from "@seam/adapters";
 import { pino } from "pino";
 import { Orchestrator } from "../packages/core/src/platforms/discord/orchestrator.js";
 import { SessionStore } from "../packages/core/src/core/session-store.js";
@@ -80,6 +80,9 @@ function setup(location = REMOTE) {
   }
   const localSpawn = vi.fn(spawn), remoteSpawn = vi.fn(spawn), localDelete = vi.fn(async () => {});
   const profile = { id: "agy", displayName: "Synthetic", defaultModel: MODEL,
+    catalog: manifestCatalogSource({ provider: "synthetic", backend: "fixture", credentialProfile: "test",
+      defaultModel: MODEL, source: "fixture", adapterVersion: 1,
+      models: () => [MODEL, OVERRIDE_MODEL].map(modelId => ({ modelId, name: modelId })) }),
     classifyError: classifyAgyError,
     effort: { mechanism: "spawnArgs", levels: ["high"] }, spawn: localSpawn,
     sessionManager: { deleteSession: localDelete } } as unknown as AgentProfile;

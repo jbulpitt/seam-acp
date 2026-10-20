@@ -89,6 +89,49 @@ function rewriteAsLegacy(store: SessionStore, id: string, legacy = "a".repeat(64
 }
 
 describe("#252 actual isolated scheduler + injectTurn, synthetic transport", () => {
+  it.each(["cancelled", "completed", "pending", "active", "suspended", "missing"] as const)(
+    "a cron fire reconciles a prior %s attempt before deciding whether it is still running", async state => {
+      const h = setup("live");
+      const orch = h.make();
+      const old = scheduledOccurrenceKey(h.row.id, "2026-10-19T22:30:00.000Z");
+      const execution = orch.scheduleExecution(h.row);
+      h.store.scheduledOccurrences.prepare(old, h.row, () => execution);
+      const spec = { id: old.id, target: h.row.channelRef, prompt: h.row.promptText,
+        kind: "scheduled" as const, session: "live" as const, createdUtc: old.scheduledFor! };
+      if (state === "pending") h.store.turnAttempts.admit(spec);
+      else if (state !== "missing") {
+        const attempt = h.store.turnAttempts.claim(spec, execution.fingerprint, "old-boot", "schedule");
+        h.store.turnAttempts.bind(attempt, "live-session");
+        h.store.turnAttempts.startPrompt(attempt);
+        if (state === "cancelled") h.store.turnAttempts.cancel(old.id);
+        else if (state === "completed") h.store.turnAttempts.complete(attempt, {
+          id: old.id, target: h.row.channelRef, status: "completed", output: "SAVED RESULT",
+          finishedUtc: new Date().toISOString() });
+        else if (state === "suspended") h.store.turnAttempts.suspend(old.id, "old-boot");
+      }
+      transport.prompt.mockResolvedValue({ stopReason: "end_turn" });
+      const onFire = vi.fn((id: string, key: ReturnType<typeof scheduledOccurrenceKey>) => orch.runScheduledPrompt(id, key));
+      const manager = new ScheduledPromptManager({ store: h.store, logger: pino({ level: "silent" }) as any,
+        resolveExecution: row => orch.scheduleExecution(row), onFire });
+      cleanups.push(() => manager.stop());
+      const next = scheduledOccurrenceKey(h.row.id, "2026-10-20T12:00:00.000Z");
+      const fire = () => manager["fire"](h.row.id, next);
+      await fire();
+      const terminal = state === "cancelled" || state === "completed";
+      expect(h.store.scheduledOccurrences.get(old.id)?.settled).toBe(terminal);
+      expect(transport.prompt).toHaveBeenCalledTimes(terminal ? 1 : 0);
+      if (terminal) {
+        expect(onFire).toHaveBeenCalledExactlyOnceWith(h.row.id, next);
+        expect(h.store.turnAttempts.get(next.id)).toMatchObject({ state: "completed", promptStarted: true });
+        await fire();
+        expect(transport.prompt).toHaveBeenCalledTimes(1);
+        expect(h.store.turnAttempts.get(old.id)?.deliveryDone).toBe(false);
+      } else {
+        expect(onFire).not.toHaveBeenCalled();
+        expect(h.store.getScheduled(h.row.id)?.lastStatus).toBe("skipped: still running");
+      }
+    });
+
   it("settles a live occurrence superseded by a human message and admits the next slot without replay", async () => {
     const h = setup("live");
     const orch = h.make();

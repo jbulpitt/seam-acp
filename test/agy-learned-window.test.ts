@@ -23,9 +23,9 @@ const dirs: string[] = [];
 const temporary = () => { const dir = fs.mkdtempSync(path.join(os.tmpdir(), "seam-agy-window-")); dirs.push(dir); return dir; };
 afterEach(() => { vi.restoreAllMocks(); for (const dir of dirs.splice(0)) fs.rmSync(dir, { recursive: true, force: true }); });
 
-async function candidate(limit?: number, identity = "runtime-a"): Promise<AdapterCatalogCandidate> {
+async function candidate(limit?: number, identity = "account-a"): Promise<AdapterCatalogCandidate> {
   const source = manifestCatalogSource({ provider: "google-antigravity", backend: "agy-native-language-server-v1",
-    credentialProfile: "antigravity-oauth:durable-test", policy: identity, defaultModel: "argon-high",
+    credentialProfile: `antigravity-oauth:${identity}`, policy: "durable-test", defaultModel: "argon-high",
     source: "agy-models", adapterVersion: 4,
     models: () => [{ modelId: "argon-high", name: "Argon 4", ...(limit ? { contextLimit: limit } : {}) }],
   });
@@ -79,7 +79,7 @@ describe("durable AGY learned context windows", () => {
     } finally { reopened.close(); }
   });
 
-  it("does not lend a learned limit to another host, runtime, account or model", async () => {
+  it("does not lend a learned limit to another host, account or model", async () => {
     const store = new ModelCatalogStore(path.join(temporary(), "seam.db"));
     let current = await candidate(window);
     const catalog = service(store, async () => current);
@@ -88,7 +88,7 @@ describe("durable AGY learned context windows", () => {
       current = await candidate();
       await catalog.refresh({ ...binding, location: "another-host" });
       expect(catalog.model({ ...binding, location: "another-host" }, "argon-high")?.context.effective).toBeNull();
-      current = await candidate(undefined, "another-runtime-or-account");
+      current = await candidate(undefined, "another-account");
       await catalog.refresh(binding);
       expect(catalog.model(binding, "argon-high")?.context.effective).toBeNull();
       expect(catalog.model(binding, "argon-high-alias")).toBeNull();
@@ -141,11 +141,30 @@ describe("durable AGY learned context windows", () => {
     } finally { store.close(); }
   });
 
-  it("includes the native runtime identity in the AGY catalog scope", () => {
+  it("keeps the AGY catalog scope stable across runtime installs and version bumps", () => {
     const opts = { defaultModel: "argon-high", credentialScope: "antigravity-oauth:primary" };
     const first = agyNativeCatalogScope({ ...opts, runtimeIdentity: "runtime-a" } as never);
     const second = agyNativeCatalogScope({ ...opts, runtimeIdentity: "runtime-b" } as never);
-    expect(first.fingerprint).not.toBe(second.fingerprint);
+    expect(first.fingerprint).toBe(second.fingerprint);
+  });
+
+  it("retains a learned window after a CLI version bump and controller restart", async () => {
+    const db = path.join(temporary(), "seam.db");
+    let store = new ModelCatalogStore(db);
+    const learned = await candidate(window);
+    learned.cliVersion = "1.4.3";
+    await service(store, async () => learned).refresh(binding);
+    store.close(); store = new ModelCatalogStore(db);
+    const upgraded = await candidate(); upgraded.cliVersion = "1.4.4";
+    try {
+      const catalog = service(store, async () => upgraded);
+      await catalog.refresh(binding);
+      expect(catalog.lookup(binding).snapshot?.candidate.cliVersion).toBe("1.4.4");
+      expect(catalog.model(binding, "argon-high")?.context.effective).toBe(window);
+      expect(catalog.model(binding, "argon-high")?.evidence).toContainEqual(expect.objectContaining({
+        runtimeVersion: "1.3.5", observedAt: "2026-10-17T16:00:00.000Z",
+      }));
+    } finally { store.close(); }
   });
 
   it("starts a second fresh adapter process at its durable learned limit without a new metadata RPC", async () => {
@@ -209,7 +228,7 @@ describe("durable AGY learned context windows", () => {
 
 const ttl = 14 * 24 * 60 * 60 * 1_000;
 
-async function windowSubject(age?: number, unavailable = false) {
+async function windowSubject(age?: number, unavailable = false, seedVersion?: string) {
   const dir = temporary();
   const requests = path.join(dir, "requests.ndjson"), value = path.join(dir, "window");
   fs.writeFileSync(value, String(window));
@@ -225,6 +244,7 @@ async function windowSubject(age?: number, unavailable = false) {
     row.context = { native: window, maximum: window, effective: window };
     row.evidence = [{ kind: "live-observation", source: "agy language server",
       observedAt: new Date(Date.now() - age).toISOString(), resolvedModel: row.id,
+      runtimeVersion: seedVersion ?? profile.runtime!.provenance.version,
       scopeRef: known.scope.fingerprint, adapterVersion: 4,
       context: { native: window, maximum: window, effective: window, method: "GetAvailableModels" } }];
   }
@@ -233,7 +253,8 @@ async function windowSubject(age?: number, unavailable = false) {
     catalogContext: model => {
       const row = known.models.find(row => row.id === model);
       return row?.context.effective ? { modelId: model, scopeRef: known.scope.fingerprint,
-        maxTokens: row.context.effective, observedAt: row.evidence?.[0]?.observedAt } as never : undefined;
+        maxTokens: row.context.effective, observedAt: row.evidence?.[0]?.observedAt,
+        runtimeVersion: row.evidence?.[0]?.runtimeVersion } as never : undefined;
     },
     onCatalogRefresh: async observed => { if (observed) { known = observed; publications.push(observed); } },
   });
@@ -253,6 +274,21 @@ async function windowSubject(age?: number, unavailable = false) {
 }
 
 describe.sequential("durable AGY window TTL", () => {
+  it("starts a version-bumped runtime at the cached window, verifies once and publishes all selectable windows", async () => {
+    const h = await windowSubject(60_000, false, "agy previous version");
+    try {
+      const usage = await h.turn();
+      expect(usage[0]).toBe(window);
+      expect(h.requests()).toBe(1); expect(h.publications).toHaveLength(1);
+      expect(h.known().models.map(row => [row.id, row.context.effective])).toEqual([
+        ["fixture-native-model", window], ["fixture-native-model-low", window],
+      ]);
+      expect(h.known().models.every(row => row.evidence?.[0]?.runtimeVersion === "agy fixture 1.1.28")).toBe(true);
+      await h.turn();
+      expect(h.requests()).toBe(1); expect(h.publications).toHaveLength(1);
+    } finally { await h.close(); }
+  }, 30_000);
+
   it("does not resolve or re-signal on each prompt while the persisted window is fresh", async () => {
     const h = await windowSubject(ttl - 60_000);
     try {

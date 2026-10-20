@@ -159,7 +159,7 @@ describe("durable AGY learned context windows", () => {
     try {
       const catalog = service(store, async () => upgraded);
       await catalog.refresh(binding);
-      expect(catalog.lookup(binding).snapshot?.candidate.cliVersion).toBe("1.4.4");
+      expect(catalog.lookup(binding).observation?.cliVersion).toBe("1.4.4");
       expect(catalog.model(binding, "argon-high")?.context.effective).toBe(window);
       expect(catalog.model(binding, "argon-high")?.evidence).toContainEqual(expect.objectContaining({
         runtimeVersion: "1.3.5", observedAt: "2026-10-17T16:00:00.000Z",

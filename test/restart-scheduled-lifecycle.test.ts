@@ -126,7 +126,8 @@ describe("#252 actual isolated scheduler + injectTurn, synthetic transport", () 
     const first = h.make();
     h.store.scheduledOccurrences.prepare(key, h.row, row => first.scheduleExecution(row));
     const attempt = h.store.turnAttempts.claim({ id: key.id, target: h.row.channelRef, prompt: h.row.promptText,
-      kind: "scheduled", session: "live" }, first.scheduleExecution(h.row).fingerprint, "old-boot", "schedule");
+      kind: "scheduled", session: "live", createdUtc: new Date().toISOString() },
+    first.scheduleExecution(h.row).fingerprint, "old-boot", "schedule");
     h.store.turnAttempts.bind(attempt, "live-session");
     h.store.turnAttempts.startPrompt(attempt);
     if (state === "cancelled") h.store.turnAttempts.cancel(key.id);
@@ -315,7 +316,7 @@ describe("#252 actual isolated scheduler + injectTurn, synthetic transport", () 
     expect(saved.execution?.model).toBe('test');
     expect(h.store.turnAttempts.get(saved.id)).toBeNull();
     expect(transport.prompt).not.toHaveBeenCalled();
-    h.router.describeConfig = () => ({ ...config, model: { value: 'changed' } });
+    Object.assign(h.router, { describeConfig: () => ({ ...config, model: { value: 'changed' } }) });
     await h.make().runScheduledPrompt(h.row.id, saved);
     expect(transport.prompt).not.toHaveBeenCalled();
     expect(h.store.scheduledOccurrences.get(saved.id)?.execution?.model).toBe('test');
@@ -524,7 +525,7 @@ describe("#252 actual isolated scheduler + injectTurn, synthetic transport", () 
     await fresh.runScheduledPrompt(h.row.id);
     expect(transport.prompt).toHaveBeenCalledTimes(1);
     const original = h.router.describeConfig();
-    h.router.describeConfig = () => ({ ...original, model: { value: "changed" } });
+    Object.assign(h.router, { describeConfig: () => ({ ...original, model: { value: "changed" } }) });
     await fresh.runScheduledPrompt(h.row.id, key);
     expect(transport.prompt).toHaveBeenCalledTimes(1);
     expect(h.store.turnAttempts.get(key.id)?.state).toBe("suspended");

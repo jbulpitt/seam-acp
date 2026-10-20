@@ -107,7 +107,7 @@ describe("#252 actual isolated scheduler + injectTurn, synthetic transport", () 
     const first = scheduledOccurrenceKey(h.row.id, "2026-10-19T22:30:00.000Z");
     const running = fire(first);
     await started;
-    await orch.handleIncomingMessage({ channel: { platform: "discord", id: "worker", parentId: "parent" },
+    await orch["handleIncomingMessage"]({ channel: { platform: "discord", id: "worker", parentId: "parent" },
       messageId: "interrupt", authorId: "user", authorIsBot: false, text: "HUMAN REPLACEMENT" });
     await running;
     expect(h.store.turnAttempts.get(first.id)).toMatchObject({ state: "cancelled", promptStarted: true });

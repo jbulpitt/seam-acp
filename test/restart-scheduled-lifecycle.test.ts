@@ -89,6 +89,62 @@ function rewriteAsLegacy(store: SessionStore, id: string, legacy = "a".repeat(64
 }
 
 describe("#252 actual isolated scheduler + injectTurn, synthetic transport", () => {
+  it("settles a live occurrence superseded by a human message and admits the next slot without replay", async () => {
+    const h = setup("live");
+    const orch = h.make();
+    let entered!: () => void; let release!: () => void;
+    const started = new Promise<void>(r => { entered = r; });
+    const gate = new Promise<void>(r => { release = r; });
+    let busy = true;
+    Object.assign(h.router, { isBusy: () => busy, abortTurn: vi.fn(async () => { busy = false; release(); }) });
+    transport.prompt.mockImplementationOnce(async () => { entered(); await gate; return { stopReason: "cancelled" }; })
+      .mockResolvedValue({ stopReason: "end_turn" });
+    const manager = new ScheduledPromptManager({ store: h.store, logger: pino({ level: "silent" }) as any,
+      resolveExecution: row => orch.scheduleExecution(row), onFire: (id, key) => orch.runScheduledPrompt(id, key) });
+    cleanups.push(() => manager.stop());
+    const fire = (key: ReturnType<typeof scheduledOccurrenceKey>) =>
+      (manager as unknown as { fire(id: string, key: ReturnType<typeof scheduledOccurrenceKey>): Promise<void> }).fire(h.row.id, key);
+    const first = scheduledOccurrenceKey(h.row.id, "2026-10-19T22:30:00.000Z");
+    const running = fire(first);
+    await started;
+    await orch.handleIncomingMessage({ channel: { platform: "discord", id: "worker", parentId: "parent" },
+      messageId: "interrupt", authorId: "user", authorIsBot: false, text: "HUMAN REPLACEMENT" });
+    await running;
+    expect(h.store.turnAttempts.get(first.id)).toMatchObject({ state: "cancelled", promptStarted: true });
+    expect(h.store.scheduledOccurrences.get(first.id)?.settled).toBe(true);
+    const next = scheduledOccurrenceKey(h.row.id, "2026-10-20T12:00:00.000Z");
+    await fire(next);
+    expect(h.store.turnAttempts.get(next.id)).toMatchObject({ state: "completed", promptStarted: true });
+    expect(transport.prompt).toHaveBeenCalledTimes(3);
+    await orch.runScheduledPrompt(h.row.id, first);
+    expect(transport.prompt).toHaveBeenCalledTimes(3);
+  });
+
+  it.each(["cancelled", "completed"] as const)("boot reconciles a %s scheduled attempt without replaying its prompt", async state => {
+    const h = setup("live");
+    const key = scheduledOccurrenceKey(h.row.id, "2026-10-19T22:30:00.000Z");
+    const first = h.make();
+    h.store.scheduledOccurrences.prepare(key, h.row, row => first.scheduleExecution(row));
+    const attempt = h.store.turnAttempts.claim({ id: key.id, target: h.row.channelRef, prompt: h.row.promptText,
+      kind: "scheduled", session: "live" }, first.scheduleExecution(h.row).fingerprint, "old-boot", "schedule");
+    h.store.turnAttempts.bind(attempt, "live-session");
+    h.store.turnAttempts.startPrompt(attempt);
+    if (state === "cancelled") h.store.turnAttempts.cancel(key.id);
+    else {
+      h.store.turnAttempts.complete(attempt, { id: key.id, target: h.row.channelRef, status: "completed",
+        output: "SAVED RESULT", finishedUtc: new Date().toISOString() });
+      h.store.turnAttempts.markDeliveryDone(key.id);
+    }
+    await h.make().recoverInterruptedTurns();
+    expect(h.store.scheduledOccurrences.get(key.id)?.settled).toBe(true);
+    expect(transport.prompt).not.toHaveBeenCalled();
+    transport.prompt.mockResolvedValue({ stopReason: "end_turn" });
+    await h.make().runScheduledPrompt(h.row.id, scheduledOccurrenceKey(h.row.id, "2026-10-20T12:00:00.000Z"));
+    expect(transport.prompt).toHaveBeenCalledTimes(1);
+    await h.make().runScheduledPrompt(h.row.id, key);
+    expect(transport.prompt).toHaveBeenCalledTimes(1);
+  });
+
   it("a later schedule tick resumes its parked isolated ACP session, preserving the frozen cwd and original prompt", async () => {
     const h = setup("isolated", "claude");
     h.row.cwd = "/synthetic/frozen-schedule-cwd";

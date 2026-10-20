@@ -30,10 +30,7 @@ export class ScheduledPromptManager {
   private readonly jobs = new Map<string, Cron>();
   /** Armed slot identity, independent of manual-fire completion timestamps. */
   private readonly nextDue = new Map<string, string>();
-  /** Schedule ids whose `onFire` is currently running. Guards same-schedule
-   *  overlap (D3): a fire that lands while a prior fire of the same id is still
-   *  in flight is skipped (status-stamped) rather than stacked. Covers both the
-   *  timer path and the boot catch-up path (both go through `fire`). */
+  /** Duplicate callbacks for one occurrence; SQL owns per-schedule overlap. */
   private readonly inFlight = new Set<string>();
   private readonly activeFires = new Set<Promise<void>>();
   private stopped = false;
@@ -212,16 +209,14 @@ export class ScheduledPromptManager {
         return;
       }
     }
-    // D3: skip (don't stack) if a prior fire of this same schedule is still
-    // running. With live + per-channel FIFO, stacking would grow the channel
-    // queue without bound and pin the thread replaying stale fires.
-    if (this.inFlight.has(id)) {
+    // Recovery and catch-up can publish the same occurrence concurrently.
+    if (this.inFlight.has(occurrence.id)) {
       this.logger.info({ id }, "scheduled prompt: still running, skipping overlap");
       this.patchRow(id, { lastStatus: "skipped: still running" });
       onAdmittedOrSkipped?.();
       return;
     }
-    this.inFlight.add(id);
+    this.inFlight.add(occurrence.id);
     let admitted = false;
     try {
       if (!current) { onAdmittedOrSkipped?.(); return; }
@@ -248,7 +243,7 @@ export class ScheduledPromptManager {
       this.patchRow(id, { lastStatus: admitted ? "error: scheduled occurrence retained" : "error: scheduled occurrence admission failed" });
       if (!admitted && onReserved) throw err;
     } finally {
-      this.inFlight.delete(id);
+      this.inFlight.delete(occurrence.id);
       const job = this.jobs.get(id);
       if (job) this.patchRow(id, { nextRunUtc: this.nextDue.get(id) ?? job.nextRun()?.toISOString() ?? null });
     }

@@ -89,6 +89,106 @@ function rewriteAsLegacy(store: SessionStore, id: string, legacy = "a".repeat(64
 }
 
 describe("#252 actual isolated scheduler + injectTurn, synthetic transport", () => {
+  it.each(["cancelled", "completed", "pending", "active", "suspended", "missing"] as const)(
+    "a cron fire reconciles a prior %s attempt before deciding whether it is still running", async state => {
+      const h = setup("live");
+      const orch = h.make();
+      const old = scheduledOccurrenceKey(h.row.id, "2026-10-19T22:30:00.000Z");
+      const execution = orch.scheduleExecution(h.row);
+      h.store.scheduledOccurrences.prepare(old, h.row, () => execution);
+      const spec = { id: old.id, target: h.row.channelRef, prompt: h.row.promptText,
+        kind: "scheduled" as const, session: "live" as const, createdUtc: old.scheduledFor! };
+      if (state === "pending") h.store.turnAttempts.admit(spec);
+      else if (state !== "missing") {
+        const attempt = h.store.turnAttempts.claim(spec, execution.fingerprint, "old-boot", "schedule");
+        h.store.turnAttempts.bind(attempt, "live-session");
+        h.store.turnAttempts.startPrompt(attempt);
+        if (state === "cancelled") h.store.turnAttempts.cancel(old.id);
+        else if (state === "completed") h.store.turnAttempts.complete(attempt, {
+          id: old.id, target: h.row.channelRef, status: "completed", output: "SAVED RESULT",
+          finishedUtc: new Date().toISOString() });
+        else if (state === "suspended") h.store.turnAttempts.suspend(old.id, "old-boot");
+      }
+      transport.prompt.mockResolvedValue({ stopReason: "end_turn" });
+      const onFire = vi.fn((id: string, key: ReturnType<typeof scheduledOccurrenceKey>) => orch.runScheduledPrompt(id, key));
+      const manager = new ScheduledPromptManager({ store: h.store, logger: pino({ level: "silent" }) as any,
+        resolveExecution: row => orch.scheduleExecution(row), onFire });
+      cleanups.push(() => manager.stop());
+      const next = scheduledOccurrenceKey(h.row.id, "2026-10-20T12:00:00.000Z");
+      const fire = () => manager["fire"](h.row.id, next);
+      await fire();
+      const terminal = state === "cancelled" || state === "completed";
+      expect(h.store.scheduledOccurrences.get(old.id)?.settled).toBe(terminal);
+      expect(transport.prompt).toHaveBeenCalledTimes(terminal ? 1 : 0);
+      if (terminal) {
+        expect(onFire).toHaveBeenCalledExactlyOnceWith(h.row.id, next);
+        expect(h.store.turnAttempts.get(next.id)).toMatchObject({ state: "completed", promptStarted: true });
+        await fire();
+        expect(transport.prompt).toHaveBeenCalledTimes(1);
+        expect(h.store.turnAttempts.get(old.id)?.deliveryDone).toBe(false);
+      } else {
+        expect(onFire).not.toHaveBeenCalled();
+        expect(h.store.getScheduled(h.row.id)?.lastStatus).toBe("skipped: still running");
+      }
+    });
+
+  it("settles a live occurrence superseded by a human message and admits the next slot without replay", async () => {
+    const h = setup("live");
+    const orch = h.make();
+    let entered!: () => void; let release!: () => void;
+    const started = new Promise<void>(r => { entered = r; });
+    const gate = new Promise<void>(r => { release = r; });
+    let busy = true;
+    Object.assign(h.router, { isBusy: () => busy, abortTurn: vi.fn(async () => { busy = false; release(); }) });
+    transport.prompt.mockImplementationOnce(async () => { entered(); await gate; return { stopReason: "cancelled" }; })
+      .mockResolvedValue({ stopReason: "end_turn" });
+    const manager = new ScheduledPromptManager({ store: h.store, logger: pino({ level: "silent" }) as any,
+      resolveExecution: row => orch.scheduleExecution(row), onFire: (id, key) => orch.runScheduledPrompt(id, key) });
+    cleanups.push(() => manager.stop());
+    const fire = (key: ReturnType<typeof scheduledOccurrenceKey>) =>
+      (manager as unknown as { fire(id: string, key: ReturnType<typeof scheduledOccurrenceKey>): Promise<void> }).fire(h.row.id, key);
+    const first = scheduledOccurrenceKey(h.row.id, "2026-10-19T22:30:00.000Z");
+    const running = fire(first);
+    await started;
+    await orch["handleIncomingMessage"]({ channel: { platform: "discord", id: "worker", parentId: "parent" },
+      messageId: "interrupt", authorId: "user", authorIsBot: false, text: "HUMAN REPLACEMENT" });
+    await running;
+    expect(h.store.turnAttempts.get(first.id)).toMatchObject({ state: "cancelled", promptStarted: true });
+    expect(h.store.scheduledOccurrences.get(first.id)?.settled).toBe(true);
+    const next = scheduledOccurrenceKey(h.row.id, "2026-10-20T12:00:00.000Z");
+    await fire(next);
+    expect(h.store.turnAttempts.get(next.id)).toMatchObject({ state: "completed", promptStarted: true });
+    expect(transport.prompt).toHaveBeenCalledTimes(3);
+    await orch.runScheduledPrompt(h.row.id, first);
+    expect(transport.prompt).toHaveBeenCalledTimes(3);
+  });
+
+  it.each(["cancelled", "completed"] as const)("boot reconciles a %s scheduled attempt without replaying its prompt", async state => {
+    const h = setup("live");
+    const key = scheduledOccurrenceKey(h.row.id, "2026-10-19T22:30:00.000Z");
+    const first = h.make();
+    h.store.scheduledOccurrences.prepare(key, h.row, row => first.scheduleExecution(row));
+    const attempt = h.store.turnAttempts.claim({ id: key.id, target: h.row.channelRef, prompt: h.row.promptText,
+      kind: "scheduled", session: "live", createdUtc: new Date().toISOString() },
+    first.scheduleExecution(h.row).fingerprint, "old-boot", "schedule");
+    h.store.turnAttempts.bind(attempt, "live-session");
+    h.store.turnAttempts.startPrompt(attempt);
+    if (state === "cancelled") h.store.turnAttempts.cancel(key.id);
+    else {
+      h.store.turnAttempts.complete(attempt, { id: key.id, target: h.row.channelRef, status: "completed",
+        output: "SAVED RESULT", finishedUtc: new Date().toISOString() });
+      h.store.turnAttempts.markDeliveryDone(key.id);
+    }
+    await h.make().recoverInterruptedTurns();
+    expect(h.store.scheduledOccurrences.get(key.id)?.settled).toBe(true);
+    expect(transport.prompt).not.toHaveBeenCalled();
+    transport.prompt.mockResolvedValue({ stopReason: "end_turn" });
+    await h.make().runScheduledPrompt(h.row.id, scheduledOccurrenceKey(h.row.id, "2026-10-20T12:00:00.000Z"));
+    expect(transport.prompt).toHaveBeenCalledTimes(1);
+    await h.make().runScheduledPrompt(h.row.id, key);
+    expect(transport.prompt).toHaveBeenCalledTimes(1);
+  });
+
   it("a later schedule tick resumes its parked isolated ACP session, preserving the frozen cwd and original prompt", async () => {
     const h = setup("isolated", "claude");
     h.row.cwd = "/synthetic/frozen-schedule-cwd";
@@ -259,7 +359,7 @@ describe("#252 actual isolated scheduler + injectTurn, synthetic transport", () 
     expect(saved.execution?.model).toBe('test');
     expect(h.store.turnAttempts.get(saved.id)).toBeNull();
     expect(transport.prompt).not.toHaveBeenCalled();
-    h.router.describeConfig = () => ({ ...config, model: { value: 'changed' } });
+    Object.assign(h.router, { describeConfig: () => ({ ...config, model: { value: 'changed' } }) });
     await h.make().runScheduledPrompt(h.row.id, saved);
     expect(transport.prompt).not.toHaveBeenCalled();
     expect(h.store.scheduledOccurrences.get(saved.id)?.execution?.model).toBe('test');
@@ -385,9 +485,10 @@ describe("#252 actual isolated scheduler + injectTurn, synthetic transport", () 
     h.adapter.sendPanel.mockRejectedValue(new Error("synthetic output outage"));
     await h.make().runScheduledPrompt(h.row.id, key);
     expect(h.store.turnAttempts.get(key.id)).toMatchObject({ state: "completed", deliveryDone: false });
+    expect(h.store.scheduledOccurrences.get(key.id)?.settled).toBe(true);
     expect(transport.delete).toHaveBeenCalledTimes(1);
     h.adapter.sendPanel.mockImplementation(async channel => ({ channel, id: "recovered" }));
-    await h.make().runScheduledPrompt(h.row.id, key);
+    await h.make().recoverInterruptedTurns();
     expect(transport.prompt).toHaveBeenCalledTimes(1);
     expect(h.store.scheduledOccurrences.get(key.id)?.settled).toBe(true);
     const deliveryCalls = h.adapter.sendPanel.mock.calls.filter(call => call[2]);
@@ -467,7 +568,7 @@ describe("#252 actual isolated scheduler + injectTurn, synthetic transport", () 
     await fresh.runScheduledPrompt(h.row.id);
     expect(transport.prompt).toHaveBeenCalledTimes(1);
     const original = h.router.describeConfig();
-    h.router.describeConfig = () => ({ ...original, model: { value: "changed" } });
+    Object.assign(h.router, { describeConfig: () => ({ ...original, model: { value: "changed" } }) });
     await fresh.runScheduledPrompt(h.row.id, key);
     expect(transport.prompt).toHaveBeenCalledTimes(1);
     expect(h.store.turnAttempts.get(key.id)?.state).toBe("suspended");

@@ -61,6 +61,38 @@ function makeStore(row: ScheduledPrompt) {
 }
 
 describe("ScheduledPromptManager overlap guard (D3)", () => {
+  it.each(["cancelled", "completed"] as const)("admits a new slot after %s even while the old callback is wrapping up", async state => {
+    const row = makeRow();
+    const store = new SqliteSessionStore(":memory:");
+    store.upsertScheduled(row);
+    const old = scheduledOccurrenceKey(row.id, "2026-10-19T22:30:00.000Z");
+    const next = scheduledOccurrenceKey(row.id, "2026-10-20T12:00:00.000Z");
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const onFire = vi.fn(async (_id: string, key: ScheduledOccurrenceKey) => {
+      const attempt = store.turnAttempts.claim({ id: key.id, target: row.channelRef,
+        prompt: row.promptText, session: "live", kind: "scheduled", createdUtc: key.scheduledFor! },
+      syntheticScheduleExecution().fingerprint, "test", "schedule");
+      if (key.id === old.id && state === "cancelled") store.turnAttempts.cancel(key.id);
+      else store.turnAttempts.complete(attempt, { id: key.id, target: row.channelRef,
+        status: "completed", finishedUtc: new Date().toISOString() });
+      if (key.id === old.id) await gate;
+      store.scheduledOccurrences.settle(key.id);
+    });
+    const manager = new ScheduledPromptManager({ store, onFire, logger: silentLogger,
+      resolveExecution: syntheticScheduleExecution });
+    const running = manager["fire"](row.id, old);
+    try {
+      await manager["fire"](row.id, old);
+      expect(onFire).toHaveBeenCalledTimes(1);
+      await manager["fire"](row.id, next);
+      expect(onFire.mock.calls.map(([, key]) => key.id)).toEqual([old.id, next.id]);
+      expect(store.scheduledOccurrences.get(old.id)?.settled).toBe(true);
+    } finally {
+      release(); await running; manager.stop(); store.close();
+    }
+  });
+
   it("a later tick rechecks the original reauth occurrence instead of silently skipping forever", async () => {
     const row = makeRow({ sessionMode: "isolated" });
     const store = new SqliteSessionStore(":memory:");

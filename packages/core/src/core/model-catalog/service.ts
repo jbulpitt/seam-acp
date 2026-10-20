@@ -533,12 +533,17 @@ export class ModelCatalogService {
       if (candidate.scope.provider === "google-antigravity"
         && known?.scope.fingerprint === candidate.scope.fingerprint) {
         candidate.models = candidate.models.map(model => {
-          if (model.context.effective !== null) return model;
           const priorModel = known.models.find(row => row.id === model.id);
           const evidence = priorModel?.evidence?.filter(row => row.kind === "live-observation"
             && row.source === "agy language server" && row.resolvedModel === model.id
             && row.scopeRef === candidate.scope.fingerprint && row.context?.effective);
-          return priorModel?.context.effective && evidence?.length
+          const observedAt = model.evidence?.filter(row => row.kind === "live-observation"
+            && row.source === "agy language server" && row.resolvedModel === model.id
+            && row.scopeRef === candidate.scope.fingerprint && row.context?.effective)
+            .map(row => row.observedAt).sort().at(-1);
+          const priorObservedAt = evidence?.map(row => row.observedAt).sort().at(-1);
+          const retain = model.context.effective === null || !observedAt || (priorObservedAt && observedAt < priorObservedAt);
+          return retain && priorModel?.context.effective && evidence?.length
             ? { ...model, context: priorModel.context, evidence: [...model.evidence ?? [], ...evidence] }
             : model;
         });

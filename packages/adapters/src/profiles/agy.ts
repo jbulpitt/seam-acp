@@ -1259,11 +1259,13 @@ export const SEAM_AGY_JSON_SCHEMA_META = "seam/agyJsonSchema";
  */
 export const SEAM_AGY_CATALOG_REFRESH_META = "seam/agyCatalogRefresh";
 export const SEAM_AGY_CONTEXT_WINDOW_META = "seam/agyContextWindow";
+export const AGY_CONTEXT_WINDOW_TTL_MS = 14 * 24 * 60 * 60 * 1_000;
 
 export interface AgyContextWindowSeed {
   modelId: string;
   scopeRef: string;
   maxTokens: number;
+  observedAt?: string;
 }
 
 /**
@@ -1378,7 +1380,7 @@ class AgyAgent implements Agent {
   private active?: AgyTurnLifecycle;
   private shutdownPromise?: Promise<void>;
   private promptTail: Promise<unknown> = Promise.resolve();
-  private catalogRefreshSignalled = false;
+  private catalogModel?: string;
 
   constructor(
     private readonly runtime: AgyLaunchRuntime,
@@ -1761,9 +1763,19 @@ class AgyAgent implements Agent {
     // settings; deleting this guard breaks isolation even if selection failed.
     if (!currentModel) throw new Error("AGY session has no model selection");
     const seed = params._meta?.[SEAM_AGY_CONTEXT_WINDOW_META] as AgyContextWindowSeed | undefined;
-    const seededWindow = seed?.modelId === currentModel.modelId && seed.scopeRef === this.catalog.scope().fingerprint
-      && Number.isSafeInteger(seed.maxTokens) && seed.maxTokens > 0 ? seed.maxTokens : undefined;
-    let maxTokens = currentModel.maxTokens || seededWindow || agyContextWindow(catalog, currentModel);
+    const cached = seed?.modelId === currentModel.modelId && seed.scopeRef === this.catalog.scope().fingerprint
+      && Number.isSafeInteger(seed.maxTokens) && seed.maxTokens > 0 ? seed : undefined;
+    const local = currentModel.maxTokens > 0 ? {
+      maxTokens: currentModel.maxTokens, observedAt: currentModel.metadataObservedAt,
+    } : undefined;
+    const known = local && (!cached || Date.parse(local.observedAt ?? "") > (Date.parse(cached.observedAt ?? "") || 0))
+      ? local : cached ?? local;
+    const observedAt = Date.parse(known?.observedAt ?? "");
+    const reverify = !known || !Number.isFinite(observedAt) || Date.now() - observedAt >= AGY_CONTEXT_WINDOW_TTL_MS
+      || (this.catalogModel !== undefined && this.catalogModel !== currentModel.modelId);
+    this.catalogModel = currentModel.modelId;
+    // Expiry requests verification; it never discards an observed capacity.
+    let maxTokens = known?.maxTokens || agyContextWindow(catalog, currentModel);
 
     // Linux limits each individual argv/envp string to MAX_ARG_STRLEN
     // (PAGE_SIZE * 32 = 131,072 bytes on x86-64), independent of the overall
@@ -1835,22 +1847,22 @@ class AgyAgent implements Agent {
         timeoutMs: 90_000,
         signal: cancelAbort.signal,
       });
-      const metadataLearning = learnAgyCatalogFromSession(
+      const metadataLearning = (reverify ? learnAgyCatalogFromSession(
         this.runtime,
         ls.port,
         cancelAbort.signal,
         csrfToken,
-      ).then(async (available) => {
+      ) : Promise.resolve(false)).then(async (available) => {
         if (!available) return;
         const enriched = await getCatalog(this.runtime);
         const enrichedCurrent = enriched.find((entry) => entry.modelId === currentModel.modelId);
-        maxTokens = enrichedCurrent?.maxTokens || seededWindow || agyContextWindow(enriched, currentModel);
+        maxTokens = enrichedCurrent?.maxTokens || known?.maxTokens || agyContextWindow(enriched, currentModel);
         const corrected = translator?.setContextWindow(maxTokens);
         if (corrected && this.conn) {
           await this.conn.sessionUpdate({ sessionId: params.sessionId,
             update: { sessionUpdate: "usage_update", ...corrected } as any });
         }
-        if (this.catalogRefreshSignalled || !this.conn) return;
+        if (!this.conn) return;
         await this.conn.sessionUpdate({
           sessionId: params.sessionId,
           update: {
@@ -1859,7 +1871,6 @@ class AgyAgent implements Agent {
             _meta: { [SEAM_AGY_CATALOG_REFRESH_META]: await this.catalog.fetch() },
           },
         });
-        this.catalogRefreshSignalled = true;
       }).catch(() => {
         // Blast radius: refuse only this metadata observation. The real turn,
         // prompt-free selectable ids, and R4a's conservative window keep working.
@@ -2740,7 +2751,6 @@ const catalogRowsPromises = new Map<string, Promise<AgyCatalogEntry[]>>();
 const sessionCatalogMetadata = new Map<string, {
   rows: AgyCatalogEntry[];
   observedAt: string;
-  fingerprint: string;
 }>();
 
 function catalogFailure(error: unknown): never {
@@ -3108,7 +3118,6 @@ async function learnAgyCatalogFromSession(
   signal: AbortSignal,
   csrfToken?: string,
 ): Promise<boolean> {
-  if (sessionCatalogMetadata.has(runtime.identityKey)) return true;
   const selectable = await getCatalogRows(runtime);
   const selectableIds = new Set(selectable.map((row) => row.modelId));
   const url = `http://localhost:${port}/exa.language_server_pb.LanguageServerService/GetAvailableModels`;
@@ -3126,17 +3135,7 @@ async function learnAgyCatalogFromSession(
         (await readAgyJsonResponse(response)) as { response?: { models?: Record<string, AgyRawModel> } },
       ).filter((row) => selectableIds.has(row.modelId));
       if (parsed.length > 0) {
-        const fingerprint = JSON.stringify(parsed.map((row) => ({
-          modelId: row.modelId,
-          maxTokens: row.maxTokens,
-          recommended: row.recommended,
-          supportsThinking: row.supportsThinking,
-          supportsImages: row.supportsImages,
-        })).sort((a, b) => a.modelId.localeCompare(b.modelId)));
-        const prior = sessionCatalogMetadata.get(runtime.identityKey);
-        sessionCatalogMetadata.set(runtime.identityKey, prior?.fingerprint === fingerprint
-          ? prior
-          : { rows: parsed, observedAt: new Date().toISOString(), fingerprint });
+        sessionCatalogMetadata.set(runtime.identityKey, { rows: parsed, observedAt: new Date(Date.now()).toISOString() });
         return true;
       }
     } else {

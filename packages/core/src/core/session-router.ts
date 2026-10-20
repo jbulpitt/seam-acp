@@ -1715,8 +1715,13 @@ export class SessionRouter {
         const snapshot = this.modelCatalog.lookup({ agentId, location }).snapshot;
         const scope = this.getProfile(agentId, location)?.catalog.scope();
         if (!snapshot || snapshot.candidate.scope.fingerprint !== scope?.fingerprint) return;
-        const maxTokens = snapshot.candidate.models.find(row => row.id === model)?.context.effective;
-        return maxTokens ? { modelId: model, scopeRef: scope.fingerprint, maxTokens } : undefined;
+        const row = snapshot.candidate.models.find(row => row.id === model);
+        const maxTokens = row?.context.effective;
+        const observedAt = row?.evidence?.filter(evidence => evidence.kind === "live-observation"
+          && evidence.scopeRef === scope.fingerprint && evidence.resolvedModel === model
+          && evidence.context?.effective === maxTokens)
+          .map(evidence => evidence.observedAt).sort().at(-1);
+        return maxTokens ? { modelId: model, scopeRef: scope.fingerprint, maxTokens, observedAt } : undefined;
       },
       ...this.clientOptions(record),
       onSessionModes: info => {

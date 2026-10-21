@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import path from "node:path";
 import readline from "node:readline";
 
 const logPath = process.env.GROK_FAKE_LOG;
@@ -84,6 +85,23 @@ input.on("line", (line) => {
     }) + "\n");
     return;
   }
+  const renewalMode = ["renew-session", "renew-always", "renew-then-hang"].includes(mode);
+  let renewing = false;
+  if (renewalMode) {
+    const authPath = path.join(process.env.GROK_HOME, "auth.json");
+    const auth = JSON.parse(fs.readFileSync(authPath, "utf8"));
+    const record = Object.values(auth)[0];
+    renewing = mode === "renew-always" || !record.expires_at;
+    if (!renewing && mode === "renew-then-hang") return;
+    if (renewing) {
+      record.create_time = new Date().toISOString();
+      record.expires_at = new Date(Date.now() + 6 * 60 * 60 * 1000).toISOString();
+      fs.writeFileSync(authPath, JSON.stringify(auth));
+    }
+  }
+  const modelIds = renewalMode
+    ? (renewing ? ["grok-4.6", "grok-4.5"] : ["grok-4.7", "grok-4.7-build-fast", "grok-4.6", "grok-4.5"])
+    : ["grok-test"];
   process.stdout.write(JSON.stringify({
     jsonrpc: "2.0",
     id: request.id,
@@ -93,9 +111,9 @@ input.on("line", (line) => {
       authMethods: [{ id: "cached_token", name: "Cached login" }],
       _meta: mode === "missing" ? {} : {
         modelState: {
-          currentModelId: "grok-test",
-          availableModels: [{
-            modelId: "grok-test",
+          currentModelId: renewalMode ? "grok-4.6" : "grok-test",
+          availableModels: modelIds.map(modelId => ({
+            modelId,
             name: "Grok Test",
             description: "Fixture",
             _meta: {
@@ -104,7 +122,7 @@ input.on("line", (line) => {
               reasoningEffort: "high",
               reasoningEfforts: [{ id: "high", value: "high", default: true }],
             },
-          }],
+          })),
         },
       },
     },

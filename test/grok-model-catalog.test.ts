@@ -480,6 +480,84 @@ Available models:
     }
   });
 
+  it("re-probes a renewed subscription session before publishing its ACP catalog", async () => {
+    const temporary = fs.mkdtempSync(path.join(os.tmpdir(), "seam-grok-renewal-"));
+    const grokHome = path.join(temporary, "grok-home");
+    const logPath = path.join(temporary, "requests.jsonl");
+    try {
+      writeAuth(grokHome, "renewal-test");
+      const profile = makeGrokProfile({
+        cliPath: process.execPath,
+        baseArgs: [path.join(process.cwd(), "test/fixtures/grok/fake-acp.mjs")],
+        defaultModel: "grok-4.6",
+        cwd: temporary,
+        extraEnv: { GROK_HOME: grokHome, GROK_FAKE_LOG: logPath, GROK_FAKE_MODE: "renew-session" },
+        cliVersionProbe: async () => "grok 1.0.62",
+      });
+      const scope = profile.catalog.scope();
+      const catalog = await profile.catalog.fetch();
+      validateCandidate(catalog);
+      expect(catalog.models.map(model => model.id)).toEqual([
+        "grok-4.7", "grok-4.7-build-fast", "grok-4.6", "grok-4.5",
+      ]);
+      expect(catalog.scope).toEqual(scope);
+      expect(catalog.source).toBe("grok-acp-model-state");
+      const requests = fs.readFileSync(logPath, "utf8").trim().split("\n").map(line => JSON.parse(line));
+      expect(requests.map(request => request.method)).toEqual(["initialize", "initialize"]);
+      expect(new Set(requests.map(request => request.pid)).size).toBe(2);
+      for (const request of requests) expect(() => process.kill(request.pid, 0)).toThrow();
+    } finally {
+      fs.rmSync(temporary, { recursive: true, force: true });
+    }
+  });
+
+  it("re-probes at most once even if the second initialize renews again", async () => {
+    const temporary = fs.mkdtempSync(path.join(os.tmpdir(), "seam-grok-renewal-bound-"));
+    const grokHome = path.join(temporary, "grok-home");
+    const logPath = path.join(temporary, "requests.jsonl");
+    try {
+      writeAuth(grokHome, "renewal-bound");
+      const result = await probeGrokCatalog({
+        cliPath: process.execPath,
+        baseArgs: [path.join(process.cwd(), "test/fixtures/grok/fake-acp.mjs")],
+        defaultModel: "grok-4.6",
+        env: { ...process.env, GROK_HOME: grokHome, GROK_FAKE_LOG: logPath, GROK_FAKE_MODE: "renew-always" },
+      });
+      expect(result.modelState?.models.map(model => model.modelId)).toEqual(["grok-4.6", "grok-4.5"]);
+      const requests = fs.readFileSync(logPath, "utf8").trim().split("\n").map(line => JSON.parse(line));
+      expect(requests.map(request => request.method)).toEqual(["initialize", "initialize"]);
+      for (const request of requests) expect(() => process.kill(request.pid, 0)).toThrow();
+    } finally {
+      fs.rmSync(temporary, { recursive: true, force: true });
+    }
+  });
+
+  it("cancels and reaps the second initialize after session renewal", async () => {
+    const temporary = fs.mkdtempSync(path.join(os.tmpdir(), "seam-grok-renewal-cancel-"));
+    const grokHome = path.join(temporary, "grok-home");
+    const logPath = path.join(temporary, "requests.jsonl");
+    const controller = new AbortController();
+    try {
+      writeAuth(grokHome, "renewal-cancel");
+      const operation = probeGrokCatalog({
+        cliPath: process.execPath,
+        baseArgs: [path.join(process.cwd(), "test/fixtures/grok/fake-acp.mjs")],
+        defaultModel: "grok-4.6",
+        env: { ...process.env, GROK_HOME: grokHome, GROK_FAKE_LOG: logPath, GROK_FAKE_MODE: "renew-then-hang" },
+        signal: controller.signal,
+        timeoutMs: 5_000,
+      });
+      await vi.waitFor(() => expect(fs.readFileSync(logPath, "utf8").trim().split("\n")).toHaveLength(2));
+      controller.abort();
+      await expect(operation).rejects.toMatchObject({ code: "cancelled" });
+      const requests = fs.readFileSync(logPath, "utf8").trim().split("\n").map(line => JSON.parse(line));
+      for (const request of requests) expect(() => process.kill(request.pid, 0)).toThrow();
+    } finally {
+      controller.abort();
+      fs.rmSync(temporary, { recursive: true, force: true });
+    }
+  });
+
   it.each(["success", "missing", "hang"] as const)(
     "cleans up the initialize-only ACP child on the %s path",
     async (mode) => {

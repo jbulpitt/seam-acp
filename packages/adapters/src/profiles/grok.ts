@@ -279,13 +279,7 @@ function grokHome(env: NodeJS.ProcessEnv): string {
   return path.join(home, ".grok");
 }
 
-/**
- * Derive a stable, non-secret account identity from Grok's cached credential
- * metadata. The path locates evidence only; neither it nor raw account fields
- * cross the adapter boundary. Multiple distinct accounts fail closed because
- * the CLI's active choice would otherwise be ambiguous.
- */
-export function resolveGrokSubscriptionIdentity(env: NodeJS.ProcessEnv): GrokAuthIdentity {
+function readGrokAuthRecords(env: NodeJS.ProcessEnv): Record<string, unknown> {
   const authPath = path.join(grokHome(env), "auth.json");
   let raw: unknown;
   try {
@@ -301,8 +295,25 @@ export function resolveGrokSubscriptionIdentity(env: NodeJS.ProcessEnv): GrokAut
   }
   const root = objectRecord(raw);
   if (!root) throw new Error("Grok subscription account identity is malformed");
+  return root;
+}
+
+function grokSessionExpiry(env: NodeJS.ProcessEnv): string {
+  return Object.values(readGrokAuthRecords(env))
+    .map(value => nonEmptyString(objectRecord(value)?.expires_at) ?? "")
+    .sort()
+    .join("\n");
+}
+
+/**
+ * Derive a stable, non-secret account identity from Grok's cached credential
+ * metadata. The path locates evidence only; neither it nor raw account fields
+ * cross the adapter boundary. Multiple distinct accounts fail closed because
+ * the CLI's active choice would otherwise be ambiguous.
+ */
+export function resolveGrokSubscriptionIdentity(env: NodeJS.ProcessEnv): GrokAuthIdentity {
   const identities = new Set<string>();
-  for (const [recordKey, value] of Object.entries(root)) {
+  for (const [recordKey, value] of Object.entries(readGrokAuthRecords(env))) {
     const record = objectRecord(value);
     if (!record) continue;
     const issuer = nonEmptyString(record.oidc_issuer) ?? nonEmptyString(recordKey.split("::", 1)[0]);
@@ -373,12 +384,14 @@ export async function probeGrokCatalog(options: {
   const env = options.env ?? process.env;
   const args = grokAgentArgs(options.baseArgs ?? [], options.defaultModel);
   const expectedIdentity = resolveGrokSubscriptionIdentity(env);
-  return runBoundedProbe({
+  const sessionExpiry = grokSessionExpiry(env);
+  const deadline = Date.now() + (options.timeoutMs ?? 30_000);
+  const initialize = () => runBoundedProbe({
     executable: cli,
     args,
     cwd: options.cwd ?? process.cwd(),
     env,
-    timeoutMs: options.timeoutMs ?? 30_000,
+    timeoutMs: Math.max(1, deadline - Date.now()),
     ...(options.signal ? { signal: options.signal } : {}),
     label: "Grok ACP initialize",
     async run(handle) {
@@ -422,6 +435,9 @@ export async function probeGrokCatalog(options: {
       };
     },
   });
+  const result = await initialize();
+  // A renewing Grok process can advertise a stale catalog until the next start.
+  return grokSessionExpiry(env) !== sessionExpiry ? initialize() : result;
 }
 
 function execGrokBounded(

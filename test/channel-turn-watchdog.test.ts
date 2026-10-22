@@ -6,6 +6,7 @@ import path from "node:path";
 import { pino } from "pino";
 import { Orchestrator } from "../packages/core/src/platforms/discord/orchestrator.js";
 import { TurnWatchdogTimeoutError } from "../packages/core/src/core/turn-watchdog.js";
+import { DispatchAcquisitionPhase } from "../packages/core/src/core/dispatch/acquisition-phase.js";
 import type { Logger } from "../packages/core/src/lib/logger.js";
 import type { SessionRecord } from "../packages/core/src/core/types.js";
 
@@ -69,8 +70,15 @@ describe("active-turn watchdog", () => {
     fs.rmSync(dir, { recursive: true, force: true });
   });
 
-  it("force-settles a never-resolving queued turn and lets the FIFO continue", async () => {
+  it.each([false, true])("expires silent work and lets the FIFO continue (connected acquisition=%s)", async acquiring => {
     const { orchestrator, abortTurn } = makeOrchestrator(dir);
+    const ready = vi.fn(() => true);
+    if (acquiring) {
+      orchestrator["store"].turnAttempts.admit({ id: "connected-start", target: "thread-1", prompt: "work",
+        session: "live", kind: "forward", createdUtc: new Date().toISOString(), location: "connected-host" });
+      orchestrator["dispatchAcquisitions"].add(new DispatchAcquisitionPhase("connected-start", "execution"));
+      orchestrator.setBridgeHub({ isBridgeReady: ready } as any);
+    }
     const hung = (orchestrator as any).queueOnChannel(
       "thread-1",
       () => new Promise<never>(() => {})
@@ -86,6 +94,7 @@ describe("active-turn watchdog", () => {
     expect(await outcome).toBeInstanceOf(TurnWatchdogTimeoutError);
     expect(orchestrator.activeTurnCount()).toBe(0);
     expect(abortTurn).toHaveBeenCalledWith("discord:thread-1", { force: true });
+    if (acquiring) expect(ready).toHaveBeenCalledWith("connected-host");
 
     const next = (orchestrator as any).queueOnChannel(
       "thread-1",

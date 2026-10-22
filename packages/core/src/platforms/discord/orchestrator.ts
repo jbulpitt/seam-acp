@@ -2696,7 +2696,7 @@ export class Orchestrator {
         const timeoutMs = turnWatchdogTimeoutMs(
           this.config.TURN_TIMEOUT_SECONDS ?? 900
         );
-        const startedAt = Date.now();
+        let startedAt = Date.now();
         const sessionId = this.recordForChannel(channelId)?.id ?? makeSessionId(this.platformForChannel(channelId), channelId);
         const value = await settleWithTurnWatchdog(() => work, {
           timeoutMs,
@@ -2705,6 +2705,15 @@ export class Orchestrator {
           // exists, the clock is this task's start so a hung boot still ends.
           lastActivityAt: () => {
             if (recovery) return recovery.lastActivityAt();
+            // An offline host is a reconnect wait, not a silent provider.
+            for (const phase of this.dispatchAcquisitions) {
+              const attempt = this.store.turnAttempts.get(phase.dispatchId);
+              if (attempt && this.queueChannelRef(attempt.spec.target) === channelId
+                && this.bridgeHub && !this.bridgeHub.isBridgeReady(
+                  parseExecutionIdentity(attempt.identity)?.location ?? attempt.spec.location ?? LOCAL_LOCATION)) {
+                return startedAt = Date.now();
+              }
+            }
             const at = this.router.getRuntime(sessionId)?.lastActivityAtMs;
             return typeof at === "number" && Number.isFinite(at) ? Math.max(startedAt, at) : startedAt;
           },
@@ -20103,7 +20112,7 @@ export class Orchestrator {
       const occurrence = this.store.scheduledOccurrences.get(attemptId);
       if (!occurrence) return "no suspended occurrence";
       this.trackContinuation(this.runScheduledPrompt(occurrence.scheduleId, occurrence, manualResume).catch((err) => {
-        this.logger.warn({ err, id: attemptId }, "reauth schedule continuation failed");
+        this.logger.warn({ err, id: attemptId }, "parked schedule continuation failed");
       }));
       return null;
     }

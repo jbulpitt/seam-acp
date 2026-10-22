@@ -228,10 +228,12 @@ describe("pre-prompt bridge reconnect on the scheduled execution paths", () => {
     const key = scheduledOccurrenceKey(row.id, "2026-10-22T19:50:00.000Z");
     const execution = h.orch.scheduleExecution(row);
     h.store.scheduledOccurrences.prepare(key, row, () => execution);
+    const boot = h.orch["attemptBoot"];
+    h.store.turnAttempts.registerOwner(boot);
     const attempt = h.store.turnAttempts.claim({ id: key.id, target: row.channelRef, prompt: row.promptText,
       session: "live", kind: "scheduled", createdUtc: key.scheduledFor!,
       agentId: execution.agentId, location: execution.location, model: execution.model, cwd: execution.cwd },
-    execution.fingerprint, "previous-boot", "schedule");
+    execution.fingerprint, boot, "schedule");
     if (submitted) {
       h.store.turnAttempts.bind(attempt, h.record.acpSessionId);
       h.store.turnAttempts.startPrompt(attempt);
@@ -248,6 +250,8 @@ describe("pre-prompt bridge reconnect on the scheduled execution paths", () => {
       try { await manager["fire"](row.id, scheduledOccurrenceKey(row.id, "2026-10-22T20:20:00.000Z")); }
       finally { manager.stop(); }
     }
+    const recovered = h.store.turnAttempts.get(key.id)!;
+    expect({ state: recovered.state, reason: recovered.stalledReason }).toEqual({ state: "completed", reason: null });
     expect(h.calls.prompts).toHaveLength(1);
     expect(h.calls.prompts[0].sessionId).toBe(h.record.acpSessionId);
     const text = h.calls.prompts[0].prompt[0].text;
@@ -284,6 +288,8 @@ describe("pre-prompt bridge reconnect on the scheduled execution paths", () => {
       h.reconnect("another-host"); await drainPreprompt();
       expect(h.calls.prompts).toEqual([]);
       h.reconnect(); await turn;
+      const recovered = h.store.turnAttempts.get(key.id)!;
+      expect({ state: recovered.state, reason: recovered.stalledReason }).toEqual({ state: "completed", reason: null });
       expect(h.calls.prompts).toHaveLength(1);
       expect(h.calls.prompts[0].prompt[0].text).toContain(h.row.promptText);
       if (cached) {
@@ -312,6 +318,10 @@ describe("pre-prompt bridge reconnect on the scheduled execution paths", () => {
       expect(h.calls.prompts).toEqual([]);
       expect(h.events.listenerCount("ready")).toBe(1);
       h.reconnect(); await turn;
+      const finished = h.store.turnAttempts.get(key.id)!;
+      expect({ state: finished.state, reason: finished.stalledReason, error: finished.outcome?.error },
+        JSON.stringify({ status: h.store.getScheduled(h.row.id)?.lastStatus, logs: h.logs }))
+        .toEqual({ state: "completed", reason: null, error: undefined });
       expect(h.calls.prompts).toHaveLength(1);
       expect(h.store.scheduledOccurrences.get(key.id)?.settled).toBe(true);
       expect(h.events.listenerCount("ready")).toBe(0);
@@ -320,15 +330,18 @@ describe("pre-prompt bridge reconnect on the scheduled execution paths", () => {
 
   it.each((["live", "isolated"] as const).flatMap(mode =>
     (["cancel", "shutdown"] as const).map(action => ({ mode, action }))))
-  ("releases the $mode pre-prompt wait on $action without submitting", async ({ mode, action }) => {
+  ("releases the $mode wait beyond 15 minutes on $action without submitting", async ({ mode, action }) => {
     const h = offlineSchedule(mode); h.disconnect();
+    vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout"] });
     const key = scheduledOccurrenceKey(h.row.id);
     const turn = h.orch.runScheduledPrompt(h.row.id, key);
     try {
       await prepromptBoundary(h, key.id);
+      await vi.advanceTimersByTimeAsync(16 * 60_000);
       expect(h.store.turnAttempts.get(key.id)).toMatchObject({ state: "active", promptStarted: false });
-      if (action === "cancel") h.store.turnAttempts.cancel(key.id, "cancelled by operator");
-      else h.orch.suspendForRestart();
+      if (action === "shutdown") h.orch.suspendForRestart();
+      else if (mode === "live") await h.orch.cancelChannel({ platform: "discord", id: h.row.channelRef });
+      else h.store.turnAttempts.cancel(key.id, "cancelled by operator");
       await turn;
       expect(h.calls.prompts).toEqual([]);
       expect(h.events.listenerCount("ready")).toBe(0);

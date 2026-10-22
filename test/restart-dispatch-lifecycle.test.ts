@@ -158,7 +158,7 @@ describe("dispatch admission while its bound bridge is away", () => {
     const h = offlineDispatch();
     const turn = h.orch.dispatchInjectTurn(h.spec).catch(error => error);
     try {
-      await vi.advanceTimersByTimeAsync(1_000);
+      await vi.advanceTimersByTimeAsync(16 * 60_000);
       h.store.turnAttempts.cancel(h.spec.id, "cancelled by operator");
       expect(await turn).toMatchObject({ message: "cancelled by operator" });
       expect(h.store.turnAttempts.get(h.spec.id)?.state).toBe("cancelled");
@@ -173,7 +173,7 @@ describe("dispatch admission while its bound bridge is away", () => {
     const h = offlineDispatch();
     const turn = h.orch.dispatchInjectTurn(h.spec).catch(error => error);
     try {
-      await vi.advanceTimersByTimeAsync(1_000);
+      await vi.advanceTimersByTimeAsync(16 * 60_000);
       h.orch.suspendForRestart();
       expect(await turn).toMatchObject({ suspension: "shutdown" });
       expect(h.store.turnAttempts.get(h.spec.id)).toMatchObject({ state: "pending", generation: 0, promptStarted: false });

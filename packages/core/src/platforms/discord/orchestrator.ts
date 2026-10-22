@@ -274,7 +274,7 @@ import {
   isolatedBindSessionId,
   planIsolatedBridgeSpawn,
 } from "../../core/location-bind.js";
-import { remainingMaxAgeMs, waitUntilBridgeReady } from "../../core/bridge-resume.js";
+import { isBridgeWaitTimeout, remainingMaxAgeMs, waitUntilBridgeReady } from "../../core/bridge-resume.js";
 import {
   isLocalLocation,
   LOCAL_LOCATION,
@@ -7086,7 +7086,8 @@ export class Orchestrator {
         assertCurrent?.();
         const result = await waitUntilBridgeReady(hub, location, { deadlineMs: 15 * 60_000, signal });
         if (result === "timeout") {
-          throw DispatchSuspendedError.defect(attemptId, `bridge "${location}" did not reconnect within 15 minutes`);
+          this.logger.warn({ id: attemptId, location }, "bridge still offline after 15 minutes; continuing to wait");
+          await waitUntilBridgeReady(hub, location, { deadlineMs: Number.POSITIVE_INFINITY, signal });
         }
       });
     } finally {
@@ -15678,7 +15679,7 @@ export class Orchestrator {
     this.logger.info({ attempt: attempt.id, location: binding.location, slot: binding.slot },
       "parked auth recovery handed back to its recorded session");
     if (accepted && resumeAccepted) {
-      this.trackContinuation(this.continueAcceptedReauth(attempt.id, !attempt.stalledReason?.startsWith(REAUTH_CHECKING_TEXT))
+      this.trackContinuation(this.continueSuspendedTurn(attempt.id, !attempt.stalledReason?.startsWith(REAUTH_CHECKING_TEXT))
         .then(() => {}).catch(err => this.logger.warn({ err, attempt: attempt.id }, "reauth continuation deferred")));
     }
     return true;
@@ -20077,7 +20078,7 @@ export class Orchestrator {
       return;
     }
     const promptStarted = this.store.turnAttempts.get(attemptId)?.promptStarted === true;
-    const refusal = await this.continueAcceptedReauth(attemptId);
+    const refusal = await this.continueSuspendedTurn(attemptId);
     await evt.followUpEphemeral(
       refusal
         ? `Authentication was recorded. The parked turn did not continue: ${refusal}`
@@ -20088,8 +20089,8 @@ export class Orchestrator {
     await this.refreshChoiceCard(fresh());
   }
 
-  /** Same executors as operator Resume, after the waiting prefix has been swapped. */
-  private async continueAcceptedReauth(attemptId: string, manualResume = true): Promise<string | null> {
+  /** Shared executors retain session, identity and submission checks. */
+  private async continueSuspendedTurn(attemptId: string, manualResume = true): Promise<string | null> {
     let attempt = this.store.turnAttempts.get(attemptId);
     if (!attempt || attempt.state !== "suspended") return "the attempt is not suspended";
     if (attempt.remoteRecovery) {
@@ -20122,10 +20123,15 @@ export class Orchestrator {
   }
 
   /** Bridge hello (including refreshed inventory) bypasses the tick's backoff. */
-  async recoverReauth(location: string): Promise<void> {
+  async recoverWaitingTurns(location: string): Promise<void> {
     for (const attempt of this.store.turnAttempts.list("suspended")) {
-      if (normalizeLocation(parseExecutionIdentity(attempt.identity)?.location ?? attempt.spec.location ?? "local") === normalizeLocation(location)
-        && isAwaitingReauth(attempt.stalledReason)) this.recheckReauth(attempt, true);
+      if (normalizeLocation(parseExecutionIdentity(attempt.identity)?.location ?? attempt.spec.location ?? "local") !== normalizeLocation(location)) continue;
+      if (isAwaitingReauth(attempt.stalledReason)) this.recheckReauth(attempt, true);
+      else if (isBridgeWaitTimeout(attempt.stalledReason)) {
+        this.trackContinuation(this.continueSuspendedTurn(attempt.id, false).then(refusal => {
+          if (refusal) this.logger.warn({ id: attempt.id, cause: refusal }, "bridge continuation deferred");
+        }).catch(err => this.logger.warn({ id: attempt.id, err }, "bridge continuation deferred")));
+      }
     }
   }
 
@@ -20149,7 +20155,7 @@ export class Orchestrator {
         this.store.turnAttempts.markStalled(attempt.id, `${attempt.stalledReason} (recheck deferred: ${cause})`);
       }
     };
-    this.trackContinuation(this.continueAcceptedReauth(attempt.id, false).then(refusal => {
+    this.trackContinuation(this.continueSuspendedTurn(attempt.id, false).then(refusal => {
       if (refusal) defer(refusal);
     }).catch(err => defer(errorMessage(err))));
   }

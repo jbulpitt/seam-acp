@@ -168,12 +168,12 @@ describe("automatic reauth recovery", () => {
     const h = harness(() => undefined);
     const id = await parkMessage(h);
     h.prompt.mockRejectedValueOnce(new RequestError(-32603, "Authentication required", { errorKind: "auth_required" }));
-    await (h.orch as unknown as { recoverReauth(location: string): Promise<void> }).recoverReauth("local");
+    await (h.orch as unknown as { recoverWaitingTurns(location: string): Promise<void> }).recoverWaitingTurns("local");
     await settleContinuations(h);
     expect(h.store.turnAttempts.get(id)).toMatchObject({ state: "suspended", promptStarted: true,
       acpSessionId: "fixture-acp" });
     resumeOutcome(h, false);
-    await (h.orch as unknown as { recoverReauth(location: string): Promise<void> }).recoverReauth("local");
+    await (h.orch as unknown as { recoverWaitingTurns(location: string): Promise<void> }).recoverWaitingTurns("local");
     await settleContinuations(h);
     expect(h.store.turnAttempts.get(id)?.state).toBe("completed");
     expect(h.prompt).toHaveBeenCalledTimes(3);
@@ -188,7 +188,7 @@ describe("automatic reauth recovery", () => {
     const id = await parkMessage(h);
     expect(h.store.turnAttempts.get(id)?.promptStarted).toBe(false);
     resumeOutcome(h, false);
-    await (h.orch as unknown as { recoverReauth(location: string): Promise<void> }).recoverReauth("local");
+    await (h.orch as unknown as { recoverWaitingTurns(location: string): Promise<void> }).recoverWaitingTurns("local");
     await settleContinuations(h);
     expect(h.store.turnAttempts.get(id)?.state).toBe("completed");
     expect(h.prompt).toHaveBeenCalledTimes(2);
@@ -252,10 +252,10 @@ describe("automatic reauth recovery", () => {
     const h = harness(() => ({ refreshTokenExpiresAt: 1 }));
     const id = await parkMessage(h);
     resumeOutcome(h, false);
-    const recovery = h.orch as unknown as { recoverReauth(location: string): Promise<void> };
-    await recovery.recoverReauth("different-host"); await settleContinuations(h);
+    const recovery = h.orch as unknown as { recoverWaitingTurns(location: string): Promise<void> };
+    await recovery.recoverWaitingTurns("different-host"); await settleContinuations(h);
     expect(h.prompt).toHaveBeenCalledOnce();
-    await Promise.all([recovery.recoverReauth("local"), recovery.recoverReauth("local"),
+    await Promise.all([recovery.recoverWaitingTurns("local"), recovery.recoverWaitingTurns("local"),
       h.orch.reconcileRemoteRecoveries()]);
     await settleContinuations(h);
     expect(h.store.turnAttempts.get(id)?.state).toBe("completed");
@@ -267,7 +267,7 @@ describe("automatic reauth recovery", () => {
     const h = harness(() => ({ refreshTokenExpiresAt: 1 }));
     const id = await parkMessage(h);
     h.store.turnAttempts.cancel(id, "cancelled by user");
-    await (h.orch as unknown as { recoverReauth(location: string): Promise<void> }).recoverReauth("local");
+    await (h.orch as unknown as { recoverWaitingTurns(location: string): Promise<void> }).recoverWaitingTurns("local");
     await settleContinuations(h);
     expect(h.prompt).toHaveBeenCalledOnce();
     expect(h.store.turnAttempts.get(id)?.state).toBe("cancelled");

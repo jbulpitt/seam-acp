@@ -11,6 +11,11 @@ import { isPastMaxAge } from "./dispatch/turn-resume.js";
 
 export type BridgeResumeWait = "ready" | "timeout";
 
+/** Persisted bridge wait expiry, distinct from session/identity refusals. */
+export function isBridgeWaitTimeout(reason: string | null | undefined): boolean {
+  return /^bridge "[^"]+" did not reconnect within 15 minutes$/.test(reason ?? "");
+}
+
 export function remainingMaxAgeMs(
   startedUtc: string,
   maxAgeSeconds: number,
@@ -60,7 +65,8 @@ export function waitUntilBridgeReady(
     const off = hub.onBridgeReady((id) => {
       if (id === loc) finish("ready");
     });
-    const timer = setTimeout(() => finish("timeout"), opts.deadlineMs);
+    const timer = Number.isFinite(opts.deadlineMs)
+      ? setTimeout(() => finish("timeout"), opts.deadlineMs) : undefined;
     opts.signal?.addEventListener("abort", abort, { once: true });
     // Ready may have flipped between the pre-check and the subscribe.
     if (hub.isBridgeReady(loc)) finish("ready");

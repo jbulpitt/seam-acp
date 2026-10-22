@@ -237,10 +237,10 @@ describe("pre-prompt bridge reconnect on the scheduled execution paths", () => {
       h.store.turnAttempts.startPrompt(attempt);
     }
     h.store.turnAttempts.markStalled(key.id, `bridge "${REMOTE}" did not reconnect within 15 minutes`);
-    await h.orch.recoverReauth("another-host");
+    await h.orch.recoverWaitingTurns("another-host");
     expect(h.calls.prompts).toEqual([]);
     if (trigger === "ready") {
-      await h.orch.recoverReauth(REMOTE);
+      await h.orch.recoverWaitingTurns(REMOTE);
       await h.orch["settleTrackedContinuations"]();
     } else {
       const manager = new ScheduledPromptManager({ store: h.store, logger: h.logger,
@@ -255,7 +255,7 @@ describe("pre-prompt bridge reconnect on the scheduled execution paths", () => {
     else expect(text).toContain(row.promptText);
     expect(h.store.turnAttempts.get(key.id)).toMatchObject({ state: "completed", deliveryDone: true });
     expect(h.store.scheduledOccurrences.pending()).toEqual([]);
-    await h.orch.recoverReauth(REMOTE);
+    await h.orch.recoverWaitingTurns(REMOTE);
     await h.orch["settleTrackedContinuations"]();
     expect(h.calls.prompts).toHaveLength(1);
   });

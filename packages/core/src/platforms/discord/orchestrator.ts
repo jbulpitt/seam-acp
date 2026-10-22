@@ -7095,6 +7095,9 @@ export class Orchestrator {
         assertCurrent?.();
         const result = await waitUntilBridgeReady(hub, location, { deadlineMs: 15 * 60_000, signal });
         if (result === "timeout") {
+          // Optional analysis has no durable attempt and retains its fallback.
+          if (!owner) throw DispatchSuspendedError.defect(attemptId,
+            `bridge "${location}" did not reconnect within 15 minutes`);
           this.logger.warn({ id: attemptId, location }, "bridge still offline after 15 minutes; continuing to wait");
           await waitUntilBridgeReady(hub, location, { deadlineMs: Number.POSITIVE_INFINITY, signal });
         }

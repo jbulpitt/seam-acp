@@ -221,6 +221,39 @@ async function prepromptBoundary(h: ReturnType<typeof offlineSchedule>, id: stri
 }
 
 describe("pre-prompt bridge reconnect on the scheduled execution paths", () => {
+  it.each([true, false])("keeps only durable waits alive beyond the optional-analysis fallback (durable=%s)", async durable => {
+    const h = offlineSchedule("live"); h.disconnect();
+    vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout"] });
+    const id = "bridge-wait-split";
+    if (durable) h.store.turnAttempts.admit({ id, target: h.row.channelRef, prompt: "pending work",
+      session: "live", kind: "forward", location: REMOTE, createdUtc: new Date().toISOString() });
+    let ended = false;
+    const waiting = h.orch["waitForTurnHost"](id, REMOTE).then(
+      () => { ended = true; return null; },
+      error => { ended = true; return error; },
+    );
+    try {
+      await drainPreprompt();
+      expect(h.events.listenerCount("ready")).toBe(1);
+      await vi.advanceTimersByTimeAsync(15 * 60_000 - 1);
+      expect(ended).toBe(false);
+      await vi.advanceTimersByTimeAsync(1);
+      if (durable) {
+        await vi.advanceTimersByTimeAsync(24 * 60 * 60_000);
+        expect(ended).toBe(false);
+        expect(h.store.turnAttempts.get(id)?.state).toBe("pending");
+        h.reconnect();
+        expect(await waiting).toBeNull();
+      } else {
+        expect(await waiting).toMatchObject({ suspension: "defect",
+          reason: `bridge "${REMOTE}" did not reconnect within 15 minutes` });
+        expect(h.store.turnAttempts.get(id)).toBeNull();
+      }
+      expect(h.calls.prompts).toEqual([]);
+      expect(h.events.listenerCount("ready")).toBe(0);
+    } finally { h.reconnect(); await waiting; }
+  });
+
   it.each((["ready", "tick"] as const).flatMap(trigger => [false, true].map(submitted => ({ trigger, submitted }))))
   ("recovers a legacy bridge suspension on $trigger (submitted=$submitted) without a new occurrence or replay", async ({ trigger, submitted }) => {
     const h = offlineSchedule("live", true);

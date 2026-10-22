@@ -182,7 +182,7 @@ describe("dispatch admission while its bound bridge is away", () => {
     } finally { h.reconnect(); await turn; }
   });
 
-  it("waits the full 15 minutes before surfacing the disconnected host cause", async () => {
+  it("keeps waiting beyond 15 minutes and dispatches once after reconnect", async () => {
     vi.useFakeTimers();
     const h = offlineDispatch();
     h.config.TURN_TIMEOUT_SECONDS = 1;
@@ -191,8 +191,11 @@ describe("dispatch admission while its bound bridge is away", () => {
       await vi.advanceTimersByTimeAsync(15 * 60_000 - 1);
       expect(h.store.turnAttempts.get(h.spec.id)).toMatchObject({ state: "pending", generation: 0 });
       expect(h.router.getOrStartRuntime).not.toHaveBeenCalled();
-      await vi.advanceTimersByTimeAsync(1);
-      expect(await turn).toMatchObject({ suspension: "defect", reason: expect.stringMatching(/remote-one.*15 minutes/) });
+      await vi.advanceTimersByTimeAsync(60_001);
+      expect(h.events.listenerCount("ready")).toBe(1);
+      expect(h.runtime.prompt).not.toHaveBeenCalled();
+      h.reconnect(); await turn;
+      expect(h.runtime.prompt).toHaveBeenCalledTimes(1);
       expect(h.events.listenerCount("ready")).toBe(0);
     } finally { h.reconnect(); await turn; }
   });

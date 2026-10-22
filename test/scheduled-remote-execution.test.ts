@@ -221,6 +221,82 @@ async function prepromptBoundary(h: ReturnType<typeof offlineSchedule>, id: stri
 }
 
 describe("pre-prompt bridge reconnect on the scheduled execution paths", () => {
+  it.each([true, false])("keeps only durable waits alive beyond the optional-analysis fallback (durable=%s)", async durable => {
+    const h = offlineSchedule("live"); h.disconnect();
+    vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout"] });
+    const id = "bridge-wait-split";
+    if (durable) h.store.turnAttempts.admit({ id, target: h.row.channelRef, prompt: "pending work",
+      session: "live", kind: "forward", location: REMOTE, createdUtc: new Date().toISOString() });
+    let ended = false;
+    const waiting = h.orch["waitForTurnHost"](id, REMOTE).then(
+      () => { ended = true; return null; },
+      error => { ended = true; return error; },
+    );
+    try {
+      await drainPreprompt();
+      expect(h.events.listenerCount("ready")).toBe(1);
+      await vi.advanceTimersByTimeAsync(15 * 60_000 - 1);
+      expect(ended).toBe(false);
+      await vi.advanceTimersByTimeAsync(1);
+      if (durable) {
+        await vi.advanceTimersByTimeAsync(24 * 60 * 60_000);
+        expect(ended).toBe(false);
+        expect(h.store.turnAttempts.get(id)?.state).toBe("pending");
+        h.reconnect();
+        expect(await waiting).toBeNull();
+      } else {
+        expect(await waiting).toMatchObject({ suspension: "defect",
+          reason: `bridge "${REMOTE}" did not reconnect within 15 minutes` });
+        expect(h.store.turnAttempts.get(id)).toBeNull();
+      }
+      expect(h.calls.prompts).toEqual([]);
+      expect(h.events.listenerCount("ready")).toBe(0);
+    } finally { h.reconnect(); await waiting; }
+  });
+
+  it.each((["ready", "tick"] as const).flatMap(trigger => [false, true].map(submitted => ({ trigger, submitted }))))
+  ("recovers a legacy bridge suspension on $trigger (submitted=$submitted) without a new occurrence or replay", async ({ trigger, submitted }) => {
+    const h = offlineSchedule("live", true);
+    const row = h.store.getScheduled(h.row.id)!;
+    const key = scheduledOccurrenceKey(row.id, "2026-10-22T19:50:00.000Z");
+    const execution = h.orch.scheduleExecution(row);
+    h.store.scheduledOccurrences.prepare(key, row, () => execution);
+    const boot = h.orch["attemptBoot"];
+    h.store.turnAttempts.registerOwner(boot);
+    const attempt = h.store.turnAttempts.claim({ id: key.id, target: row.channelRef, prompt: row.promptText,
+      session: "live", kind: "scheduled", createdUtc: key.scheduledFor!,
+      agentId: execution.agentId, location: execution.location, model: execution.model, cwd: execution.cwd },
+    execution.fingerprint, boot, "schedule");
+    if (submitted) {
+      h.store.turnAttempts.bind(attempt, h.record.acpSessionId);
+      h.store.turnAttempts.startPrompt(attempt);
+    }
+    h.store.turnAttempts.markStalled(key.id, `bridge "${REMOTE}" did not reconnect within 15 minutes`);
+    await h.orch.recoverWaitingTurns("another-host");
+    expect(h.calls.prompts).toEqual([]);
+    if (trigger === "ready") {
+      await h.orch.recoverWaitingTurns(REMOTE);
+      await h.orch["settleTrackedContinuations"]();
+    } else {
+      const manager = new ScheduledPromptManager({ store: h.store, logger: h.logger,
+        resolveExecution: row => h.orch.scheduleExecution(row), onFire: (id, occurrence) => h.orch.runScheduledPrompt(id, occurrence) });
+      try { await manager["fire"](row.id, scheduledOccurrenceKey(row.id, "2026-10-22T20:20:00.000Z")); }
+      finally { manager.stop(); }
+    }
+    const recovered = h.store.turnAttempts.get(key.id)!;
+    expect({ state: recovered.state, reason: recovered.stalledReason }).toEqual({ state: "completed", reason: null });
+    expect(h.calls.prompts).toHaveLength(1);
+    expect(h.calls.prompts[0].sessionId).toBe(h.record.acpSessionId);
+    const text = h.calls.prompts[0].prompt[0].text;
+    if (submitted) { expect(text).toMatch(/^continue\n/); expect(text).not.toContain(row.promptText); }
+    else expect(text).toContain(row.promptText);
+    expect(h.store.turnAttempts.get(key.id)).toMatchObject({ state: "completed", deliveryDone: true });
+    expect(h.store.scheduledOccurrences.pending()).toEqual([]);
+    await h.orch.recoverWaitingTurns(REMOTE);
+    await h.orch["settleTrackedContinuations"]();
+    expect(h.calls.prompts).toHaveLength(1);
+  });
+
   it.each([
     { mode: "live" as const, cached: true },
     { mode: "live" as const, cached: false },
@@ -245,6 +321,8 @@ describe("pre-prompt bridge reconnect on the scheduled execution paths", () => {
       h.reconnect("another-host"); await drainPreprompt();
       expect(h.calls.prompts).toEqual([]);
       h.reconnect(); await turn;
+      const recovered = h.store.turnAttempts.get(key.id)!;
+      expect({ state: recovered.state, reason: recovered.stalledReason }).toEqual({ state: "completed", reason: null });
       expect(h.calls.prompts).toHaveLength(1);
       expect(h.calls.prompts[0].prompt[0].text).toContain(h.row.promptText);
       if (cached) {
@@ -259,7 +337,7 @@ describe("pre-prompt bridge reconnect on the scheduled execution paths", () => {
     } finally { h.reconnect(); await turn; }
   });
 
-  it.each(["live", "isolated"] as const)("keeps %s unsent for the full 15-minute bound", async mode => {
+  it.each(["live", "isolated"] as const)("keeps %s waiting beyond 15 minutes and submits once when the bridge returns", async mode => {
     const h = offlineSchedule(mode); h.disconnect();
     vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout"] });
     const key = scheduledOccurrenceKey(h.row.id);
@@ -268,23 +346,35 @@ describe("pre-prompt bridge reconnect on the scheduled execution paths", () => {
       await prepromptBoundary(h, key.id); await vi.advanceTimersByTimeAsync(15 * 60_000 - 1);
       expect(h.store.turnAttempts.get(key.id)).toMatchObject({ state: "active", promptStarted: false });
       expect(h.calls.prompts).toEqual([]);
-      await vi.advanceTimersByTimeAsync(1); await turn;
-      expect(JSON.stringify(h.store.turnAttempts.get(key.id))).toMatch(/remote-synthetic.*15 minutes/);
+      await vi.advanceTimersByTimeAsync(60_001);
+      expect(h.store.turnAttempts.get(key.id)).toMatchObject({ state: "active", promptStarted: false });
+      expect(h.calls.prompts).toEqual([]);
+      expect(h.events.listenerCount("ready")).toBe(1);
+      h.reconnect(); await turn;
+      const finished = h.store.turnAttempts.get(key.id)!;
+      expect({ state: finished.state, reason: finished.stalledReason, error: finished.outcome?.error },
+        JSON.stringify({ status: h.store.getScheduled(h.row.id)?.lastStatus, logs: h.logs }))
+        .toEqual({ state: "completed", reason: null, error: undefined });
+      expect(h.calls.prompts).toHaveLength(1);
+      expect(h.store.scheduledOccurrences.get(key.id)?.settled).toBe(true);
       expect(h.events.listenerCount("ready")).toBe(0);
     } finally { h.reconnect(); await turn; }
   });
 
   it.each((["live", "isolated"] as const).flatMap(mode =>
     (["cancel", "shutdown"] as const).map(action => ({ mode, action }))))
-  ("releases the $mode pre-prompt wait on $action without submitting", async ({ mode, action }) => {
+  ("releases the $mode wait beyond 15 minutes on $action without submitting", async ({ mode, action }) => {
     const h = offlineSchedule(mode); h.disconnect();
+    vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout"] });
     const key = scheduledOccurrenceKey(h.row.id);
     const turn = h.orch.runScheduledPrompt(h.row.id, key);
     try {
       await prepromptBoundary(h, key.id);
+      await vi.advanceTimersByTimeAsync(16 * 60_000);
       expect(h.store.turnAttempts.get(key.id)).toMatchObject({ state: "active", promptStarted: false });
-      if (action === "cancel") h.store.turnAttempts.cancel(key.id, "cancelled by operator");
-      else h.orch.suspendForRestart();
+      if (action === "shutdown") h.orch.suspendForRestart();
+      else if (mode === "live") await h.orch.cancelChannel({ platform: "discord", id: h.row.channelRef });
+      else h.store.turnAttempts.cancel(key.id, "cancelled by operator");
       await turn;
       expect(h.calls.prompts).toEqual([]);
       expect(h.events.listenerCount("ready")).toBe(0);

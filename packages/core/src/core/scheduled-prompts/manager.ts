@@ -15,6 +15,7 @@ import { scheduledOccurrenceKey, type ScheduledOccurrenceKey, type ScheduledExec
 import { legacyAttachmentQuarantine, legacyAttachmentStatus } from "./quarantine.js";
 import type { Logger } from "../../lib/logger.js";
 import { isAwaitingReauth, reauthWaitingStatus } from "../reauth-negotiation.js";
+import { isBridgeWaitTimeout } from "../bridge-resume.js";
 
 export interface ScheduledPromptManagerOpts {
   store: SessionStore;
@@ -226,8 +227,11 @@ export class ScheduledPromptManager {
       if (!intent) {
         const pending = this.store.scheduledOccurrences.pending().find(row => row.scheduleId === id);
         const attempt = pending && this.store.turnAttempts.get(pending.id);
-        if (attempt?.state === "suspended" && isAwaitingReauth(attempt.stalledReason)) {
-          this.patchRow(id, { lastStatus: reauthWaitingStatus(attempt, current.timezone) });
+        if (attempt?.state === "suspended"
+          && (isAwaitingReauth(attempt.stalledReason) || isBridgeWaitTimeout(attempt.stalledReason))) {
+          if (isAwaitingReauth(attempt.stalledReason)) {
+            this.patchRow(id, { lastStatus: reauthWaitingStatus(attempt, current.timezone) });
+          }
           onReserved?.();
           await this.onFire(id, pending!);
         } else this.patchRow(id, { lastStatus: "skipped: still running" });

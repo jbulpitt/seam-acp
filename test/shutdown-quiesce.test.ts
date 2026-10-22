@@ -404,6 +404,7 @@ function makeQuiesceHost(over: Record<string, unknown> = {}) {
     cardJobs: new Set<Promise<void>>(),
     channelQueues: new Map<string, Promise<void>>(),
     attemptBoot: "shutdown-fixture-owner",
+    dispatchAcquisitions: new Set(),
     dispatchWatcher: undefined,
     scheduledManager: undefined,
     ...over,

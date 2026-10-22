@@ -657,7 +657,7 @@ async function main(): Promise<void> {
   stopBridgeUpdates = await installBridgeUpdater(bridgeHub, logger);
   stopPermissionBridgeRecovery = bridgeHub.onBridgeReady(location => {
     orchestrator.recoverPermissionCards(location);
-    void orchestrator.recoverReauth(location).catch(err => logger.warn({ err, location }, "reauth check deferred"));
+    void orchestrator.recoverWaitingTurns(location).catch(err => logger.warn({ err, location }, "waiting-turn recovery deferred"));
   });
   // Slots outlive controllers; rebind sessions before reaping true orphans.
   bridgeHub.onBridgeReady((location) => orchestrator.sweepUnownedSlots(location));

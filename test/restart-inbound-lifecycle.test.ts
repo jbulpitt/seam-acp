@@ -643,7 +643,7 @@ describe("#250 human turn production pipeline, synthetic transport only", () => 
       expect(h.router.getOrStartRuntime).not.toHaveBeenCalled();
       expect(resume).not.toHaveBeenCalled();
       expect(acceptReauthWait(h.store.turnAttempts, attempt.id)).not.toBeNull();
-      await (next as any).continueAcceptedReauth(attempt.id);
+      await (next as any).continueSuspendedTurn(attempt.id);
     }
     await vi.waitFor(() => expect(h.store.turnAttempts.get(attempt.id)?.state).toBe("completed"));
     await next.reconcileRemoteRecoveries();

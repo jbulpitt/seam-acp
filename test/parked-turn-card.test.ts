@@ -360,14 +360,14 @@ describe("durable parked-turn notice actions", () => {
 
   it("cancels an unavailable dispatch with one durable failure report-back and no card", async () => {
     const orch = controller();
-    const spec = { id: "cancel-only-dispatch", target: "worker", returnTo: "requester", reportBack: true,
+    const spec = { id: "cancel-only-dispatch", target: "worker", returnTo: "1543323221439414374", reportBack: true,
       kind: "handoff" as const, session: "live" as const, prompt: "UNSENT" };
-    store.recordDelegation({ id: spec.id, kind: "handoff", sourceRef: "requester", targetRef: "worker",
+    store.recordDelegation({ id: spec.id, kind: "handoff", sourceRef: "1543323221439414374", targetRef: "worker",
       worker: null, promptPreview: "UNSENT", correlationId: null, status: "interrupted" });
     store.turnAttempts.admit(spec);
     await orch.observeRetainedDispatch(spec, { reason: "provider acquisition failed: missing conversation" });
     const report = store.getReportBackByCorrelation(spec.id)!;
-    expect(report).toMatchObject({ kind: "report_back", targetRef: "requester" });
+    expect(report).toMatchObject({ kind: "report_back", targetRef: "1543323221439414374" });
     const queued = store.turnAttempts.get(report.id)!;
     expect(queued.spec.prompt).toContain("provider acquisition failed: missing conversation");
     expect(queued.spec.prompt).toContain("The prompt was never sent");
@@ -381,14 +381,14 @@ describe("durable parked-turn notice actions", () => {
 
   it("cancels an already-notified dispatch when only Cancel remains available", async () => {
     const orch = controller();
-    const spec = { id: "already-notified-deleted-target", target: "deleted-worker", returnTo: "requester", reportBack: true,
+    const spec = { id: "already-notified-deleted-target", target: "deleted-worker", returnTo: "1543323221439414374", reportBack: true,
       kind: "handoff" as const, session: "live" as const, prompt: "UNSENT" };
     const reason = "target thread is deleted; continuation cannot currently be admitted";
-    store.recordDelegation({ id: spec.id, kind: "handoff", sourceRef: "requester", targetRef: spec.target,
+    store.recordDelegation({ id: spec.id, kind: "handoff", sourceRef: "1543323221439414374", targetRef: spec.target,
       worker: null, promptPreview: spec.prompt, correlationId: null, status: "interrupted" });
     store.turnAttempts.claim(spec, executionIdentity({ agent: "codex", location: "local" }), "boot");
     store.turnAttempts.markStalled(spec.id, reason);
-    const posted = await orch.publishChoiceCard(orch.router.ensureSessionRecord({ channelRef: "requester" }), {
+    const posted = await orch.publishChoiceCard(orch.router.ensureSessionRecord({ channelRef: "1543323221439414374" }), {
       title: "Parked turn", body: `Dispatch is parked: ${reason}. Use Resume to continue.`,
       options: [{ label: "Abandon", kind: "prompt", payload: `parked-turn:abandon:${spec.id}` }],
     });
@@ -401,7 +401,7 @@ describe("durable parked-turn notice actions", () => {
 
     expect(store.turnAttempts.get(spec.id)).toMatchObject({ state: "cancelled", promptStarted: false });
     const report = store.getReportBackByCorrelation(spec.id)!;
-    expect(report).toMatchObject({ kind: "report_back", targetRef: "requester" });
+    expect(report).toMatchObject({ kind: "report_back", targetRef: "1543323221439414374" });
     expect(store.turnAttempts.get(report.id)!.spec.prompt).toContain(reason);
     expect(store.turnAttempts.get(report.id)!.spec.prompt).toContain("The prompt was never sent");
     expect(store.listRecentDelegations(20).filter(row => row.kind === "report_back")).toHaveLength(1);

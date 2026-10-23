@@ -2250,7 +2250,9 @@ export class Orchestrator {
     this.store.turnAttempts.markStalled(spec.id, reason);
     const stalled = this.store.turnAttempts.get(spec.id);
     if (stalled?.state !== "suspended" || !stalled.stalledUtc) return;
-    const requester = spec.returnTo ?? spec.originThreadRef ?? spec.target;
+    // An ingest caller's refs can name an endpoint rather than a chat channel.
+    const requester = [spec.returnTo, spec.originThreadRef].find(ref =>
+      ref && (this.recordForChannel(ref) || isDiscordSnowflake(ref))) ?? spec.target;
     await this.notifyParkedTurn(stalled, requester,
       `⚠️ Dispatch \`${spec.id}\` to <#${spec.target}> is parked: ${reason}.`
     );

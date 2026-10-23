@@ -8,13 +8,14 @@ import { AgentRuntime, type AgentEvent } from "../packages/core/src/agents/agent
 import { DispatchStatusPanel } from "../packages/core/src/core/dispatch-status-panel.js";
 import { TurnStatus } from "../packages/core/src/core/status-panel.js";
 import { discordRenderer } from "../packages/core/src/platforms/discord/renderer.js";
-import type { StructuredPanel } from "../packages/core/src/core/types.js";
+import { serializePanelText } from "../packages/core/src/platforms/renderer.js";
+import type { StatusCardStyle, StructuredPanel } from "../packages/core/src/core/types.js";
 import type { Logger } from "../packages/core/src/lib/logger.js";
 
 const cleanups: Array<() => Promise<void>> = [];
 afterEach(async () => { for (const cleanup of cleanups.splice(0).reverse()) await cleanup(); });
 
-async function fixture(agentId = "grok") {
+async function fixture(agentId = "grok", style: StatusCardStyle = "full") {
   const stdin = new PassThrough(), stdout = new PassThrough(), stderr = new PassThrough();
   const child = Object.assign(new EventEmitter(), {
     stdin, stdout, stderr, pid: undefined, killed: false,
@@ -49,6 +50,7 @@ async function fixture(agentId = "grok") {
   const rt = new AgentRuntime({ profile: { id: agentId } as AgentProfile,
     logger: pino({ level: "silent" }) as Logger, spawnFn: () => child as never });
   const status = new TurnStatus({ model: "grok-4.7", repoDisplay: "repo" });
+  status.style = style;
   const edits: StructuredPanel[] = [], events: AgentEvent[] = [];
   const panel = new DispatchStatusPanel(discordRenderer, status, {
     post: async () => "card", edit: async (_ref, value) => { edits.push(value); },
@@ -67,13 +69,14 @@ async function fixture(agentId = "grok") {
 }
 
 describe("Grok compaction notifications on the real ACP reader", () => {
-  it("shows compaction on the live card, then continues the same prompt without posting the summary", async () => {
-    const h = await fixture(); const { turn } = await h.start();
+  it.each(["full", "simple"] as const)("shows compaction on the %s card, then continues the same prompt without posting the summary", async style => {
+    const h = await fixture("grok", style); const { turn } = await h.start();
     h.send({ sessionUpdate: "auto_compact_started", tokens_used: 220_000, context_window: 256_000, percentage: 86, reason: "threshold" });
     await vi.waitFor(() => expect(h.status.action).toBe("Compacting memory…"));
-    await vi.waitFor(() => expect(JSON.stringify(h.edits)).toContain("Compacting memory…"));
+    await vi.waitFor(() => expect(h.edits.map(serializePanelText).join("\n")).toContain("Compacting memory…"));
     h.send({ sessionUpdate: "auto_compact_completed", tokens_before: 220_000, tokens_after: 30_000, elapsed_ms: 60_000, summary_preview: "private retained context" });
     await vi.waitFor(() => expect(h.status.action).toBe("Compaction complete · continuing…"));
+    await vi.waitFor(() => expect(h.edits.map(serializePanelText).join("\n")).toContain("Compaction complete · continuing…"));
     h.finish(); await turn;
     expect(h.events.filter(event => event.kind === "agent-text")).toEqual([{ kind: "agent-text", text: "continued answer" }]);
     expect(JSON.stringify(h.edits)).not.toContain("private retained context");

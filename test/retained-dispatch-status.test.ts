@@ -3,6 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { pino } from "pino";
+import { DiscordAPIError } from "discord.js";
 import { attachErrorClassification } from "@seam/adapters";
 import { SessionStore } from "../packages/core/src/core/session-store.js";
 import { Orchestrator } from "../packages/core/src/platforms/discord/orchestrator.js";
@@ -29,6 +30,7 @@ let sequence: number;
 let messages: Map<string, StructuredPanel>;
 let edits: Array<{ ref: MessageRef; panel: StructuredPanel }>;
 let acquire: ReturnType<typeof vi.fn>;
+let editFailure: Error | undefined;
 
 function controller() {
   const record = store.getByChannel("discord", target)!;
@@ -52,7 +54,9 @@ function controller() {
         messages.set(ref.id, panel); return ref;
       },
       editPanel: async (ref: MessageRef, panel: StructuredPanel) => {
-        edits.push({ ref, panel }); messages.set(ref.id, panel);
+        edits.push({ ref, panel });
+        if (editFailure) throw editFailure;
+        messages.set(ref.id, panel);
       },
       sendMessage: vi.fn(async (channel: MessageRef["channel"]) => ({ channel, id: `text-${++sequence}` })),
       sendChoiceCard: vi.fn(async (channel: MessageRef["channel"]) => ({ channel, id: `notice-${++sequence}` })),
@@ -90,7 +94,7 @@ beforeEach(() => {
   store.upsert({ id: `discord:${target}`, platform: "discord", channelRef: target, parentRef: "parent",
     agentId: "agy", acpSessionId: "", repoPath: dir, configJson: "{}",
     createdUtc: spec.createdUtc, updatedUtc: spec.createdUtc });
-  sequence = 0; messages = new Map(); edits = [];
+  sequence = 0; messages = new Map(); edits = []; editFailure = undefined;
   const refusal = new Error("unknown AGY model unknown-agy-model");
   attachErrorClassification(refusal, { agentId: "agy", errorKind: "model_not_found" });
   acquire = vi.fn(async () => { throw refusal; });
@@ -129,14 +133,14 @@ describe("retained forward status ownership", () => {
     expect(store.listOpenChoiceCards("discord", target)).toEqual([]);
   });
 
-  it("boot paints a cancellation missed during shutdown once, without repainting 413 settled history cards", async () => {
+  it("boot paints a cancellation missed during shutdown once, without repainting 860 settled history cards", async () => {
     const parked = await refuse();
     const messageId = parked.statusCard!.messageId;
     await stop(); store.close();
     // No controller is alive when the terminal commit wins before its paint.
     store = new SessionStore(path.join(dir, "seam.db"));
     expect(store.turnAttempts.cancel(spec.id)).toBe(true);
-    for (let index = 0; index < 413; index++) {
+    for (let index = 0; index < 860; index++) {
       const history = store.turnAttempts.claim({ ...spec, id: `history-${index}` }, "history", "old-boot");
       store.turnAttempts.bindStatusCard(history, { channelId: target, messageId: `history-card-${index}` });
       const terminal = new TurnStatus({ model: "old", repoDisplay: dir });
@@ -154,6 +158,54 @@ describe("retained forward status ownership", () => {
     expect(edits).toHaveLength(1);
     expect(edits[0]!.ref.id).toBe(messageId);
     expect(acquire).not.toHaveBeenCalled();
+    expect(store.turnAttempts.get(spec.id)?.submissions ?? []).toEqual([]);
+    edits.length = 0; await boot();
+    expect(edits).toEqual([]);
+    expect(acquire).not.toHaveBeenCalled();
+  });
+
+  it.each(["cancel", "boot"] as const)("keeps a rejected %s paint recoverable until Discord accepts it", async phase => {
+    const parked = await refuse();
+    const messageId = parked.statusCard!.messageId;
+    const notice = store.listOpenChoiceCards("discord", target)[0]!;
+    await stop(); store.close();
+    store = new SessionStore(path.join(dir, "seam.db"));
+    if (phase === "boot") expect(store.turnAttempts.cancel(spec.id)).toBe(true);
+    for (let index = 0; index < 860; index++) {
+      const history = store.turnAttempts.claim({ ...spec, id: `history-${index}` }, "history", "old-boot");
+      store.turnAttempts.bindStatusCard(history, { channelId: target, messageId: `history-card-${index}` });
+      const status = new TurnStatus({ model: "old", repoDisplay: dir });
+      status.setState("Failed"); status.setAction("Cancelled");
+      store.turnAttempts.saveStatusCardState(history, status.snapshot());
+      store.turnAttempts.cancel(history.id);
+    }
+    store.close(); store = new SessionStore(path.join(dir, "seam.db"));
+    controller(); acquire.mockClear(); edits.length = 0;
+    editFailure = new DiscordAPIError({ code: 50083, message: "Thread is archived" },
+      50083, 400, "PATCH", `https://discord.com/api/v10/channels/${target}/messages/${messageId}`,
+      { body: {}, files: [] });
+    if (phase === "cancel") {
+      await host.handleChoiceCardInteraction({ customId: makeChoiceCustomId(notice.id, 1), userId: "tester",
+        userName: "Tester", channel: { platform: "discord", id: target, parentId: "parent" },
+        messageId: notice.messageId, kind: "button", replyEphemeral: vi.fn(async () => {}),
+        followUpEphemeral: vi.fn(async () => {}) } as any);
+    } else await watcher.start();
+    await drain();
+
+    expect(edits.length).toBeGreaterThan(0);
+    expect(edits.every(edit => edit.ref.id === messageId)).toBe(true);
+    expect(messages.get(messageId)?.title).toBe("📤 Forward · Waiting");
+    expect(store.turnAttempts.get(spec.id)).toMatchObject({ state: "cancelled", generation: 1, promptStarted: false,
+      statusCardState: { status: { input: { state: "Waiting" } } } });
+    expect(acquire).not.toHaveBeenCalled();
+
+    // The same existing boot path retries after the platform becomes editable.
+    editFailure = undefined; edits.length = 0;
+    await boot();
+    expect(edits).toHaveLength(1);
+    expect(edits[0]!.ref.id).toBe(messageId);
+    expect(messages.get(messageId)?.title).toBe("📤 Forward · Failed");
+    expect(store.turnAttempts.get(spec.id)?.statusCardState?.status.input.state).toBe("Failed");
     expect(store.turnAttempts.get(spec.id)?.submissions ?? []).toEqual([]);
     edits.length = 0; await boot();
     expect(edits).toEqual([]);

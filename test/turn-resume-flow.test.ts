@@ -683,6 +683,7 @@ describe("watcher recoverStale vs resumeEnabled", () => {
   });
 
   it("durably quarantines and reports a post-readiness retain through the production watcher path (#290)", async () => {
+    store.upsert(record({ id: "discord:thread-boss", channelRef: "thread-boss" }));
     const spec = handoffSpec({ agentId: "codex", createdUtc: new Date().toISOString() });
     await seedInterrupted(spec);
     const before = store.turnAttempts.get(spec.id)!;

@@ -46,7 +46,7 @@ function setup() {
 }
 
 describe("choice availability follows the requesting turn", () => {
-  it.each(["handoff", "forward"] as const)("%s returns the real caller in the MCP error and publishes nothing", async kind => {
+  it.each(["handoff", "forward", "report_back"] as const)("%s MCP choice availability follows its turn kind", async kind => {
     const h = setup();
     h.start(h.spec(kind));
     const server = new SeamMcpServer({ logger: pino({ level: "silent" }) as any,
@@ -57,6 +57,11 @@ describe("choice availability follows the requesting turn", () => {
       headers: { "content-type": "application/json", "x-seam-session": "token" },
       body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "create_choice", arguments: choice } }) });
     const body = await response.json() as any;
+    if (kind !== "handoff") {
+      expect(body.result.isError).not.toBe(true);
+      expect(h.adapter.sendChoiceCard).toHaveBeenCalledOnce();
+      return;
+    }
     expect(body.result.isError).toBe(true);
     expect(body.result.content[0].text).toContain("thread caller (an agent)");
     expect(body.result.content[0].text).toContain("put the question in your result");
@@ -64,7 +69,7 @@ describe("choice availability follows the requesting turn", () => {
     expect(h.adapter.sendChoiceCard).not.toHaveBeenCalled();
   });
 
-  it.each(["report_back", "wake", "scheduled", "watch", "parked", "choice", undefined] as const)("%s preserves card publication", async kind => {
+  it.each(["forward", "report_back", "wake", "scheduled", "watch", "parked", "choice", undefined] as const)("%s preserves card publication", async kind => {
     const h = setup();
     if (kind) h.start(h.spec(kind));
     else (h.orch as any).currentAuthorIds.set("worker", "user");
@@ -123,12 +128,13 @@ describe("choice availability follows the requesting turn", () => {
   it("worker capture keeps prose and other fences and converts closed or unclosed choice fences", () => {
     const h = setup();
     const text = "Before\n```js\nconst answer = 42;\n```\n" + fence + "\nAfter";
-    const output = agentChoiceOutput(text, h.spec("forward"));
+    const output = agentChoiceOutput(text, h.spec("handoff"));
     expect(output).toContain("Before\n```js\nconst answer = 42;\n```");
     expect(output).toContain("Question for you: May I reserve staging?");
     expect(output).toContain("\nAfter");
     expect(output).not.toContain("seam-choice");
-    expect(agentChoiceOutput(fence.slice(0, -3), h.spec("forward"))).not.toContain("seam-choice");
+    expect(agentChoiceOutput(fence.slice(0, -3), h.spec("handoff"))).not.toContain("seam-choice");
+    expect(agentChoiceOutput(text, h.spec("forward"))).toBe(text);
     expect(agentChoiceOutput(text, h.spec("wake"))).toBe(text);
     expect(agentChoiceOutput(text, h.spec("report_back"))).toBe(text);
   });

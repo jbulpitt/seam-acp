@@ -8,7 +8,7 @@ import { Orchestrator } from "../packages/core/src/platforms/discord/orchestrato
 import { DispatchWatcher } from "../packages/core/src/core/dispatch/watcher.js";
 import { executionIdentity } from "../packages/core/src/core/dispatch/execution-identity.js";
 import { parkedTurnAction, parkedTurnChoiceSpec, parkedTurnContext } from "../packages/core/src/core/parked-turn-card.js";
-import type { TurnAttempt } from "../packages/core/src/core/dispatch/attempt-store.js";
+import { DispatchSuspendedError, type TurnAttempt } from "../packages/core/src/core/dispatch/attempt-store.js";
 import type { ScheduledPrompt } from "../packages/core/src/core/scheduled-prompts/types.js";
 import { TurnStatus } from "../packages/core/src/core/status-panel.js";
 import { makeChoiceCustomId } from "../packages/core/src/core/choice/types.js";
@@ -151,6 +151,48 @@ describe("recorded parked-turn context", () => {
 });
 
 describe("durable parked-turn notice actions", () => {
+  it.each([
+    { returnTo: "ie_Nila-QvWlb3E", originThreadRef: "ie_Nila-QvWlb3E", expected: "1543323221439414372" },
+    { returnTo: "ie_Nila-QvWlb3E", originThreadRef: "1543323221439414373", expected: "1543323221439414373" },
+    { returnTo: "not-a-channel", originThreadRef: "also-not-a-channel", expected: "1543323221439414372" },
+    { returnTo: "1543323221439414374", originThreadRef: "1543323221439414373", expected: "1543323221439414374" },
+    { returnTo: "spaces/configured-chat-space", originThreadRef: "ie_Nila-QvWlb3E", expected: "spaces/configured-chat-space" },
+  ])("routes a retained dispatch notice from $returnTo to $expected without running it", async ({ returnTo, originThreadRef, expected }) => {
+    const orch = controller();
+    const cause = "provider acquisition failed during boot-recovery: Strict resume refused: thread now belongs to a different ACP session";
+    const spec = { id: "ingest-origin-forward", target: "1543323221439414372", returnTo, originThreadRef,
+      reportBack: false, kind: "forward" as const, session: "live" as const,
+      prompt: "ORIGINAL-BRIEF-DO-NOT-REPLAY", createdUtc: new Date().toISOString() };
+    store.upsert({ id: "google-chat:configured-chat-space", platform: "google-chat", channelRef: "spaces/configured-chat-space",
+      parentRef: null, agentId: "codex", acpSessionId: "chat-acp", repoPath: dir, configJson: "{}",
+      createdUtc: spec.createdUtc, updatedUtc: spec.createdUtc });
+    const attempt = store.turnAttempts.claim(spec, executionIdentity({ agent: "claude", location: "local" }), "boot");
+    store.turnAttempts.bind(attempt, "original-acp");
+    store.turnAttempts.startPrompt(attempt);
+    orch.adapter.sendChoiceCard.mockImplementation(async (channel: { id: string }) => {
+      if (channel.id !== expected) throw Object.assign(new Error(`Invalid Form Body: channel_id "${channel.id}" is not snowflake`), { code: 50035 });
+      return { id: "notice" };
+    });
+
+    await orch.observeRetainedDispatch(spec, DispatchSuspendedError.defect(spec.id, cause));
+
+    const platform = expected.startsWith("spaces/") ? "google-chat" : "discord";
+    const cards = store.listOpenChoiceCards(platform, expected);
+    expect(cards).toHaveLength(1);
+    expect(cards[0]!.body).toContain(cause);
+    expect(cards[0]!.options.map(option => parkedTurnAction(option.payload))).toEqual([
+      { action: "resume", attemptId: spec.id }, { action: "cancel", attemptId: spec.id },
+    ]);
+    expect(store.turnAttempts.get(spec.id)).toMatchObject({ state: "suspended", generation: 1,
+      acpSessionId: "original-acp", promptStarted: true, stalledReason: cause, outcome: null,
+      stallNoticeUtc: expect.any(String) });
+    expect(store.getReportBackByCorrelation(spec.id)).toBeNull();
+    expect(orch.adapter.sendMessage).not.toHaveBeenCalled();
+
+    await orch.observeRetainedDispatch(spec, DispatchSuspendedError.defect(spec.id, cause));
+    expect(orch.adapter.sendChoiceCard).toHaveBeenCalledTimes(1);
+  });
+
   it("claims and settles Cancel while the central ACK is pending, then replies privately", async () => {
     const orch = controller();
     orch.adapter.sendChoiceCard.mockResolvedValueOnce({ id: "notice", jumpUrl: "https://discord.com/channels/g/worker/notice" });

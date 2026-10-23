@@ -1556,7 +1556,7 @@ describe("SeamMcpServer", () => {
     // The raw prompt is wrapped in the <seam-steer> frame, not passed verbatim.
     expect(spec.prompt).toContain("<seam-steer>");
     expect(spec.prompt).toContain("focus on the failing test first");
-    expect(spec.prompt).toContain("steering you mid-task");
+    expect(spec.prompt).toContain("course correction");
     expect(spec.originThreadRef).toBe("thread-caller");
     expect(body.result.content[0].text).toContain("Queued steering instruction");
     expect(body.result.content[0].text).toContain("separate turn");

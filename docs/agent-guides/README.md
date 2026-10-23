@@ -71,7 +71,8 @@ still govern the current thread. This primer does not replace them.
    - `send` leaves a note for the target's next inbox poll and starts no turn.
    - `handoff` assigns work and reports the result back automatically.
    - `forward` relays content and starts a turn without specialist framing.
-   - `steer` redirects a currently running teammate while preserving context.
+   - `steer` queues a course correction as a separate turn in the existing
+     session, after running and already queued work.
    - `send(..., interrupt:true)` runs next after the current turn, ahead of queued dispatches; it never cancels running work;
      reserve it for a genuine preemption. `fresh:true` also drops its context.
    - `chain` runs a fixed sequence whose output feeds the next worker.
@@ -110,7 +111,8 @@ Use this as a map, not as a substitute for each tool's live schema.
 - Immediate task with automatic report-back: `handoff`.
 - Thin immediate relay: `forward`.
 - Non-interrupting note to a busy teammate: `send`.
-- Mid-turn course correction: `steer`.
+- Mid-turn feedback: `send`, read at the teammate's next `poll_inbox`.
+- Course correction queued after existing work: `steer`.
 - Ordered multi-worker pipeline: `chain`.
 
 Choice clicks, wakes and handoffs queued for a live thread follow its FIFO

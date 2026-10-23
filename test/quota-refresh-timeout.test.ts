@@ -208,7 +208,16 @@ describe("bounded quota refresh", () => {
   it.each(["headers", "body"] as const)(
     "aborts the real Copilot source while response %s are stalled",
     async (stallAt) => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "seam-quota-copilot-"));
+    let poller: AgentQuotaPoller | undefined;
+    let releaseIdentity!: () => void;
+    const identityRead = new Promise<void>(resolve => { releaseIdentity = resolve; });
+    const readFile = fs.promises.readFile.bind(fs.promises);
+    vi.spyOn(fs.promises, "readFile").mockImplementationOnce((async (file, options) => {
+      await identityRead;
+      return readFile(file, options);
+    }) as typeof fs.promises.readFile);
     try {
       fs.writeFileSync(path.join(dir, "config.json"), JSON.stringify({
         lastLoggedInUser: { host: "github.com", login: "fixture" },
@@ -218,21 +227,24 @@ describe("bounded quota refresh", () => {
       vi.stubGlobal("fetch", vi.fn((_url: string, init?: RequestInit) => {
         fetchSignal = init?.signal ?? undefined;
         const stalled = async () => await new Promise<never>((_resolve, reject) => {
-            fetchSignal?.addEventListener("abort", () => reject(fetchSignal?.reason), { once: true });
+            if (fetchSignal?.aborted) reject(fetchSignal.reason);
+            else fetchSignal?.addEventListener("abort", () => reject(fetchSignal?.reason), { once: true });
         });
         if (stallAt === "headers") return stalled();
         return Promise.resolve({ ok: true, json: stalled } as Response);
       }));
       const profile = { id: "copilot", displayName: "Copilot", configDir: dir } as AgentProfile;
       const [source] = createAgentQuotaSources([profile], {});
-      const poller = new AgentQuotaPoller({
+      poller = new AgentQuotaPoller({
         logger: silent,
         registry: new QuotaRegistry(),
         sources: [source!],
         sourceTimeoutMs: 25,
         staleRetentionMs: 0,
       });
-      const result = await poller.refreshAll(true);
+      const refresh = poller.refreshAll(true);
+      await vi.advanceTimersByTimeAsync(25);
+      const result = await refresh;
       expect(fetchSignal?.aborted).toBe(true);
       expect(result.sources[0]).toMatchObject({
         agentId: "copilot",
@@ -242,6 +254,9 @@ describe("bounded quota refresh", () => {
       expect(JSON.stringify(result)).not.toContain("credential-must-not-surface");
       expect(JSON.stringify(result)).not.toContain(dir);
     } finally {
+      releaseIdentity();
+      poller?.stop();
+      await poller?.drain();
       fs.rmSync(dir, { recursive: true, force: true });
     }
     },

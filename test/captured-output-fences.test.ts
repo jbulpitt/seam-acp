@@ -78,14 +78,26 @@ describe("one math registry across captured and streamed output", () => {
 });
 
 describe("captured agent output uses live fence handlers", () => {
-  it.each(["messages", "card"])("renders a quiet %s forward as a question for its caller in prose order", async style => {
+  it.each(["messages", "card"])("renders a quiet %s handoff as a question for its caller in prose order", async style => {
     const h = setup(style);
+    h.spec.kind = "handoff";
     await h.orch.postDispatchOutput(h.channel, h.spec, `Before\n\n${fence}\n\nAfter`);
     expect(h.adapter.sendChoiceCard).not.toHaveBeenCalled();
     const output = h.visible.join("");
     expect(output).toMatch(/Before[\s\S]*Question for you: Choose next[\s\S]*After/);
     expect(output).toContain("- Continue");
     expect(output).toContain("thread caller (an agent)");
+    expect(h.visible.join("")).not.toContain("seam-choice");
+  });
+
+  it.each(["forward", "report_back"].flatMap(kind => ["messages", "card"].map(style => ({ kind, style }))))
+  ("publishes a quiet $style $kind choice without exposing directive JSON", async ({ kind, style }) => {
+    const h = setup(style);
+    h.spec.kind = kind;
+    await h.orch.postDispatchOutput(h.channel, h.spec, `Before\n\n${fence}\n\nAfter`);
+    expect(h.adapter.sendChoiceCard).toHaveBeenCalledOnce();
+    expect(h.visible.join("")).toMatch(/Before[\s\S]*After/);
+    expect(h.visible.join("")).not.toContain("Question for you:");
     expect(h.visible.join("")).not.toContain("seam-choice");
   });
 
@@ -99,6 +111,7 @@ describe("captured agent output uses live fence handlers", () => {
 
   it("processes the quiet stateless handoff card without embedding directive JSON", async () => {
     const h = setup();
+    h.spec.kind = "handoff";
     await h.orch.publishStatelessHandoffCard(h.channel, h.spec, undefined, "▶ Handoff", Date.now(), { text: fence });
     expect(h.adapter.sendChoiceCard).not.toHaveBeenCalled();
     const output = JSON.stringify(h.adapter.sendPanel.mock.calls[0]![1]);

@@ -27,6 +27,9 @@ this file; HTTP submissions have a separate guide. Skip them until needed.
 Publish with MCP `create_choice` or a `seam-choice` fence (stripped from
 chat; the card is a follow-up in **this** thread):
 
+Only handoff turns suppress choice cards and return their questions to the
+caller. Forward and report-back turns can publish cards through either path.
+
 ```json
 {
   "title": "Does this explanation make sense?",

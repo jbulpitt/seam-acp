@@ -1,9 +1,9 @@
 import type { DispatchSpec } from "../dispatch/types.js";
 import { CHOICE_FENCE_LANG, parseChoiceFence } from "./types.js";
 
-/** Agent callers read results; they cannot answer cards in the worker thread. */
+/** Handoff callers collect worker questions in their results. */
 export function agentChoiceRefusal(spec?: DispatchSpec): string | undefined {
-  if (!spec || !["handoff", "forward"].includes(spec.kind ?? "")) return undefined;
+  if (spec?.kind !== "handoff") return undefined;
   const caller = spec.originThreadRef ?? spec.returnTo;
   if (!caller) return undefined;
   return `Choice cards are unavailable: this turn was requested by thread ${caller} (an agent); put the question in your result and the caller will decide or ask the user.`;

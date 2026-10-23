@@ -252,7 +252,7 @@ describe('dispatchInjectTurn: start indicator + live streaming ("card" style)', 
     { style: "card" as const, stream: true },
     { style: "messages" as const, stream: false },
     { style: "card" as const, stream: false },
-  ])("returns a forward choice question to its caller for $style / stream=$stream", async ({ style, stream }) => {
+  ])("returns a handoff choice question to its caller for $style / stream=$stream", async ({ style, stream }) => {
     const log: string[] = [];
     const rt = fakeRuntime(["Before\n\n```seam-", 'choice\n{"title":"Pick","options":[{"label":"Continue","kind":"prompt","payload":"continue"}]}\n', "```\n\nAfter"], log);
     const { adapter, calls } = spyAdapter(log);
@@ -261,7 +261,7 @@ describe('dispatchInjectTurn: start indicator + live streaming ("card" style)', 
     (orch as any).effectiveCwd = () => "/repo";
     const publish = vi.spyOn(orch, "createChoice").mockResolvedValue({ ok: true, choiceId: "choice", messageId: "card" });
     const prompt = vi.spyOn(rt, "prompt");
-    const result = await orch.dispatchInjectTurn(baseSpec({ kind: "forward", originThreadRef: "caller", stream }));
+    const result = await orch.dispatchInjectTurn(baseSpec({ kind: "handoff", originThreadRef: "caller", stream }));
     expect(publish).not.toHaveBeenCalled();
     expect(result.output).toContain("Question for you: Pick");
     expect(result.output).toContain("- Continue");
@@ -277,7 +277,7 @@ describe('dispatchInjectTurn: start indicator + live streaming ("card" style)', 
     expect(displayed).toContain("After");
   });
 
-  it.each(["wake", "scheduled"] as const)("a %s still advertises and publishes choice fences", async kind => {
+  it.each(["forward", "report_back", "wake", "scheduled"] as const)("a %s advertises and publishes choice fences", async kind => {
     const log: string[] = [];
     const rt = fakeRuntime(['```seam-choice\n{"title":"Pick","options":[{"label":"Continue","kind":"prompt","payload":"continue"}]}\n```'], log);
     const { adapter } = spyAdapter(log);
@@ -286,7 +286,7 @@ describe('dispatchInjectTurn: start indicator + live streaming ("card" style)', 
     (orch as any).effectiveCwd = () => "/repo";
     const publish = vi.spyOn(orch, "createChoice").mockResolvedValue({ ok: true, choiceId: "choice", messageId: "card" });
     const prompt = vi.spyOn(rt, "prompt");
-    const result = await orch.dispatchInjectTurn(baseSpec({ kind }));
+    const result = await orch.dispatchInjectTurn(baseSpec({ kind, originThreadRef: "caller" }));
     expect(publish).toHaveBeenCalledOnce();
     expect(String(prompt.mock.calls[0]?.[0])).toContain("To publish a frozen click-card");
     expect(result.output).toContain("seam-choice");

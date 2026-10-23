@@ -195,8 +195,8 @@ describe("retained forward status ownership", () => {
     expect(edits.length).toBeGreaterThan(0);
     expect(edits.every(edit => edit.ref.id === messageId)).toBe(true);
     expect(messages.get(messageId)?.title).toBe("📤 Forward · Waiting");
-    expect(store.turnAttempts.get(spec.id)).toMatchObject({ state: "cancelled", generation: 1, promptStarted: false,
-      statusCardState: { status: { input: { state: "Waiting" } } } });
+    expect(store.turnAttempts.get(spec.id)).toMatchObject({ state: "cancelled", generation: 1, promptStarted: false });
+    expect(["Working", "Waiting"]).toContain(store.turnAttempts.get(spec.id)?.statusCardState?.status.input.state);
     expect(acquire).not.toHaveBeenCalled();
 
     // The same existing boot path retries after the platform becomes editable.

@@ -8,7 +8,7 @@ import { Orchestrator } from "../packages/core/src/platforms/discord/orchestrato
 import { DispatchWatcher } from "../packages/core/src/core/dispatch/watcher.js";
 import { executionIdentity } from "../packages/core/src/core/dispatch/execution-identity.js";
 import { parkedTurnAction, parkedTurnChoiceSpec, parkedTurnContext } from "../packages/core/src/core/parked-turn-card.js";
-import type { TurnAttempt } from "../packages/core/src/core/dispatch/attempt-store.js";
+import { DispatchSuspendedError, type TurnAttempt } from "../packages/core/src/core/dispatch/attempt-store.js";
 import type { ScheduledPrompt } from "../packages/core/src/core/scheduled-prompts/types.js";
 import { TurnStatus } from "../packages/core/src/core/status-panel.js";
 import { makeChoiceCustomId } from "../packages/core/src/core/choice/types.js";
@@ -28,7 +28,7 @@ function controller() {
   orch.logger = logger;
   orch.config = { DATA_DIR: dir, REPOS_ROOT: dir, DISCORD_ALLOWED_USER_IDS: new Set(["user"]),
     channelPresets: new Map(), threadPresets: new Map() };
-  orch.router = { ensureSessionRecord: ({ channelRef }: any) => ({ id: `discord:${channelRef}`, platform: "discord", channelRef, parentRef: "parent" }) };
+  orch.router = { ensureSessionRecord: ({ channelRef, platform = "discord" }: any) => ({ id: `${platform}:${channelRef}`, platform, channelRef, parentRef: "parent" }) };
   const watcher = new DispatchWatcher({ dataDir: dir, logger: logger as any, attempts: store.turnAttempts, onDispatch: async () => {} });
   watchers.push(watcher);
   orch.dispatchWatcher = watcher;
@@ -151,6 +151,48 @@ describe("recorded parked-turn context", () => {
 });
 
 describe("durable parked-turn notice actions", () => {
+  it.each([
+    { returnTo: "ie_Nila-QvWlb3E", originThreadRef: "ie_Nila-QvWlb3E", expected: "1543323221439414372" },
+    { returnTo: "ie_Nila-QvWlb3E", originThreadRef: "1543323221439414373", expected: "1543323221439414373" },
+    { returnTo: "not-a-channel", originThreadRef: "also-not-a-channel", expected: "1543323221439414372" },
+    { returnTo: "1543323221439414374", originThreadRef: "1543323221439414373", expected: "1543323221439414374" },
+    { returnTo: "spaces/configured-chat-space", originThreadRef: "ie_Nila-QvWlb3E", expected: "spaces/configured-chat-space" },
+  ])("routes a retained dispatch notice from $returnTo to $expected without running it", async ({ returnTo, originThreadRef, expected }) => {
+    const orch = controller();
+    const cause = "provider acquisition failed during boot-recovery: Strict resume refused: thread now belongs to a different ACP session";
+    const spec = { id: "ingest-origin-forward", target: "1543323221439414372", returnTo, originThreadRef,
+      reportBack: false, kind: "forward" as const, session: "live" as const,
+      prompt: "ORIGINAL-BRIEF-DO-NOT-REPLAY", createdUtc: new Date().toISOString() };
+    store.upsert({ id: "google-chat:configured-chat-space", platform: "google-chat", channelRef: "spaces/configured-chat-space",
+      parentRef: null, agentId: "codex", acpSessionId: "chat-acp", repoPath: dir, configJson: "{}",
+      createdUtc: spec.createdUtc, updatedUtc: spec.createdUtc });
+    const attempt = store.turnAttempts.claim(spec, executionIdentity({ agent: "claude", location: "local" }), "boot");
+    store.turnAttempts.bind(attempt, "original-acp");
+    store.turnAttempts.startPrompt(attempt);
+    orch.adapter.sendChoiceCard.mockImplementation(async (channel: { id: string }) => {
+      if (channel.id !== expected) throw Object.assign(new Error(`Invalid Form Body: channel_id "${channel.id}" is not snowflake`), { code: 50035 });
+      return { id: "notice" };
+    });
+
+    await orch.observeRetainedDispatch(spec, DispatchSuspendedError.defect(spec.id, cause));
+
+    const platform = expected.startsWith("spaces/") ? "google-chat" : "discord";
+    const cards = store.listOpenChoiceCards(platform, expected);
+    expect(cards).toHaveLength(1);
+    expect(cards[0]!.body).toContain(cause);
+    expect(cards[0]!.options.map(option => parkedTurnAction(option.payload))).toEqual([
+      { action: "resume", attemptId: spec.id }, { action: "cancel", attemptId: spec.id },
+    ]);
+    expect(store.turnAttempts.get(spec.id)).toMatchObject({ state: "suspended", generation: 1,
+      acpSessionId: "original-acp", promptStarted: true, stalledReason: cause, outcome: null,
+      stallNoticeUtc: expect.any(String) });
+    expect(store.getReportBackByCorrelation(spec.id)).toBeNull();
+    expect(orch.adapter.sendMessage).not.toHaveBeenCalled();
+
+    await orch.observeRetainedDispatch(spec, DispatchSuspendedError.defect(spec.id, cause));
+    expect(orch.adapter.sendChoiceCard).toHaveBeenCalledTimes(1);
+  });
+
   it("claims and settles Cancel while the central ACK is pending, then replies privately", async () => {
     const orch = controller();
     orch.adapter.sendChoiceCard.mockResolvedValueOnce({ id: "notice", jumpUrl: "https://discord.com/channels/g/worker/notice" });
@@ -318,14 +360,14 @@ describe("durable parked-turn notice actions", () => {
 
   it("cancels an unavailable dispatch with one durable failure report-back and no card", async () => {
     const orch = controller();
-    const spec = { id: "cancel-only-dispatch", target: "worker", returnTo: "requester", reportBack: true,
+    const spec = { id: "cancel-only-dispatch", target: "worker", returnTo: "1543323221439414374", reportBack: true,
       kind: "handoff" as const, session: "live" as const, prompt: "UNSENT" };
-    store.recordDelegation({ id: spec.id, kind: "handoff", sourceRef: "requester", targetRef: "worker",
+    store.recordDelegation({ id: spec.id, kind: "handoff", sourceRef: "1543323221439414374", targetRef: "worker",
       worker: null, promptPreview: "UNSENT", correlationId: null, status: "interrupted" });
     store.turnAttempts.admit(spec);
     await orch.observeRetainedDispatch(spec, { reason: "provider acquisition failed: missing conversation" });
     const report = store.getReportBackByCorrelation(spec.id)!;
-    expect(report).toMatchObject({ kind: "report_back", targetRef: "requester" });
+    expect(report).toMatchObject({ kind: "report_back", targetRef: "1543323221439414374" });
     const queued = store.turnAttempts.get(report.id)!;
     expect(queued.spec.prompt).toContain("provider acquisition failed: missing conversation");
     expect(queued.spec.prompt).toContain("The prompt was never sent");
@@ -339,14 +381,14 @@ describe("durable parked-turn notice actions", () => {
 
   it("cancels an already-notified dispatch when only Cancel remains available", async () => {
     const orch = controller();
-    const spec = { id: "already-notified-deleted-target", target: "deleted-worker", returnTo: "requester", reportBack: true,
+    const spec = { id: "already-notified-deleted-target", target: "deleted-worker", returnTo: "1543323221439414374", reportBack: true,
       kind: "handoff" as const, session: "live" as const, prompt: "UNSENT" };
     const reason = "target thread is deleted; continuation cannot currently be admitted";
-    store.recordDelegation({ id: spec.id, kind: "handoff", sourceRef: "requester", targetRef: spec.target,
+    store.recordDelegation({ id: spec.id, kind: "handoff", sourceRef: "1543323221439414374", targetRef: spec.target,
       worker: null, promptPreview: spec.prompt, correlationId: null, status: "interrupted" });
     store.turnAttempts.claim(spec, executionIdentity({ agent: "codex", location: "local" }), "boot");
     store.turnAttempts.markStalled(spec.id, reason);
-    const posted = await orch.publishChoiceCard(orch.router.ensureSessionRecord({ channelRef: "requester" }), {
+    const posted = await orch.publishChoiceCard(orch.router.ensureSessionRecord({ channelRef: "1543323221439414374" }), {
       title: "Parked turn", body: `Dispatch is parked: ${reason}. Use Resume to continue.`,
       options: [{ label: "Abandon", kind: "prompt", payload: `parked-turn:abandon:${spec.id}` }],
     });
@@ -359,7 +401,7 @@ describe("durable parked-turn notice actions", () => {
 
     expect(store.turnAttempts.get(spec.id)).toMatchObject({ state: "cancelled", promptStarted: false });
     const report = store.getReportBackByCorrelation(spec.id)!;
-    expect(report).toMatchObject({ kind: "report_back", targetRef: "requester" });
+    expect(report).toMatchObject({ kind: "report_back", targetRef: "1543323221439414374" });
     expect(store.turnAttempts.get(report.id)!.spec.prompt).toContain(reason);
     expect(store.turnAttempts.get(report.id)!.spec.prompt).toContain("The prompt was never sent");
     expect(store.listRecentDelegations(20).filter(row => row.kind === "report_back")).toHaveLength(1);

@@ -31,6 +31,7 @@ function setup(acpSessionId = "recorded-acp") {
     parentRef: null, agentId: "codex", acpSessionId, repoPath: "/synthetic",
     configJson: "{}", createdUtc: new Date().toISOString(), updatedUtc: new Date().toISOString() };
   store.upsert(record);
+  store.upsert({ ...record, id: "discord:origin", channelRef: "origin", acpSessionId: "origin-acp" });
   let release!: () => void;
   let entered!: () => void;
   const started = new Promise<void>(r => { entered = r; });

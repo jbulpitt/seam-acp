@@ -51,7 +51,7 @@ async function fixture(states: Array<"pending" | "running" | "completed" | "miss
     adapter: { platform: "google-chat", editPanel } as any,
     config: { DATA_DIR: dir, REPOS_ROOT: dir, TURN_TIMEOUT_SECONDS: 60,
       channelPresets: new Map(), threadPresets: new Map() } as any });
-  const render = vi.spyOn(host as any, "renderPersistedTerminalAttemptCard");
+  const render = vi.spyOn(host as any, "renderPersistedAttemptCard");
   const settle = vi.spyOn(store, "settleInboundExecution");
   cleanups.push(async () => {
     await (host as any).settleTrackedContinuations();

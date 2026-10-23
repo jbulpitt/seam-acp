@@ -33,7 +33,7 @@
 import type { AgentEvent } from "../agents/agent-runtime.js";
 import type { Renderer } from "../platforms/renderer.js";
 import { SerialQueue } from "./serial-queue.js";
-import { TurnStatus, renderStatusPanel, formatContextUsage, formatAgentNotice } from "./status-panel.js";
+import { TurnStatus, renderStatusPanel, formatContextUsage, formatAgentNotice, type TurnStatusSnapshot } from "./status-panel.js";
 import { StatusSnapshotCard, observationFromTurn } from "./status-snapshot.js";
 import type { StructuredPanel, TurnState } from "./types.js";
 
@@ -56,6 +56,8 @@ export interface DispatchStatusPanelOptions {
   /** How often the elapsed clock ticks while nothing else changes. Default 5000ms. */
   heartbeatMs?: number;
   observe?: (status: TurnStatus) => void;
+  /** The captured snapshot accepted by the platform edit. */
+  onEdited?: (snapshot: TurnStatusSnapshot) => void;
   onError?: (error: unknown) => void;
 }
 
@@ -229,6 +231,7 @@ export class DispatchStatusPanel<TRef = unknown> {
       return;
     }
     this.stop();
+    this.opts.observe?.(this.status);
     this.finishedAt = finishedAt;
     this.status.setState(state);
     if (action !== undefined) this.status.setAction(action);
@@ -293,6 +296,7 @@ export class DispatchStatusPanel<TRef = unknown> {
         return;
       }
       this.renders += 1;
+      const snapshot = this.status.snapshot();
       try {
         const edited = await this.io.edit(ref, panel);
         this.editSucceeded = edited !== false;
@@ -304,6 +308,7 @@ export class DispatchStatusPanel<TRef = unknown> {
         this.editSucceeded = false;
         throw error;
       }
+      if (this.editSucceeded) this.opts.onEdited?.(snapshot);
     });
   }
 }

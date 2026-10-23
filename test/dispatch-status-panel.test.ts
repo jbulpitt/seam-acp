@@ -148,6 +148,35 @@ describe("DispatchStatusPanel: drives TurnStatus from onEvent", () => {
     expect(panel.lastEditSucceeded).toBe(true);
   });
 
+  it("does not confirm a later terminal state when an earlier Working edit finishes", async () => {
+    let release!: () => void;
+    let entered!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const editing = new Promise<void>(resolve => { entered = resolve; });
+    const status = new TurnStatus({ model: "test", repoDisplay: "repo" });
+    const observed: ReturnType<TurnStatus["snapshot"]>[] = [];
+    const confirmed: ReturnType<TurnStatus["snapshot"]>[] = [];
+    let edits = 0;
+    const panel = new DispatchStatusPanel<MessageRef>(discordRenderer, status, {
+      post: async () => ({ channel: { platform: "discord", id: "worker" }, id: "card" }),
+      edit: async () => {
+        if (++edits === 1) { entered(); await gate; }
+        else throw Object.assign(new Error("Thread is archived"), { code: 50083 });
+      },
+    }, { debounceMs: 0, observe: current => { observed.push(current.snapshot()); },
+      onEdited: snapshot => { confirmed.push(snapshot); } });
+    await panel.start();
+    panel.handleEvent({ kind: "usage-update", used: 50_000, size: 200_000 });
+    await editing;
+    const finalizing = panel.finalize("Failed", "Cancelled").catch(error => error);
+    expect(confirmed).toEqual([]);
+    release();
+    expect(await finalizing).toMatchObject({ code: 50083 });
+    expect(confirmed.map(snapshot => snapshot.input.state)).toEqual(["Working"]);
+    expect(confirmed[0]?.contextUsed).toBe(50_000);
+    expect(observed.some(snapshot => snapshot.input.state === "Working" && snapshot.contextUsed === 50_000)).toBe(true);
+  });
+
   it("keeps the elapsed clock counting while nothing else changes", async () => {
     vi.useFakeTimers({ toFake: ["setInterval", "clearInterval", "setTimeout", "clearTimeout", "Date"] });
     try {

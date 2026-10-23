@@ -17,7 +17,7 @@ import { createHash } from "node:crypto";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { commandRunner, parseKeyValues, renderRemoteScript } from "../scripts/lib/bridge-rollout.mjs";
 
 const repo = path.resolve(import.meta.dirname, "..");
@@ -120,12 +120,55 @@ async function createMany(count: number, make: (index: number) => Promise<unknow
   }
 }
 
-afterEach(async () => {
-  while (fixtures.length) {
-    const fixture = fixtures.pop()!;
+async function cleanupFixtures(): Promise<void> {
+  const completed = fixtures.splice(0);
+  while (completed.length) {
+    const fixture = completed.pop()!;
     try { process.kill(fixture.pid, "SIGKILL"); } catch {}
     await fs.rm(fixture.root, { recursive: true, force: true });
   }
+}
+
+// The ceiling fixtures contain 120,001 real entries to remove.
+afterEach(cleanupFixtures, 60_000);
+
+describe.sequential("enrollment fixture cleanup", () => {
+  it("does not delete a later fixture when an earlier cleanup resumes", async () => {
+    const finished = await makeFixture();
+    const remove = fs.rm;
+    let deletionStarted!: () => void;
+    const started = new Promise<void>((resolve) => { deletionStarted = resolve; });
+    let releaseDeletion!: () => void;
+    const blocked = new Promise<void>((resolve) => { releaseDeletion = resolve; });
+    const removal = vi.spyOn(fs, "rm").mockImplementation(async (file, options) => {
+      if (file === finished.root) {
+        deletionStarted();
+        await blocked;
+      }
+      return remove(file, options);
+    });
+    const cleanup = cleanupFixtures();
+
+    try {
+      await started;
+      const next = await makeFixture();
+      const pm2Module = path.join(next.root, "pm2.cjs");
+      const moduleBytes = await fs.readFile(pm2Module);
+
+      releaseDeletion();
+      await cleanup;
+
+      await expect(fs.stat(finished.root)).rejects.toThrow();
+      await expect(fs.readFile(pm2Module)).resolves.toEqual(moduleBytes);
+      expect(() => process.kill(next.pid, 0)).not.toThrow();
+      const report = parseKeyValues((await enroll(next)).stdout);
+      expect(report.enrollment).toBe("recorded");
+      expect(report.process_signaled).toBe("no");
+    } finally {
+      releaseDeletion();
+      await cleanup.finally(() => removal.mockRestore());
+    }
+  }, 60_000);
 });
 
 describe.sequential("#281 legacy baseline enrollment", () => {

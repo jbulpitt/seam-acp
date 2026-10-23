@@ -211,24 +211,20 @@ describe("bounded quota refresh", () => {
     vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "seam-quota-copilot-"));
     let poller: AgentQuotaPoller | undefined;
-    let releaseIdentity!: () => void;
-    const identityRead = new Promise<void>(resolve => { releaseIdentity = resolve; });
-    const readFile = fs.promises.readFile.bind(fs.promises);
-    vi.spyOn(fs.promises, "readFile").mockImplementationOnce((async (file, options) => {
-      await identityRead;
-      return readFile(file, options);
-    }) as typeof fs.promises.readFile);
     try {
       fs.writeFileSync(path.join(dir, "config.json"), JSON.stringify({
         lastLoggedInUser: { host: "github.com", login: "fixture" },
         copilotTokens: { "github.com:fixture": "credential-must-not-surface" },
       }));
+      let entered!: () => void;
+      const reading = new Promise<void>(resolve => { entered = resolve; });
       let fetchSignal: AbortSignal | undefined;
       vi.stubGlobal("fetch", vi.fn((_url: string, init?: RequestInit) => {
         fetchSignal = init?.signal ?? undefined;
         const stalled = async () => await new Promise<never>((_resolve, reject) => {
             if (fetchSignal?.aborted) reject(fetchSignal.reason);
             else fetchSignal?.addEventListener("abort", () => reject(fetchSignal?.reason), { once: true });
+            entered();
         });
         if (stallAt === "headers") return stalled();
         return Promise.resolve({ ok: true, json: stalled } as Response);
@@ -243,7 +239,11 @@ describe("bounded quota refresh", () => {
         staleRetentionMs: 0,
       });
       const refresh = poller.refreshAll(true);
-      await vi.advanceTimersByTimeAsync(25);
+      // Reach the intended IO boundary before advancing the poller's deadline.
+      await reading;
+      await vi.advanceTimersByTimeAsync(24);
+      expect(fetchSignal?.aborted).toBe(false);
+      await vi.advanceTimersByTimeAsync(1);
       const result = await refresh;
       expect(fetchSignal?.aborted).toBe(true);
       expect(result.sources[0]).toMatchObject({
@@ -254,7 +254,6 @@ describe("bounded quota refresh", () => {
       expect(JSON.stringify(result)).not.toContain("credential-must-not-surface");
       expect(JSON.stringify(result)).not.toContain(dir);
     } finally {
-      releaseIdentity();
       poller?.stop();
       await poller?.drain();
       fs.rmSync(dir, { recursive: true, force: true });

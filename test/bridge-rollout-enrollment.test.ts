@@ -121,14 +121,16 @@ async function createMany(count: number, make: (index: number) => Promise<unknow
 }
 
 async function cleanupFixtures(): Promise<void> {
-  while (fixtures.length) {
-    const fixture = fixtures.pop()!;
+  const completed = fixtures.splice(0);
+  while (completed.length) {
+    const fixture = completed.pop()!;
     try { process.kill(fixture.pid, "SIGKILL"); } catch {}
     await fs.rm(fixture.root, { recursive: true, force: true });
   }
 }
 
-afterEach(cleanupFixtures);
+// The ceiling fixtures contain 120,001 real entries to remove.
+afterEach(cleanupFixtures, 60_000);
 
 describe.sequential("enrollment fixture cleanup", () => {
   it("does not delete a later fixture when an earlier cleanup resumes", async () => {

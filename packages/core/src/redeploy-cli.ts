@@ -18,10 +18,24 @@ import { discordMessageLink } from "./platforms/discord/message-link.js";
 import { logger } from "./lib/logger.js";
 
 export interface DeployHealth { status: string; controller?: BootObservation }
-async function readHealth(): Promise<DeployHealth> {
-  const response = await fetch(`http://127.0.0.1:${process.env.HEALTH_PORT ?? 3000}/health`, { signal: AbortSignal.timeout(5000) });
+async function readHealth(timeoutMs = 5000): Promise<DeployHealth> {
+  const response = await fetch(`http://127.0.0.1:${process.env.HEALTH_PORT ?? 3000}/health`, { signal: AbortSignal.timeout(timeoutMs) });
   if (!response.ok) throw new Error(`/health: HTTP ${response.status}`);
   return await response.json() as DeployHealth;
+}
+
+async function readInitialHealth(): Promise<DeployHealth> {
+  const deadline = Date.now() + 60_000;
+  for (;;) {
+    try { return await readHealth(Math.min(5000, deadline - Date.now())); }
+    catch (error) {
+      const delay = Math.min(1000, deadline - Date.now());
+      if (delay <= 0) throw error;
+      console.error(`Waiting for controller /health: ${error instanceof Error ? error.message : String(error)}`);
+      await new Promise(resolve => setTimeout(resolve, delay));
+      if (Date.now() >= deadline) throw error;
+    }
+  }
 }
 
 /** The first verified deploy upgrades a controller without identity in /health. */
@@ -125,7 +139,7 @@ async function main(): Promise<void> {
   let request: DeployRequest | undefined;
   let result: CanaryRunResult;
   try {
-    const health = await readHealth();
+    const health = await readInitialHealth();
     const previous = health.controller?.identity ?? await legacyControllerIdentity(dataDir, process.cwd());
     request = { id: randomUUID(), previous, ...revision, startedAt: new Date().toISOString() };
     await writeDeployFile(dataDir, DEPLOY_REQUEST_FILE, request);

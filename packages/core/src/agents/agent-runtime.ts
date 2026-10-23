@@ -853,6 +853,9 @@ export class AgentRuntime {
       .onNotification(methods.client.session.update, async ({ params }) => {
         await this.handleSessionUpdate(params.update);
       })
+      .onNotification("_x.ai/session/update", (params: unknown) => params, async ({ params }) => {
+        await this.handleGrokSessionUpdate(params);
+      })
       .onRequest(methods.client.elicitation.create, async ({ params, requestId, signal }) => {
         if (!this.elicitationHandler) return { action: "decline" };
         const context: ElicitationRequestContext = { requestId, signal, isDetached: () => this.detached };
@@ -2337,6 +2340,27 @@ export class AgentRuntime {
     // divergence past the prompt's opening) doesn't defeat the boundary.
     const prefix = want.slice(0, Math.min(want.length, RESUME_ECHO_PREFIX_LEN));
     return prefix.length >= RESUME_ECHO_MIN_PREFIX && got.includes(prefix);
+  }
+
+  private handleGrokSessionUpdate(params: unknown): Promise<void> {
+    const notification = objectRecord(params);
+    // Grok replays this extension alongside ordinary updates during session/load.
+    if (this.profile.id !== "grok" || this.loadReplayInProgress ||
+        typeof notification?.sessionId !== "string" || notification.sessionId !== this.sessionId) {
+      return Promise.resolve();
+    }
+    const update = objectRecord(notification.update);
+    let state: string;
+    switch (update?.sessionUpdate) {
+      case "auto_compact_started": state = "Compacting memory…"; break;
+      case "auto_compact_completed": state = "Compaction complete · continuing…"; break;
+      case "auto_compact_cancelled": state = "Compaction cancelled"; break;
+      case "auto_compact_failed":
+        state = typeof update.error === "string" ? `Compaction failed: ${update.error}` : "Compaction failed";
+        break;
+      default: return Promise.resolve();
+    }
+    return this.sessionUpdates.run(() => this.emit({ kind: "agent-state", state }));
   }
 
   private handleSessionUpdate(update: SessionUpdate): Promise<void> {

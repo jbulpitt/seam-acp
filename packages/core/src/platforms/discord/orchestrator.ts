@@ -1209,7 +1209,7 @@ export class Orchestrator {
       this.trackContinuation(Promise.resolve().then(async () => {
         const attempt = this.store.turnAttempts.get(id);
         if (attempt) await this.refreshDispatchChoice(attempt.spec);
-        if (attempt && !attempt.promptStarted) await this.renderPersistedTerminalAttemptCard(attempt);
+        if (attempt && !attempt.promptStarted) await this.renderPersistedAttemptCard(attempt);
       }).catch(err => this.logger.warn({ err, attempt: id }, "terminal status-card settlement failed")));
     });
 
@@ -2250,6 +2250,7 @@ export class Orchestrator {
     this.store.turnAttempts.markStalled(spec.id, reason);
     const stalled = this.store.turnAttempts.get(spec.id);
     if (stalled?.state !== "suspended" || !stalled.stalledUtc) return;
+    await this.renderPersistedAttemptCard(stalled);
     // An ingest caller's refs can name an endpoint rather than a chat channel.
     const requester = [spec.returnTo, spec.originThreadRef].find(ref =>
       ref && (this.recordForChannel(ref) || isDiscordSnowflake(ref))) ?? spec.target;
@@ -2793,11 +2794,10 @@ export class Orchestrator {
     return a?.state === "completed" || a?.state === "cancelled";
   }
 
-  /** Render the terminal winner with this attempt's saved observations. */
-  private async renderPersistedTerminalAttemptCard(attempt: TurnAttempt): Promise<void> {
+  /** Render the durable winner with this attempt's saved observations. */
+  private async renderPersistedAttemptCard(attempt: TurnAttempt): Promise<void> {
     const latest = this.store.turnAttempts.get(attempt.id);
-    if (!latest || (latest.state !== "completed" && latest.state !== "cancelled")) return;
-    if (!latest.statusCard) return;
+    if (!latest?.statusCard) return;
     const projection = projectAttemptCard(latest, latest);
     if (!projection) return;
     try {
@@ -2807,7 +2807,7 @@ export class Orchestrator {
         latest.outcome?.finishedUtc ? Date.parse(latest.outcome.finishedUtc) : Date.now());
     } catch (err) {
       this.logger.warn({ err, attempt: latest.id },
-        "durable terminal status-card render failed");
+        "durable status-card render failed");
     }
   }
 
@@ -3592,7 +3592,7 @@ export class Orchestrator {
           "restart cutoff reached before the prompt was submitted");
       }
       if (priorHuman?.state === "completed" || priorHuman?.state === "cancelled") {
-        await this.renderPersistedTerminalAttemptCard(priorHuman);
+        await this.renderPersistedAttemptCard(priorHuman);
         return;
       }
       if (!operatorResume && priorHuman?.acpSessionId && record.acpSessionId && priorHuman.acpSessionId !== record.acpSessionId) {
@@ -11588,7 +11588,7 @@ export class Orchestrator {
       await this.enqueueReportBack(spec, text, workerError);
     }
     // No live panel survived to flip the worker's card; project the outcome.
-    if (attempt) await this.renderPersistedTerminalAttemptCard(attempt);
+    if (attempt) await this.renderPersistedAttemptCard(attempt);
 
     // #246: ingest's HTTP result is a completion side effect just like the
     // ledger transition. A definitive done artifact can settle a stranded
@@ -12155,12 +12155,10 @@ export class Orchestrator {
     }
     if (statusAttempt) {
       this.attemptStatusPanels.set(statusAttempt.id, panel);
-      const finalize = panel.finalize.bind(panel);
-      panel.finalize = async (...args) => {
-        try { await finalize(...args); }
-        finally {
-          if (this.attemptStatusPanels.get(statusAttempt.id) === panel) this.attemptStatusPanels.delete(statusAttempt.id);
-        }
+      const stop = panel.stop.bind(panel);
+      panel.stop = () => {
+        stop();
+        if (this.attemptStatusPanels.get(statusAttempt.id) === panel) this.attemptStatusPanels.delete(statusAttempt.id);
       };
     }
     return panel;
@@ -15778,7 +15776,7 @@ export class Orchestrator {
         ...(outcome.error ? { reason: outcome.error } : {}),
       }).catch(() => {});
     }
-    await this.renderPersistedTerminalAttemptCard(completed);
+    await this.renderPersistedAttemptCard(completed);
   }
 
   /**
@@ -15975,6 +15973,13 @@ export class Orchestrator {
    * Two processes on one DATA_DIR would double-resume everything.
    */
   async recoverInterruptedTurns(): Promise<void> {
+    // A pre-prompt Cancel may commit while its controller is exiting.
+    for (const attempt of this.store.turnAttempts.list("cancelled")) {
+      const state = attempt.statusCardState?.status.input.state;
+      if (attempt.source === "dispatch" && !attempt.promptStarted && (state === "Working" || state === "Waiting")) {
+        await this.renderPersistedAttemptCard(attempt);
+      }
+    }
     await this.recoverScheduledOutput();
     const enabled = this.config.SEAM_TURN_RESUME_ENABLED === true;
     const maxAge =
@@ -15991,7 +15996,7 @@ export class Orchestrator {
       const a = this.store.turnAttempts.get(inboundAttemptId(row.messageId));
       if (a?.state === "cancelled") continue;
       if (a?.state === "completed") {
-        await this.renderPersistedTerminalAttemptCard(a);
+        await this.renderPersistedAttemptCard(a);
         this.store.settleInboundExecution(row.messageId);
         continue;
       }
@@ -16331,7 +16336,7 @@ export class Orchestrator {
       if (a.source !== "inbound") continue;
       const row = this.store.getInbound(a.id.slice("inbound-".length));
       if (!row || (row.state !== "pending" && row.state !== "running" && !unfinished.has(a.id))) continue;
-      await this.renderPersistedTerminalAttemptCard(a);
+      await this.renderPersistedAttemptCard(a);
       this.store.settleInboundExecution(row.messageId);
       await finishLiveTurn(this.config.DATA_DIR, { id: a.id, status: "cancelled",
         channelRef: a.spec.target, finishedUtc: new Date().toISOString(), reason: "durable cancellation" });

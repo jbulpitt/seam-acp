@@ -146,7 +146,8 @@ export const discordRenderer: Renderer = {
       const title = state.titlePrefix
         ? `${state.titlePrefix} · ${state.state}`
         : undefined;
-      const description = [originDescription(state), state.notice ? `⚠️ ${state.notice}` : undefined].filter(Boolean).join("\n");
+      const compaction = /^(Compacting|Compaction)\b/.test(state.action) ? trim(state.action, 220) : undefined;
+      const description = [originDescription(state), compaction, state.notice ? `⚠️ ${state.notice}` : undefined].filter(Boolean).join("\n");
       return {
         color: COLOR_BY_STATE[state.state],
         ...(title ? { title } : {}),

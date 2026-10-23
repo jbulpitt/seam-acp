@@ -157,7 +157,8 @@ describe("MCP steer delivery", () => {
     expect(h.events.filter(event => event.startsWith("start:") || event.startsWith("end:"))).toEqual([
       "start:active", "end:active", "start:first", "end:first", "start:steer", "end:steer",
     ]);
-    expect(h.contexts.get("steer")).toBe("fixture-acp");
+    expect(h.contexts.get("steer")).toBe("original-context");
+    expect(h.contexts.get("steer")).toBe(h.contexts.get("active"));
     for (const id of ["active", "first", steerAttempt.id]) {
       expect(store.turnAttempts.get(id)?.state).toBe("completed");
       expect(h.events.filter(event => event === `report:${id}`)).toHaveLength(1);

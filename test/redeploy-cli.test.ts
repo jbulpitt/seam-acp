@@ -25,6 +25,7 @@ async function run(mode: "recover" | "timeout" | "http503" | "healthy", staging 
     ({ stdout, stderr } = await execute(process.execPath, ["--import", fixture, "--import", import.meta.resolve("tsx"), cli], {
       cwd, encoding: "utf8", timeout: 30_000,
       env: { ...process.env, DATA_DIR: dataDir, REDEPLOY_HEALTH_CASE: mode, LOG_LEVEL: "silent",
+        TSX_TSCONFIG_PATH: path.resolve(import.meta.dirname, "../tsconfig.json"),
         SEAM_TEST_DRIVER_ACTOR_ID: staging ? "fixture-actor" : "", DISCORD_BOT_TOKEN: "fixture-token",
         SEAM_CANARY_SELF_CHANNEL_ID: "1553555541710741585" },
     }));
@@ -32,7 +33,10 @@ async function run(mode: "recover" | "timeout" | "http503" | "healthy", staging 
     const failed = error as { code?: number; stdout?: string; stderr?: string };
     code = failed.code ?? -1; stdout = failed.stdout ?? ""; stderr = failed.stderr ?? "";
   }
-  const events: Event[] = (await fs.readFile(path.join(dataDir, "events.jsonl"), "utf8")).trim().split("\n").map(line => JSON.parse(line));
+  const trace = await fs.readFile(path.join(dataDir, "events.jsonl"), "utf8").catch(error => {
+    throw new Error(`CLI produced no trace (exit ${code}): ${stderr}`, { cause: error });
+  });
+  const events: Event[] = trace.trim().split("\n").map(line => JSON.parse(line));
   const read = async (file: string) => JSON.parse(await fs.readFile(path.join(dataDir, file), "utf8"));
   return { code, stdout, stderr, events, dataDir, read };
 }

@@ -562,6 +562,10 @@ const STATUS_HEARTBEAT_MS = 5000;
 export const DISPATCH_SETTLEMENT_WARN_MS = 5_000;
 const PLATFORM = "discord";
 
+function terminalCardState(state: TurnState): boolean {
+  return state === "Done" || state === "Failed" || state === "Timed out";
+}
+
 function permanentDiscordDeliveryCause(err: unknown): string | null {
   const code = err !== null && typeof err === "object" && "code" in err ? err.code : undefined;
   if (code !== 10003 && code !== 50001 && code !== 50035) return null;
@@ -2861,12 +2865,15 @@ export class Orchestrator {
       },
     }, { debounceMs: STATUS_EDIT_DEBOUNCE_MS, heartbeatMs: STATUS_HEARTBEAT_MS,
       observe: status => {
+        if (!terminalCardState(status.state)) this.store.turnAttempts.saveStatusCardState(attempt, status.snapshot());
         const latest = this.store.turnAttempts.get(attempt.id);
         if ((latest?.state === "completed" && latest.deliveryDone) || latest?.state === "cancelled") {
           const projection = projectAttemptCard(latest, attempt);
           if (projection) { status.setState(projection.state); status.setAction(projection.action); }
         }
-        this.store.turnAttempts.saveStatusCardState(attempt, status.snapshot());
+      },
+      onEdited: snapshot => {
+        if (terminalCardState(snapshot.input.state)) this.store.turnAttempts.saveStatusCardState(attempt, snapshot);
       },
       onError: err => this.logger.warn({ err, attempt: attempt.id }, "adopted recovery status update failed") });
     void panel.start(ref).catch(err => this.logger.warn({ err, attempt: attempt.id }, "adopted recovery status bind failed"));
@@ -12109,7 +12116,10 @@ export class Orchestrator {
       {
         debounceMs: STATUS_EDIT_DEBOUNCE_MS,
         observe: status => {
-          if (statusAttempt) this.store.turnAttempts.saveStatusCardState(statusAttempt, status.snapshot());
+          if (statusAttempt && !terminalCardState(status.state)) this.store.turnAttempts.saveStatusCardState(statusAttempt, status.snapshot());
+        },
+        onEdited: snapshot => {
+          if (statusAttempt && terminalCardState(snapshot.input.state)) this.store.turnAttempts.saveStatusCardState(statusAttempt, snapshot);
         },
         onError: err => this.logger.warn({ err, dispatch: spec.id }, "dispatch: status panel edit failed"),
       }

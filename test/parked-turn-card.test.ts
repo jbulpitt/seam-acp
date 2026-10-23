@@ -28,7 +28,7 @@ function controller() {
   orch.logger = logger;
   orch.config = { DATA_DIR: dir, REPOS_ROOT: dir, DISCORD_ALLOWED_USER_IDS: new Set(["user"]),
     channelPresets: new Map(), threadPresets: new Map() };
-  orch.router = { ensureSessionRecord: ({ channelRef }: any) => ({ id: `discord:${channelRef}`, platform: "discord", channelRef, parentRef: "parent" }) };
+  orch.router = { ensureSessionRecord: ({ channelRef, platform = "discord" }: any) => ({ id: `${platform}:${channelRef}`, platform, channelRef, parentRef: "parent" }) };
   const watcher = new DispatchWatcher({ dataDir: dir, logger: logger as any, attempts: store.turnAttempts, onDispatch: async () => {} });
   watchers.push(watcher);
   orch.dispatchWatcher = watcher;

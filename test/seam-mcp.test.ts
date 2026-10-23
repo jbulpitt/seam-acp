@@ -417,6 +417,7 @@ describe("SeamMcpServer", () => {
     expect(body.result.instructions).toMatch(/agent_quota\(agentId\?\)/);
     expect(body.result.instructions).toMatch(/configure_thread\(thread,.*rebuild\?\)/);
     expect(body.result.instructions).toMatch(/migrate_self\(agent\?, model\?, effort\?, manifest, rebuild\?\)/);
+    expect(body.result.instructions).toContain("steer(thread, prompt): queue a course correction");
     expect(body.result.protocolVersion).toBe("2025-06-18");
   });
 
@@ -1542,7 +1543,7 @@ describe("SeamMcpServer", () => {
 
   it("steer enqueues a live dispatch of the FRAMED prompt into the target thread", async () => {
     h = await makeHarness();
-    await h.call(
+    const { body } = await h.call(
       "tools/call",
       { name: "steer", arguments: { thread: "333333333333333333", prompt: "focus on the failing test first" } },
       { "X-Seam-Session": "good-token" }
@@ -1557,6 +1558,21 @@ describe("SeamMcpServer", () => {
     expect(spec.prompt).toContain("focus on the failing test first");
     expect(spec.prompt).toContain("steering you mid-task");
     expect(spec.originThreadRef).toBe("thread-caller");
+    expect(body.result.content[0].text).toContain("Queued steering instruction");
+    expect(body.result.content[0].text).toContain("separate turn");
+    expect(body.result.content[0].text).toContain("already queued");
+    expect(body.result.content[0].text).not.toContain("injected into its live session");
+  });
+
+  it("advertises steer as queued delivery and send as feedback for the next inbox poll", async () => {
+    h = await makeHarness();
+    const { body } = await h.call("tools/list");
+    const steer = body.result.tools.find((tool: { name: string }) => tool.name === "steer");
+    expect(steer.description).toContain("separate turn");
+    expect(steer.description).toContain("already queued");
+    expect(steer.description).toContain("send");
+    expect(steer.description).toContain("poll_inbox");
+    expect(steer.inputSchema.properties.prompt.description).not.toContain("inject now");
   });
 
   it("compact with no `thread` arg enqueues a kind:compact dispatch scoped to the caller", async () => {

@@ -5,7 +5,7 @@ describe("frameSteerPrompt", () => {
   it("wraps the prompt in a <seam-steer> fence with the operator directive", () => {
     expect(frameSteerPrompt("go check the logs")).toBe(
       "<seam-steer>\ngo check the logs\n</seam-steer>\n\n" +
-        "The operator is steering you mid-task — adjust to the above now."
+        "The operator has sent a course correction. Apply the instruction above using the existing session context."
     );
   });
 
@@ -14,6 +14,6 @@ describe("frameSteerPrompt", () => {
     const framed = frameSteerPrompt(raw);
     expect(framed).toContain(`<seam-steer>\n${raw}\n</seam-steer>`);
     expect(framed.startsWith("<seam-steer>\n")).toBe(true);
-    expect(framed.trimEnd().endsWith("adjust to the above now.")).toBe(true);
+    expect(framed.trimEnd().endsWith("using the existing session context.")).toBe(true);
   });
 });

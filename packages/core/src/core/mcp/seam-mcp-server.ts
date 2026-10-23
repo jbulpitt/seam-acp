@@ -618,14 +618,14 @@ const TOOLS = [
   {
     name: "steer",
     description:
-      "Redirect a teammate mid-task. Injects a framed steering instruction into that thread's LIVE " +
-      "session (its history is preserved) so it adjusts course now. Use when a running teammate is " +
-      "heading the wrong way or you have a new constraint for it.",
+      "Queue a framed course correction as a separate turn in the teammate's existing session, " +
+      "after running and already queued work. Preserves its history without cancelling the running turn. " +
+      "For feedback during a running turn, use send; the teammate reads it at its next poll_inbox.",
     inputSchema: {
       type: "object",
       properties: {
         thread: { type: "string", description: "Target thread id to steer." },
-        prompt: { type: "string", description: "The steering instruction to inject now." },
+        prompt: { type: "string", description: "The steering instruction to queue." },
       },
       required: ["thread", "prompt"],
     },
@@ -1808,7 +1808,7 @@ const INSTRUCTIONS = [
   "  teammate) or a preset name (a fresh stateless specialist). You do NOT block — the worker's",
   "  result is dispatched back when it completes; use reportBack:false to skip the report-back.",
   "- forward(to, content, reportBack?): relay a message into another thread (thin handoff, no specialist framing). Use reportBack:false to skip the report-back.",
-  "- steer(thread, prompt): redirect a teammate mid-task — inject a new instruction into its live session.",
+  "- steer(thread, prompt): queue a course correction as a separate turn after running and already queued work, preserving its session.",
   "- configure_thread(thread, agent?, cwd?, model?, effort?, role?, disableThreadPrefix?, fastMode?, rebuild?): reconfigure a teammate in YOUR channel; agent@host binds that host (bare agent keeps the current host), cwd uses the shared repo picker path. Returns exact changed/no-change identity and posts a target confirmation card. rebuild:true then runs deterministic Discord reconstruction with a durable card in the target (and may be used alone). Agent/host switches reset context; repo changes wait for an in-flight turn to finish. `fastMode` defaults off and requires the current live model's option: Codex applies live, preserving ACP/context and increasing quota/credit usage; Claude forges a fresh session and spends paid usage credits.",
   "- reset_thread_session(thread): deliberately drop a teammate's context and forge a fresh session with its current agent/model.",
   "- migrate_self(agent?, model?, effort?, manifest, rebuild?): migrate YOUR OWN thread after this turn ends. Default: the manifest is the replacement session's first prompt. rebuild:true rebuilds from Discord history first, then fires the manifest as the next live turn. Purpose-agnostic and rollback-safe.",
@@ -2702,11 +2702,8 @@ export class SeamMcpServer {
     );
   }
 
-  /** Steer a teammate: enqueue a LIVE dispatch into the target thread whose
-   *  prompt is the framed steer text, so it lands in that thread's own session
-   *  (history preserved). Minimal by design — unlike the `/seam steer` command
-   *  it does not preemptively cancel the target's in-flight turn; it queues
-   *  behind it on that thread. kind = "handoff". */
+  /** Queue a framed course correction in the target's existing session,
+   * behind running and already queued work. */
   private async toolSteer(
     caller: SessionRecord,
     args: Record<string, unknown>
@@ -2732,8 +2729,9 @@ export class SeamMcpServer {
       "seam-mcp steer enqueued"
     );
     return textResult(
-      `Steered thread ${thread} (dispatch ${dispatchId}). The instruction was ` +
-        `injected into its live session; its response is reported back into thread ${caller.channelRef}.`
+      `Queued steering instruction for thread ${thread} (dispatch ${dispatchId}). ` +
+        `It will run as a separate turn in its existing session, after running and already queued work; ` +
+        `its response will be reported back into thread ${caller.channelRef}.`
     );
   }
 

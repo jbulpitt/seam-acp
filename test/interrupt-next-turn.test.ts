@@ -42,10 +42,10 @@ afterEach(async () => {
   fs.rmSync(dir, { recursive: true, force: true });
 });
 
-async function fixture() {
+async function fixture(workerAgent = "claude") {
   const record = (channelRef: string): SessionRecord => ({
     id: `discord:${channelRef}`, platform: "discord", channelRef, parentRef: parent,
-    agentId: "claude", acpSessionId: "original-context", repoPath: dir, configJson: "{}",
+    agentId: channelRef === target ? workerAgent : "claude", acpSessionId: "original-context", repoPath: dir, configJson: "{}",
     createdUtc: new Date().toISOString(), updatedUtc: new Date().toISOString(),
   });
   store.upsert(record(target));
@@ -59,7 +59,7 @@ async function fixture() {
     store.upsert({ ...row, acpSessionId: "" }, { source: "fixture", cause: "requested fresh session" });
   });
   const router = testSessionRouter({
-    listProfiles: () => [], getProfile: () => ({ id: "claude" }), hasRuntime: () => true,
+    listProfiles: () => [], getProfile: (id: string) => ({ id }), hasRuntime: () => true,
     ensureSessionRecord: (input: { channelRef: string }) => store.getByChannel("discord", input.channelRef) ?? record(input.channelRef),
     describeConfig: (row: SessionRecord) => ({
       agent: { value: row.agentId, source: "session config" },
@@ -81,7 +81,8 @@ async function fixture() {
   const holds = new Map<string, Promise<void>>([["active", held.promise]]);
   // Only provider execution/Discord rendering are synthetic; both queue layers and SQL are real.
   (orch as any).injectTurn = async (row: SessionRecord, prompt: string, opts: any) => {
-    const name = prompt.includes("<seam-interrupt>") ? prompt.includes("second urgent") ? "interrupt2" : "interrupt"
+    const name = prompt.includes("<seam-steer>") ? "steer"
+      : prompt.includes("<seam-interrupt>") ? prompt.includes("second urgent") ? "interrupt2" : "interrupt"
       : ["active", "first", "second"].find(value => prompt.includes(`JOB_${value}`))!;
     contexts.set(name, row.acpSessionId);
     opts.onSession?.("fixture-acp");
@@ -105,11 +106,11 @@ async function fixture() {
   });
   servers.push(mcp);
   await mcp.start();
-  const send = async (fresh = false, message = "do the urgent task") => {
+  const call = async (name: string, args: Record<string, unknown>) => {
     const response = await fetch(`http://127.0.0.1:${mcp.port}/mcp`, { method: "POST",
       headers: { "content-type": "application/json", "X-Seam-Session": "fixture-caller" },
       body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call",
-        params: { name: "send", arguments: { to: target, message, interrupt: true, fresh } } }),
+        params: { name, arguments: args } }),
     });
     expect(response.status).toBe(200);
     const body = await response.json();
@@ -117,12 +118,57 @@ async function fixture() {
     expect(body.result.isError, body.result.content[0]?.text).toBeFalsy();
     return body.result.content[0].text as string;
   };
+  const send = (fresh = false, message = "do the urgent task") =>
+    call("send", { to: target, message, interrupt: true, fresh });
+  const steer = () => call("steer", { thread: target, prompt: "focus on the failing test first" });
   const enqueue = (id: string, name: string, second: number) => enqueueDispatchSpec(dir, {
     id, target, prompt: `JOB_${name}`, session: "live", kind: "handoff", returnTo: callerRef,
     createdUtc: `2026-01-01T00:00:0${second}.000Z`,
   }, store.turnAttempts);
-  return { orch, watcher, send, enqueue, events, contexts, held, holds, abortTurn, invalidate };
+  return { orch, watcher, send, steer, enqueue, events, contexts, held, holds, abortTurn, invalidate };
 }
+
+describe("MCP steer delivery", () => {
+  it("acknowledges queued steering behind a busy Codex turn and earlier work", async () => {
+    const h = await fixture("codex");
+    await h.enqueue("active", "active", 0);
+    await h.watcher.start({ waitForInitialDispatches: false });
+    await vi.waitFor(() => expect(h.events).toContain("start:active"));
+    await h.enqueue("first", "first", 1);
+    const earlier = h.watcher.tick();
+    await vi.waitFor(() => expect(h.watcher.inFlightIdsForTarget(target)).toHaveLength(2));
+
+    const receipt = await h.steer();
+    const queued = h.watcher.tick();
+    await vi.waitFor(() => expect(h.watcher.inFlightIdsForTarget(target)).toHaveLength(3));
+    const steerAttempt = store.turnAttempts.list("pending").find(attempt => attempt.spec.prompt.includes("<seam-steer>"))!;
+    expect(steerAttempt.promptStarted).toBe(false);
+    expect(store.turnAttempts.get("active")?.promptStarted).toBe(true);
+    expect(h.events.filter(event => event.startsWith("start:"))).toEqual(["start:active"]);
+    expect.soft(receipt).toContain("Queued steering instruction");
+    expect.soft(receipt).toContain("separate turn");
+    expect.soft(receipt).toContain("already queued");
+    expect.soft(receipt).not.toContain("injected into its live session");
+    expect.soft(receipt).toContain(steerAttempt.id);
+
+    h.held.release();
+    await Promise.all([earlier, queued]);
+    await h.watcher.drain();
+    expect(h.events.filter(event => event.startsWith("start:") || event.startsWith("end:"))).toEqual([
+      "start:active", "end:active", "start:first", "end:first", "start:steer", "end:steer",
+    ]);
+    expect(h.contexts.get("steer")).toBe("original-context");
+    expect(h.contexts.get("steer")).toBe(h.contexts.get("active"));
+    for (const id of ["active", "first", steerAttempt.id]) {
+      expect(store.turnAttempts.get(id)?.state).toBe("completed");
+      expect(h.events.filter(event => event === `report:${id}`)).toHaveLength(1);
+    }
+    await h.watcher.tick();
+    expect(h.events.filter(event => event === "start:steer")).toHaveLength(1);
+    expect(h.abortTurn).not.toHaveBeenCalled();
+    expect(h.invalidate).not.toHaveBeenCalled();
+  });
+});
 
 describe("send interrupt next-turn ordering", () => {
   for (const active of ["dispatch", "typed"] as const) {

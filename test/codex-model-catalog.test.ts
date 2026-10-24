@@ -373,6 +373,7 @@ describe("Codex live model catalog", () => {
     });
   });
 
+  // Allow 3s collection + 6s close/reap + 5s version, then assertions.
   it("routes collection through the installed codex-acp CODEX_PATH and reaps wrapper plus app-server", async () => {
     const { profile, callsPath } = installedWrapperSetup("ok");
     const catalog = await profile.catalog.fetch();
@@ -384,7 +385,7 @@ describe("Codex live model catalog", () => {
     ]);
     expect(processExists(events[0]!.pid!)).toBe(false);
     expect(processExists(events[0]!.ppid!)).toBe(false);
-  });
+  }, 15_000);
 
   it("reaps the installed codex-acp wrapper and nested app-server after a deadline", async () => {
     const { profile, callsPath } = installedWrapperSetup("timeout");

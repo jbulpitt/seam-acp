@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import type { Logger } from "../lib/logger.js";
 import type { ChatAdapter, MessageRef } from "../platforms/chat-adapter.js";
-export type ServiceStatusCardTransport = Pick<ChatAdapter, "sendLayout" | "editLayout" | "sendPanel" | "editPanel" | "pinMessage" | "deleteMessage" | "bumpThread">;
+export type ServiceStatusCardTransport = Pick<ChatAdapter, "sendLayout" | "editLayout" | "sendPanel" | "editPanel" | "pinMessage" | "reusePinnedMessage" | "bumpThread">;
 import type { LayoutBlock, PanelButton, StructuredLayout, StructuredPanel } from "./types.js";
 import { statusRank } from "./service-status/severity.js";
 import type {
@@ -280,6 +280,14 @@ export class ServiceStatusCard {
   }
 
   private async push(): Promise<void> {
+    if (this.adapter.reusePinnedMessage) {
+      const message = await this.adapter.reusePinnedMessage(this.channel, this.message);
+      if (message?.id !== this.message?.id) {
+        this.pinned = false;
+        this.lastBumpAt = this.now();
+      }
+      this.message = message;
+    }
     const allowed = new Set(this.sources.map((source) => source.id));
     const snapshots = this.collect().filter((snapshot) => allowed.has(snapshot.sourceId));
     const now = this.now();
@@ -302,13 +310,10 @@ export class ServiceStatusCard {
         await this.ensurePinned();
         return;
       } catch (err) {
-        this.logger.info({ err }, "service status card edit failed; posting a replacement");
-        const stale = this.message;
+        if ((err as { code?: number })?.code !== 10008) throw err;
+        this.logger.info("service status card message gone; posting a replacement");
         this.message = undefined;
         this.pinned = false;
-        await this.sendLayout(layout);
-        if (this.adapter.deleteMessage) await this.adapter.deleteMessage(stale).catch(() => {});
-        return;
       }
     }
     await this.sendLayout(layout);
@@ -329,13 +334,10 @@ export class ServiceStatusCard {
         await this.ensurePinned();
         return;
       } catch (err) {
-        this.logger.info({ err }, "service status card edit failed; posting a replacement");
-        const stale = this.message;
+        if ((err as { code?: number })?.code !== 10008) throw err;
+        this.logger.info("service status card message gone; posting a replacement");
         this.message = undefined;
         this.pinned = false;
-        await this.sendPanel(panel);
-        if (this.adapter.deleteMessage) await this.adapter.deleteMessage(stale).catch(() => {});
-        return;
       }
     }
     await this.sendPanel(panel);
@@ -376,7 +378,7 @@ export class ServiceStatusCard {
       this.message = { channel: this.channel, id: parsed.messageId };
       this.lastBumpAt = typeof parsed.lastBumpAt === "number" ? parsed.lastBumpAt : 0;
     } catch {
-      // First run or invalid state: post a fresh canonical card.
+      // Missing or invalid state: look for an existing pinned card.
     }
   }
 

@@ -1990,6 +1990,8 @@ export class DiscordAdapter implements ChatAdapter {
     const msg = await ch.messages.fetch(message.id);
     await msg.edit({
       flags: MessageFlags.IsComponentsV2,
+      content: "",
+      embeds: [],
       components: [
         DiscordAdapter.buildContainer(layout),
         ...DiscordAdapter.buildActionRows(layout.actions),
@@ -2001,6 +2003,40 @@ export class DiscordAdapter implements ChatAdapter {
     const ch = await this.fetchSendableChannel(message.channel.id);
     const msg = await ch.messages.fetch(message.id);
     await msg.delete();
+  }
+
+  async reusePinnedMessage(channel: ChannelRef, saved?: MessageRef): Promise<MessageRef | undefined> {
+    const ch = await this.fetchSendableChannel(channel.id);
+    const pins: Message[] = [];
+    let before: number | undefined;
+    for (;;) {
+      const page = await ch.messages.fetchPins({ limit: 50, before, cache: false });
+      pins.push(...page.items.map(item => item.message));
+      if (!page.hasMore) break;
+      before = page.items.at(-1)!.pinnedTimestamp;
+    }
+    const own = pins.filter(message => message.author.id === this.client.user!.id);
+    let current = own.find(message => message.id === saved?.id);
+    if (!current && saved) {
+      try {
+        const message = await ch.messages.fetch(saved.id);
+        if (message.author.id === this.client.user!.id) current = message;
+      } catch (err) {
+        if ((err as { code?: number })?.code !== 10008) throw err;
+      }
+    }
+    current ??= own.sort((a, b) => b.createdTimestamp - a.createdTimestamp)[0];
+    for (const stale of own) {
+      if (stale.id === current?.id) continue;
+      try {
+        await stale.delete();
+      } catch (err) {
+        if ((err as { code?: number })?.code === 10008) continue;
+        // Failed deletes remain pinned, so the next refresh finds them again.
+        this.logger.warn({ err, channelId: channel.id, messageId: stale.id }, "failed to delete superseded pinned card");
+      }
+    }
+    return current ? { channel, id: current.id, ...discordMessageLink(ch.guildId, channel.id, current.id) } : undefined;
   }
 
   async bumpThread(channel: ChannelRef): Promise<void> {

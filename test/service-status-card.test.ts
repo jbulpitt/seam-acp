@@ -217,7 +217,7 @@ describe("service status card lifecycle", () => {
     } as ChatAdapter;
     const card = new ServiceStatusCard({ logger: silent, adapter, threadId: "123", stateFile: path.join(dir, "service-status-card.json"), sources: [source("x")], collect: () => [snapshot("x", "operational")] });
     await card.start();
-    expect({ sends, deletes }).toEqual({ sends: 1, deletes: 1 });
+    expect({ sends, deletes }).toEqual({ sends: 1, deletes: 0 });
     card.poke(); card.poke(); card.poke();
     await vi.advanceTimersByTimeAsync(500);
     expect(edits).toBe(2);

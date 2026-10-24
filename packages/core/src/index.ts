@@ -521,12 +521,7 @@ async function main(): Promise<void> {
   if (serviceStatusEnabled) {
     await plugins.loadBuiltins([{ id: "service-status", load: async () => {
       const { createServiceStatusPlugin } = await import("./plugins/service-status/index.js");
-      const serviceStatus = createServiceStatusPlugin({
-        sendLayout: adapter.sendLayout.bind(adapter), editLayout: adapter.editLayout.bind(adapter),
-        sendPanel: adapter.sendPanel.bind(adapter), editPanel: adapter.editPanel.bind(adapter),
-        pinMessage: adapter.pinMessage.bind(adapter), deleteMessage: adapter.deleteMessage.bind(adapter),
-        bumpThread: adapter.bumpThread.bind(adapter),
-      });
+      const serviceStatus = createServiceStatusPlugin(adapter);
       readServiceStatus = serviceStatus.read;
       return serviceStatus.plugin;
     } }], { "service-status": config });

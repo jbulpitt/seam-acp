@@ -2,20 +2,27 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { ChannelType, Collection, MessageFlags, MessageType } from "discord.js";
+import { pino } from "pino";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { DiscordAdapter } from "../packages/core/src/platforms/discord/adapter.js";
 import { ServerStatusCard } from "../packages/core/src/core/server-status-card.js";
 import { ServiceStatusCard, SERVICE_STATUS_BUMP_AFTER_MS } from "../packages/core/src/core/service-status-card.js";
 import type { Logger } from "../packages/core/src/lib/logger.js";
 import type { ServerStatusSnapshot } from "../packages/core/src/core/server-status.js";
+import { PluginHost } from "../packages/core/src/plugins/host.js";
+import { createServiceStatusPlugin } from "../packages/core/src/plugins/service-status/index.js";
+import * as serviceSources from "../packages/core/src/core/service-status/sources/registry.js";
 
 const THREAD = "1540213090480558120";
 const BOT = "seam-bot";
 const NOW = 2_000_000_000_000;
 const dirs: string[] = [];
 const cards: Array<{ stop(): void }> = [];
-afterEach(() => {
+const hosts: PluginHost[] = [];
+afterEach(async () => {
+  for (const host of hosts.splice(0)) await host.dispose();
   for (const card of cards.splice(0)) card.stop();
+  vi.restoreAllMocks();
   for (const dir of dirs.splice(0)) fs.rmSync(dir, { recursive: true, force: true });
 });
 
@@ -261,3 +268,40 @@ it("keeps the service card's twenty-hour silent bump cadence", async () => {
   expect(f.sends).toHaveBeenCalledTimes(1);
   expect(f.saved().messageId).toBe(existing.id);
 });
+
+for (const state of ["saved", "missing"] as const) {
+  it(`service plugin reuses own pins through the adapter instance with ${state} state and restart`, async () => {
+    vi.spyOn(serviceSources, "createDefaultServiceStatusSources").mockReturnValue([]);
+    const f = fixture("service", "layout");
+    const root = path.dirname(f.stateFile);
+    const current = f.add("current", BOT, NOW - 1_000);
+    const stale = f.add("stale", BOT, NOW - 2_000);
+    const human = f.add("human", "owner");
+    if (state === "saved") f.save(current.id);
+    for (let boot = 0; boot < 2; boot += 1) {
+      const host = new PluginHost(pino({ level: "silent" }), {
+        storageRoot: root,
+        storageAliases: { "service-status": {
+          "service-status.sqlite": path.join(root, "service-status.sqlite"),
+          "service-status-card.json": f.stateFile,
+        } },
+      });
+      hosts.push(host);
+      const service = createServiceStatusPlugin(f.adapter);
+      await host.loadBuiltins([{ id: "service-status", load: async () => service.plugin }], {
+        "service-status": { OLLAMA_CLOUD_ENABLED: false, DISCORD_SERVICE_STATUS_THREAD_ID: THREAD },
+      });
+      await host.jobs.startAfterAdmission(Promise.resolve());
+      host.jobs.stop();
+      await host.jobs.drain();
+      await host.dispose();
+      hosts.splice(hosts.indexOf(host), 1);
+    }
+    expect(f.sends).not.toHaveBeenCalled();
+    expect(current.edit).toHaveBeenCalledTimes(2);
+    expect(stale.delete).toHaveBeenCalledTimes(1);
+    expect(human.delete).not.toHaveBeenCalled();
+    expect(f.messages.has(human.id)).toBe(true);
+    expect(f.saved().messageId).toBe(current.id);
+  });
+}

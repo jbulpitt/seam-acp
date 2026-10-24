@@ -707,6 +707,8 @@ async function runClientMode(
     console.error(`[bridge] Connecting to ${wsUrl} ...`);
     const ws = new WebSocket(wsUrl, {
       headers: { Authorization: `Bearer ${token}` },
+      // A silent opening handshake must reach the existing close/reconnect path.
+      handshakeTimeout: KEEPALIVE_PONG_TIMEOUT_MS,
     });
 
     // #427: the ping is no longer blind. Any inbound traffic counts as an

@@ -28,7 +28,7 @@ type Persisted = {
 function isUnknownMessage(err: unknown): boolean {
   if (typeof err !== "object" || err === null || !("code" in err)) return false;
   const code = (err as { code: unknown }).code;
-  return code === 10008 || code === 10003;
+  return code === 10008;
 }
 
 export class ServerStatusCard {
@@ -116,6 +116,11 @@ export class ServerStatusCard {
   }
 
   private async push(): Promise<void> {
+    if (this.adapter.reusePinnedMessage) {
+      const message = await this.adapter.reusePinnedMessage(this.channel, this.message);
+      if (message?.id !== this.message?.id) this.pinned = false;
+      this.message = message;
+    }
     const snap = this.collect();
     this.lastSeen = rememberBridgeState(snap.bridges, this.lastSeen, snap.nowUtc);
     if (this.adapter.sendLayout && this.adapter.editLayout) {
@@ -139,19 +144,10 @@ export class ServerStatusCard {
         await this.ensurePinned();
         return;
       } catch (err) {
-        // Unknown message, or an old embed that cannot take the v2 flag.
-        this.logger.info({ err }, "status card v2 edit failed; posting a new one");
-        const stale = this.message;
+        if (!isUnknownMessage(err)) throw err;
+        this.logger.info("status card message gone; posting a new one");
         this.message = undefined;
         this.pinned = false;
-        const sent = await this.adapter.sendLayout!(this.channel, layout);
-        this.message = sent;
-        this.persist();
-        await this.ensurePinned();
-        if (stale && this.adapter.deleteMessage) {
-          await this.adapter.deleteMessage(stale).catch(() => {});
-        }
-        return;
       }
     }
     const sent = await this.adapter.sendLayout!(this.channel, layout);

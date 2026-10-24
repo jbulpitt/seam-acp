@@ -242,6 +242,8 @@ export interface ChatAdapter {
 
   /** Optional: pin a message (status card lives as the sticky post in its thread). */
   pinMessage?(message: MessageRef): Promise<void>;
+  /** Reuse one own card in a dedicated channel, deleting other own pins. */
+  reusePinnedMessage?(channel: ChannelRef, saved?: MessageRef): Promise<MessageRef | undefined>;
   /** Optional: unpin a superseded sticky message while retaining its history. */
   unpinMessage?(message: MessageRef): Promise<void>;
 

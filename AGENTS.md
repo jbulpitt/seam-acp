@@ -132,7 +132,9 @@ These are the defaults. When in doubt, choose the one that keeps the user's work
 5. **Keep comments short.** Say what the code does and why, briefly. Incident narratives and issue-number chains belong in the PR or issue, not the source; agents copy whatever style they see.
 6. **Done means it ran on the real host.** Tests that restate the implementation are not evidence. Run the real path (a real turn, a real restart) and say what you didn't check.
 
-Reviewing? Read `docs/agent-guides/review-guide.md`. It covers the delete-first questions, the outcome ranking that code comments cite as "blast radius", and what to do with an empty review.
+PR authors: use the [PR template](.github/pull_request_template.md). Reviewers:
+start with the [review brief](docs/agent-guides/review-brief.md); the
+[review guide](docs/agent-guides/review-guide.md) explains the questions.
 
 ## ⚠️ CRITICAL: Applying code changes or restarting the app
 

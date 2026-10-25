@@ -6,6 +6,9 @@ This file contains instructions for AI agents (Copilot, Claude, Gemini, etc.) wo
 
 `seam-acp` is the Discord bot you are currently running inside. It bridges Discord messages to AI agent CLIs via the Agent Client Protocol (ACP). You are likely talking to yourself.
 
+For current meanings of agent, harness, session, adapter, preset and dispatch
+verbs, see the [Seam glossary](docs/agent-guides/glossary.md).
+
 ## Your deployment's details: `docs/local/`
 
 This repo describes how Seam works, not where or how any one deployment runs.

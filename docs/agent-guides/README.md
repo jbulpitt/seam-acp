@@ -9,6 +9,9 @@ Read this primer once. Then open only the task-specific guide it routes you to.
 The MCP tool schema remains authoritative for exact arguments; these guides
 teach the operating model and the choices between tools.
 
+The [glossary](glossary.md) distinguishes overloaded names such as agent,
+harness, session, adapter, preset and card, and summarizes dispatch semantics.
+
 ## What Seam is
 
 **ACP (Agent Client Protocol)** is the session protocol Seam uses to talk to

@@ -16202,11 +16202,9 @@ export class Orchestrator {
     if (attempt.source === "inbound" && attempt.id.startsWith("inbound-")) {
       channel = this.deliveryForChannel(channel, attempt.id.slice("inbound-".length)).channel;
     }
-    // Protects bounded uncertainty from being re-queried on every boot;
-    // deleting this check recreates noisy retries without creating proof.
+    // Persisted uncertainty avoids repeating the bounded lookup on each boot.
     if (attempt.deliveryUncertainReason) return "uncertain";
-    // Protects against replaying pre-nonce output that may already be visible;
-    // deleting this check converts legacy uncertainty into duplicate messages.
+    // Legacy output lacks a receipt proving whether it was already delivered.
     if (
       !attempt.deliveryNonce ||
       !attempt.deliveryPayload ||
@@ -16219,8 +16217,7 @@ export class Orchestrator {
       );
       return "abandoned";
     }
-    // Protects against sending a receipt into a replacement/different thread;
-    // deleting this check lets stale state redirect captured output.
+    // A delivery receipt belongs to its recorded conversation.
     if (attempt.deliveryChannel !== channel.id) {
       this.store.turnAttempts.abandonDelivery(
         attempt.id,
@@ -16229,8 +16226,7 @@ export class Orchestrator {
       return "abandoned";
     }
     const sinceMs = Date.parse(attempt.deliveryStartedUtc) - 5 * 60_000;
-    // Protects against treating corrupt receipt time as a complete history scan;
-    // deleting this check can turn an indeterminate lookup into unsafe replay.
+    // The receipt timestamp anchors the history window for delivery evidence.
     if (!Number.isFinite(sinceMs)) {
       this.store.turnAttempts.abandonDelivery(attempt.id, "recorded delivery timestamp is invalid");
       return "abandoned";
@@ -16264,8 +16260,7 @@ export class Orchestrator {
       }
       if (observed.status === "found") continue;
       if (observed.status === "indeterminate") {
-        // Protects incomplete history scans from becoming destructive proof;
-        // deleting this distinction lets automatic abandonment authorize pruning.
+        // An incomplete history scan leaves delivery uncertain, not abandoned.
         this.store.turnAttempts.markDeliveryUncertain(attempt.id, observed.reason);
         return "uncertain";
       }

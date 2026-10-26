@@ -15079,11 +15079,7 @@ export class Orchestrator {
     };
   }
 
-  /**
-   * Situation for a process-restart resume. Local checkouts contribute the
-   * default-branch tip they actually have. A remote session does not get
-   * this machine's git state. A failed read is omitted.
-   */
+  /** Only local sessions inherit this checkout's default-branch facts. */
   private async processRestartRender(source: RecoveryAttemptSource): Promise<RecoveryRender> {
     const facts = recoveryFactsFromAttempt(source);
     if (facts.cwd && isLocalLocation(facts.location)) {
@@ -15093,7 +15089,6 @@ export class Orchestrator {
     return recoveryStory(facts);
   }
 
-  /** Give a failed live invocation to the existing retained-owner recovery. */
   private recoverActiveRemoteTurn(attempt: TurnAttempt, error: unknown): boolean {
     const kind = readErrorClassification(error)?.errorKind;
     if (kind !== "agent_exit" && kind !== "host_oom" && kind !== "connection_closed") return false;
@@ -15197,13 +15192,7 @@ export class Orchestrator {
     await this.notifyParkedTurn(stalled);
   }
 
-  /**
-   * Re-bind one suspended attempt to the bridge slot it already owns (#467).
-   *
-   * The attempt ledger proves ownership; `listSlots` proves the same bridge
-   * still owns that exact submission. A mismatch retains this one attempt and
-   * never falls back to local retry.
-   */
+  /** Adopt the recorded bridge submission; never substitute a local retry. */
   private async adoptRemoteRecoveryOwned(attempt: TurnAttempt): Promise<boolean> {
     const binding = attempt.remoteRecovery;
     if (!binding) return false;
@@ -15789,11 +15778,7 @@ export class Orchestrator {
     await this.renderPersistedAttemptCard(completed);
   }
 
-  /**
-   * The bridge can no longer produce this turn's result. The conversation is
-   * intact in its ACP session, so continue it there like any other
-   * interrupted turn (#631): the turn is never left waiting on a dead owner.
-   */
+  /** Continue the recorded ACP session when its bridge owner cannot return a result. */
   private continueLostRemoteTurn(attempt: TurnAttempt, cause: string): void {
     const binding = attempt.remoteRecovery;
     if (isAwaitingReauth(attempt.stalledReason)) return;
@@ -15937,8 +15922,7 @@ export class Orchestrator {
       if (!onReady) return;
       this.remoteAdoptionWaiters.get(attempt.id)?.();
     }
-    // Tier 3 (#631): after 15 minutes without the bridge, say so plainly and
-    // keep waiting. The turn continues the moment the bridge is back.
+    // The timeout is a notice, not a deadline for bridge-owned work.
     const target = attempt.spec?.target;
     let told = false;
     const notice = setTimeout(() => {
@@ -15973,15 +15957,8 @@ export class Orchestrator {
     this.remoteAdoptionWaiters.set(attempt.id, cleanup);
   }
 
-  /**
-   * Boot recovery (#76). Markers are ALWAYS reconciled (max-age / deleted
-   * thread → abandon + notice). Auto-resume ("continue" + loadSession) is
-   * gated by SEAM_TURN_RESUME_ENABLED — default off means unconfigured ==
-   * today's behavior.
-   *
-   * SINGLE-INSTANCE ASSUMPTION: no other seam-acp process owns these turns.
-   * Two processes on one DATA_DIR would double-resume everything.
-   */
+  /** Reconciliation still runs with auto-resume disabled.
+   * Recovery assumes one controller per DATA_DIR to avoid duplicate continuations. */
   async recoverInterruptedTurns(): Promise<void> {
     // A pre-prompt Cancel may commit while its controller is exiting.
     for (const attempt of this.store.turnAttempts.list("cancelled")) {
@@ -16064,9 +16041,7 @@ export class Orchestrator {
     }
 
     if (this.dispatchWatcher) {
-      // Successors already admitted must not wait behind a reattach of work
-      // that has already been prompted. Reattach stays available when nothing
-      // never-started is waiting.
+      // Reattachment must not delay successors already admitted to the queue.
       this.noteSettledUnstartedAttempts(this.store.turnAttempts.settleSupersededUnstartedAttempts());
       for (const spec of await this.dispatchWatcher.listStaleRunning()) {
         const owned = this.store.turnAttempts.get(spec.id);
@@ -16075,12 +16050,9 @@ export class Orchestrator {
           await this.adoptRemoteRecovery(owned);
           continue;
         }
-        // Defer only opted-out prompted work. Never-started dispatches and
-        // unrelated targets remain available, without original-input replay.
+        // Disabling auto-resume leaves never-started work available.
         if (owned.promptStarted && !enabled) continue;
-        // Quarantine only work we cannot safely continue, not a timestamp.
-        // Prompted, session-bound work uses the same path as operator Resume;
-        // identity/ownership/provider guards still run before any prompt.
+        // Session-bound continuation shares the operator Resume path.
         const refusal = await this.dispatchContinuationRefusal(spec);
         if (refusal) {
           await this.observeRetainedDispatch(spec, DispatchSuspendedError.defect(spec.id, refusal));

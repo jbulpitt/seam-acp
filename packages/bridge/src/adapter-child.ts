@@ -1,12 +1,7 @@
 #!/usr/bin/env node
 /**
- * Adapter-aware child host for #574.
- *
- * sessiond remains an opaque descriptor owner. This process is what turns a
- * bridge slot configuration into an adapter process, then survives bridge
- * control-plane restarts while keeping that adapter's stdio open. Bootstrap
- * arrives on stdin (never argv or persisted state) because it may contain MCP
- * credentials and per-slot environment values.
+ * Host an adapter independently of bridge control-plane restarts.
+ * Bootstrap arrives on stdin, not argv, because it may contain credentials.
  */
 import type { ChildProcess } from "node:child_process";
 import { writeSync } from "node:fs";
@@ -67,9 +62,7 @@ function writeAgent(data: string | Buffer): boolean {
 let refused = false;
 /** Set once a resume record exists; a refusal or failure ends the work for good. */
 let clearResumeRecord = (): void => {};
-/** Stop this slot and send the reason to the controller as the exit frame's
- *  spawnError. A dropped input with no report surfaced only as a 45s
- *  "never responded" timeout (#609, #610). */
+/** Report the refusal before exiting so the controller receives its cause. */
 function exitWithRefusal(reason: string): void {
   if (refused) return;
   refused = true;
@@ -170,8 +163,7 @@ function start(config: AdapterChildBootstrap): void {
     }
   };
 
-  // #631: relaunched after a host restart. Bring the agent back to the same
-  // session, then continue the interrupted turn under its original request id.
+  // Resume under the original request id so the controller can settle its turn.
   let resuming: { resume: AdapterChildResume; phase: "initialize" | "load" | "mode" } | undefined;
   const RESUME_INITIALIZE = "seam-resume-initialize";
   const RESUME_LOAD = "seam-resume-load";
@@ -339,8 +331,7 @@ function start(config: AdapterChildBootstrap): void {
 
   consume = handle;
   if (config.resume) {
-    // Re-arm first: the controller sees this slot owns the turn while the
-    // session reloads, and does not start a second continuation.
+    // Re-arm before loading so the controller does not start a second continuation.
     recovery.arm(config.slot, {
       submissionId: config.resume.recovery.submissionId,
       acpSessionId: config.resume.recovery.acpSessionId,

@@ -1,15 +1,6 @@
 /**
- * Resume records for turns interrupted by a host restart (#631).
- *
- * While a delegated turn is in flight, the adapter child keeps a private
- * record of how to relaunch itself and continue that turn. sessiond deletes
- * it when it sees the slot exit or kills the slot on purpose, and the child
- * deletes it when the turn finishes. So a record outlives its process only
- * when the host (or sessiond and the child together) went down mid-turn.
- * After boot, sessiond relaunches each record it finds; it does not read it.
- *
- * The record holds the child's launch and bootstrap, which can include
- * credentials. It is written 0600 inside sessiond's private resume directory.
+ * Resume records survive host restarts; completed or explicitly ended turns remove them.
+ * They may contain credentials and use mode 0600 in sessiond's private directory.
  */
 import fs from "node:fs";
 import path from "node:path";
@@ -34,7 +25,6 @@ export function createResumeRecorder(file: string | undefined, bootstrap: Adapte
   const modeRequests = new Map<unknown, string | undefined>();
 
   return {
-    /** Remember how the controller set the session up, from its own requests. */
     observeInput(line: string): void {
       if (!file || (!line.includes("\"initialize\"") && !line.includes("\"session/"))) return;
       try {
@@ -67,7 +57,6 @@ export function createResumeRecorder(file: string | undefined, bootstrap: Adapte
       } catch { /* Not an ACP response. */ }
     },
 
-    /** Write the record for an in-flight turn, once per submission. */
     record(recovery: AdapterChildResume["recovery"] | undefined): void {
       if (!file || !recovery || recorded === recovery.submissionId || initialize === undefined || !session) return;
       const resume: AdapterChildResume = {

@@ -1,14 +1,7 @@
 #!/usr/bin/env node
 /**
- * One process per slot that owns the slot's child and its stdio (#631).
- *
- * sessiond used to hold every child's pipes itself, so a sessiond restart
- * closed them and ended every running turn on the host. The holder owns the
- * pipes instead, numbers and keeps the child's output until it is read, and
- * listens on a private socket. A restarted sessiond reconnects and carries on.
- *
- * It knows nothing about ACP or adapters: it moves bytes and reports facts.
- * The launch (which may carry credentials) arrives over the socket, never argv.
+ * Own the child's stdio so it survives sessiond restarts.
+ * Launch data may contain credentials and arrives over the socket, not argv.
  */
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import fs from "node:fs";
@@ -27,7 +20,6 @@ import {
 const socketPath = process.argv[2];
 if (!socketPath) process.exit(2);
 
-/** Unread output is kept up to this size, oldest dropped first. */
 const MAX_BUFFER_BYTES = 64 * 1024 * 1024;
 /** After the child exits, stay reachable this long for sessiond to collect the exit. */
 const EXIT_LINGER_MS = 60_000;
@@ -143,8 +135,6 @@ function startChild(message: Extract<SlotHolderInput, { type: "spawn" }>, socket
 
 function handle(socket: net.Socket, message: SlotHolderInput): void {
   if (message.type === "hello") {
-    // A (re)connecting sessiond. It replaces any earlier connection and gets
-    // every retained frame after its cursor, then the live stream.
     if (connection && connection !== socket) connection.destroy();
     connection = socket;
     send(socket, { v: SLOT_HOLDER_PROTOCOL_VERSION, type: "hello_ack",
@@ -199,12 +189,10 @@ const server = net.createServer((socket) => {
 server.listen(socketPath, () => {
   fs.chmodSync(socketPath, 0o600);
 });
-// sessiond sends the launch right after starting this holder. If it never
-// arrives (sessiond died in between), there is nothing to hold.
+// A holder with no launch has no child to preserve.
 setTimeout(() => { if (!child) finish(); }, 60_000).unref();
 
-// sessiond's own stop signals never reach here (separate process group). A
-// SIGTERM to the holder is an explicit stop of this slot: pass it to the child.
+// The holder has its own process group; SIGTERM here explicitly stops its slot.
 process.on("SIGTERM", () => {
   if (child && child.exitCode === null && child.signalCode === null) child.kill("SIGTERM");
   else if (!finalizing || exitSeq !== undefined) finish();

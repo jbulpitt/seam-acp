@@ -16,11 +16,10 @@ export interface AdapterChildBootstrap {
   localCwd: string;
   slot: number;
   config: SlotSpawnConfig;
-  /** Present when sessiond relaunches this slot after a host restart (#631). */
+  /** Present when sessiond relaunches this slot after a host restart. */
   resume?: AdapterChildResume;
 }
 
-/** Everything needed to continue an interrupted turn in a fresh agent process. */
 export interface AdapterChildResume {
   initialize: unknown;
   load: { sessionId: string; cwd: unknown; mcpServers: unknown };

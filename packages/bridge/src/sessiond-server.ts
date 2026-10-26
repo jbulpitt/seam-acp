@@ -43,7 +43,7 @@ const ORPHAN_KILL_GRACE_MS = 500;
 interface PersistedSlot {
   slot: number;
   pid: number | null;
-  /** The slot holder's socket (#631). Absent for pre-holder records. */
+  /** Absent for records without a slot holder. */
   socketPath?: string;
   exitedAt?: number;
   lastSeq?: number;
@@ -347,11 +347,7 @@ export class SessiondServer {
     this.started = true;
   }
 
-  /**
-   * Stop this supervisor. Slots keep running in their holders and the next
-   * sessiond reconnects to them (#631). `terminateChildren` ends every slot;
-   * only tests use it, to clean up.
-   */
+  /** Disconnect without stopping holders; terminateChildren is test cleanup. */
   async close(options: { terminateChildren?: boolean } = {}): Promise<void> {
     const ownedSocket = this.started;
     this.closing = true;
@@ -389,8 +385,7 @@ export class SessiondServer {
     socket.on("data", (chunk: Buffer) => this.receive(connection, chunk));
     socket.on("error", () => undefined);
     socket.on("close", () => {
-      // Link loss proves nothing about the child. Drop only this subscriber;
-      // every slot and descriptor remains owned by sessiond.
+      // Losing a subscriber does not end the holder-owned slot.
       this.connections.delete(connection);
     });
   }
@@ -786,8 +781,7 @@ export class SessiondServer {
     }
     let data: Buffer;
     try {
-      // A canonical round trip is the whole check. The previous regex overflowed
-      // V8's stack past ~6 MB and rejected valid photo prompts as invalid.
+      // Round-trip validation avoids regex stack limits on large attachment payloads.
       data = Buffer.from(params.dataBase64, "base64");
       if (params.dataBase64.length % 4 !== 0 || data.toString("base64") !== params.dataBase64) throw new Error("invalid base64");
     } catch {
@@ -803,9 +797,7 @@ export class SessiondServer {
   private subscribe(connection: ConnectionState, params: SessiondSubscribeParams): { slot: number; subscribed: true; throughSeq: number } {
     this.assertRestorableSlot(params.slot);
     if (!this.slots.has(params.slot)) throw new SessiondError("slot_not_found", "subscribe refused: slot does not exist");
-    // Registration, replay, and acknowledgement happen in one event-loop turn.
-    // A child event cannot interleave, so the consumer observes retained frames
-    // first and every later live frame exactly once on this connection.
+    // Synchronous registration and replay keep child events after retained frames.
     connection.subscriptions.add(params.slot);
     const replay = this.outputLog.since(params.slot, params.afterSeq);
     if (replay.gap) {
@@ -991,8 +983,6 @@ export class SessiondServer {
       }
     }
 
-    // #631: a slot holder outlived the previous sessiond. Reconnect and carry
-    // on: the child, its stdio and its unread output are all still there.
     await Promise.all(held.map(async (entry) => {
       if (await this.connectHolder(entry, 3_000)) {
         console.error(`[seam-sessiond] reattached slot ${entry.slot} (pid ${entry.pid ?? "?"}) after a sessiond restart`);
@@ -1002,9 +992,7 @@ export class SessiondServer {
       }
     }));
 
-    // Pre-holder children had their stdio in the old sessiond, so they lost
-    // it when it exited and can do no further work. Their exact identity is
-    // positive ownership evidence; only those process groups are reaped.
+    // Legacy children lose stdio when their supervisor exits; reap only verified owned groups.
     const escalated = new Set<number>();
     for (const { identity } of legacy) {
       try { process.kill(-identity.pgid, "SIGTERM"); } catch { /* already gone */ }
@@ -1028,12 +1016,7 @@ export class SessiondServer {
     await this.persist();
   }
 
-  /**
-   * #631: a host restart ended slots whose turns were still running. Each
-   * left a resume record; relaunch it before accepting clients, so the bridge
-   * sees the slot live on its first look. What the child does with its
-   * bootstrap is its business.
-   */
+  /** Relaunch before accepting clients so the bridge sees the resumed slots live. */
   private async relaunchRecordedTurns(): Promise<void> {
     const directory = this.resumeDir();
     const names = await fs.readdir(directory).catch(() => [] as string[]);

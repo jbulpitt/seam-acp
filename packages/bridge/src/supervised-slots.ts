@@ -34,16 +34,8 @@ interface SlotBinding {
   buffered: Map<number, SupervisedBridgeFrame>;
   gap?: { afterSeq: number; firstAvailableSeq: number; droppedFrames: number };
   exitSeen?: boolean;
-  /**
-   * #606: the child behind this binding has exited (or its descriptors died
-   * with a previous sessiond). The binding stays so its retained output —
-   * including the exit frame that settles the turn it was serving — can still
-   * be replayed. It must never be reused for NEW input: `ensure()` respawns.
-   *
-   * Separate from `exitSeen`, which `replay()` resets to de-duplicate exit
-   * frames per consumer cursor. That reset is right for replay and would be
-   * wrong here: a replayed death is still a death.
-   */
+  /** Dead bindings retain output; only a fresh configure permits a replacement child.
+   * Unlike exitSeen, this survives replay cursor resets. */
   dead?: boolean;
 }
 
@@ -90,36 +82,7 @@ function outputFrame(frame: SessiondOutputFrame, parsedOutput?: ReturnType<typeo
   return { seq: frame.seq, type: "exit", code: 1, signal: null, spawnError };
 }
 
-/**
- * Restartable bridge-side view of sessiond slots (#574).
- *
- * A retained slot accepts input exactly like a freshly spawned one. #584 made
- * retained bindings output-only to avoid an "unknown resend" into a child whose
- * submission state the new control plane could not prove. That protection does
- * not apply here and cost more than it saved:
- *
- * - `recovery-directive.ts` already decides this. Duplicate submission is a
- *   refusal predicate for EPHEMERAL outward-effect work only; persistent
- *   conversations keep their transcript, so a repeat is absorbed, not doubled.
- * - Rung-1 recovery resubmits into a live session on purpose
- *   (`disposition: "continue_same_session"`, `retry.mode: "continue" | "resend"`).
- *   Refusing the same write here contradicted the layer above it.
- * - Resuming a conversation is "continue". That is the normal path, not a hazard.
- *
- * What it actually did was turn "this slot is uncertain" into "this thread can
- * never accept input again", surfaced as a failed turn that discarded the
- * operator's prompt. Uncertainty is not an operating mode.
- */
-/**
- * #606: deliver controller input to a slot and REPORT when it cannot land.
- *
- * `writeInput` resolves false for an undeliverable write and rejects when a
- * spawn fails. The bridge used to handle only the rejection, so a resolved
- * false vanished: no exit frame reached the controller, which then waited out
- * its 45s ACP-initialize timeout and blamed installation and authentication.
- * Both outcomes now produce the same immediate, named failure. Exported so the
- * contract is testable; `index.ts` exits on import and cannot be.
- */
+/** Report undeliverable writes as well as spawn failures to the controller. */
 export async function forwardInput(
   slots: Pick<SupervisedSlots, "writeInput"> & Partial<Pick<SupervisedSlots, "undeliverableReason">>,
   slot: number,
@@ -158,12 +121,7 @@ export class SupervisedSlots {
   async rebind(): Promise<SessiondListSlotsResult> {
     const listed = await this.options.client.listSlots();
     for (const health of listed.health) {
-      // #606: sessiond keeps entries for exited children, and slot numbers
-      // restart near zero on every bridge connection. Binding a dead entry as
-      // though it were live meant the first turns after a bridge-only restart
-      // collided with it, `ensure()` returned it without spawning, and the
-      // write went to a process that no longer existed. Keep it replayable;
-      // refuse it for input.
+      // Dead slots remain replayable but cannot accept input.
       this.bindings.set(health.slot, {
         mode: "idle",
         buffered: new Map(),
@@ -194,12 +152,7 @@ export class SupervisedSlots {
   }
 
   configure(slot: number, config: SlotSpawnConfig): void {
-    // #606: the controller configures a slot with `rpc("spawn")` before the
-    // first ACP frame of a NEW runtime (mux.ts). If the binding under that slot
-    // number is dead, this is the declaration that a new child belongs there:
-    // drop the dead binding so the next input spawns. sessiond replaces the
-    // dead entry on spawn (`spawnSlot`), and the old recovery snapshot described
-    // the dead child's submission, not this one's.
+    // Configure marks a new runtime; input alone must not resurrect a dead child.
     if (this.bindings.get(slot)?.dead) {
       this.bindings.delete(slot);
       this.recoveries.delete(slot);
@@ -224,16 +177,11 @@ export class SupervisedSlots {
     };
   }
 
-  /** False means UNDELIVERABLE — the child is gone — never "I declined to try".
-   * Liveness is the only thing that can refuse a write. Where the slot came from
-   * is not a reason: a retained child is as writable as one spawned a moment ago. */
+  /** False means the write could not land; callers must report the cause. */
   async writeInput(slot: number, data: string): Promise<boolean> {
     return this.serial(slot, async () => {
-      // #606: input for a dead child WITHOUT a fresh configure is a continuation
-      // of a session whose process is gone. Spawning a blank child and feeding
-      // it mid-session ACP frames would hide that death (#574's "instead of
-      // resurrecting the dead slot"). Report it undeliverable; the binding stays
-      // so the dead child's exit frame can still be replayed to settle its turn.
+      // Mid-session ACP input cannot initialize a replacement child.
+      // Retain the dead binding so its exit remains replayable.
       if (this.bindings.get(slot)?.dead) {
         if (!this.undeliverable.has(slot)) this.undeliverable.set(slot, "the slot's process has already exited");
         return false;
@@ -247,12 +195,6 @@ export class SupervisedSlots {
         });
       } catch (error) {
         this.undeliverable.set(slot, `sessiond refused a ${data.length}-byte write (${error instanceof Error ? error.message : String(error)})`);
-        // The child died between ensure() and this write. Mark it so the next
-        // input respawns rather than writing into the same corpse forever, and
-        // return false. The caller MUST report false as undeliverable: #599
-        // introduced this return and nothing read it, so a dead slot became a
-        // silent 45-second ACP-initialize timeout instead of an immediate error
-        // (#606). See `forwardInput`.
         const binding = this.bindings.get(slot);
         if (binding) binding.dead = true;
         return false;
@@ -396,7 +338,7 @@ export class SupervisedSlots {
 
   /** The controller has read this slot's output through `throughSeq`. */
   async ack(slot: number, throughSeq: number): Promise<void> {
-    // A sessiond from before #631 has no ack method; its time bound still applies.
+    // Older supervisors lack ack; their time-based retention still applies.
     await this.options.client.ack({ slot, throughSeq }).catch(() => {});
   }
 
@@ -412,11 +354,7 @@ export class SupervisedSlots {
     });
   }
 
-  /**
-   * Atomically switches the supervisor subscription to the consumer cursor.
-   * `activate` is called only after the cmd reply is written to the websocket,
-   * so live frames cannot overtake their retained predecessors.
-   */
+  /** Activate after the command reply so live frames follow retained output. */
   async replay(slot: number, afterSeq: number): Promise<{
     result: {
       slot: number;
@@ -428,9 +366,7 @@ export class SupervisedSlots {
     const binding = this.bindings.get(slot);
     if (!binding) throw new Error("replayOutput: slot does not exist");
     binding.mode = "buffering";
-    // A prior live delivery may have happened while the websocket was absent.
-    // Replay is a new consumer cursor, so the retained terminal frame must be
-    // eligible again; duplicate exits within this one replay remain collapsed.
+    // A new consumer cursor permits its retained exit, then deduplicates within this replay.
     binding.exitSeen = false;
     binding.buffered.clear();
     binding.gap = undefined;
@@ -524,8 +460,6 @@ export class SupervisedSlots {
     const frame = outputFrame(event.frame, parsed);
     if (!frame) return;
     if (frame.type === "exit") {
-      // #606: without this, a child that exited normally left a binding that
-      // `ensure()` would hand back for the next input on the same slot.
       binding.dead = true;
       if (binding.exitSeen) return;
       binding.exitSeen = true;

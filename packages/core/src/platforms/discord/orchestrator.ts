@@ -16643,22 +16643,9 @@ export class Orchestrator {
     return (`Cancelled ${abandoned} item(s) older than ${days} days in ${channelRef ? "this thread" : "all threads"}. All database records were kept.${failureNote}`).slice(0, 1900);
   }
 
-  /** Steer a running (or idle) node: preemptively cancel its in-flight turn,
-   *  then inject a FRAMED re-prompt into that thread's LIVE session so its
-   *  history/session is preserved (no new session). Works cross-thread — the
-   *  `thread` option names the target, which may differ from where the command
-   *  was run — and on an idle node (nothing to cancel, the inject just runs).
-   *
-   *  Cancel uses the same mechanism as `/seam cancel`: a graceful ACP cancel via
-   *  `router.abortTurn(id, { force: false })`. The inject is queued on the
-   *  target's channel (`queueOnChannel`) so it takes the cancelled turn's place
-   *  in line rather than overlapping its event stream. */
   /**
-   * Resolve the operator's display name for a slash interaction via the same
-   * speaker-identity precedence as chat messages (#57): admin override → guild
-   * nickname → global name → username. Used to attribute a cooperative steer to
-   * the human who issued it. `i.member` may be a full GuildMember (has
-   * `displayName`) or the raw API shape (no getter) — read it defensively.
+   * Attribute the operator using override → guild nickname → global name → username.
+   * Interaction members may be raw API objects without GuildMember's displayName getter.
    */
   private interactionSpeakerName(i: ChatInputCommandInteraction): string {
     const member = i.member;
@@ -16685,9 +16672,7 @@ export class Orchestrator {
     const here = this.channelRefFromInteraction(i);
     const threadId = explicit || here?.id;
     const prompt = i.options.getString("prompt", true);
-    // #63 two-tier: `now:true` is PREEMPTIVE (cancel-and-reprompt, today's
-    // behavior); `now:false` (DEFAULT) is COOPERATIVE — push into the session's
-    // inbox (#61) with no cancel, delivered at the agent's next poll_inbox.
+    // Slash steer defaults to inbox delivery; now:true cancels and queues a live replacement.
     const now = i.options.getBoolean("now") ?? false;
     if (!threadId) {
       await replyToInteraction(i, {
@@ -16716,9 +16701,7 @@ export class Orchestrator {
     const source = here;
 
     if (!now) {
-      // COOPERATIVE (#63 default): queue the steer into the target's inbox — no
-      // cancel, no new turn. The running (or idle) agent absorbs it on its next
-      // poll_inbox. Attributed to the operator via speaker-identity (#57).
+      // Attributed inbox delivery waits for poll_inbox without cancelling or opening a turn.
       const from = humanInboxFrom(operator, i.user.id);
       const { queued } = this.pushHumanInbox(record, from, prompt);
       await this.postSteerCard({
@@ -16736,11 +16719,8 @@ export class Orchestrator {
       return;
     }
 
-    // #174: `now:true` is the one steer mode that OPENS a turn (the cooperative
-    // path above only writes to the inbox), and it does so outside the
-    // `handleIncomingMessage` gate. Refuse it once admission is closed rather
-    // than cancelling a live turn and starting a replacement the drain has
-    // already stopped waiting for. Told plainly, so the operator can resend.
+    // Preemptive steer opens a turn outside handleIncomingMessage's admission gate.
+    // During shutdown, keep the live turn rather than start a replacement the drain cannot await.
     if (this.intakeStopped) {
       await replyToInteraction(i,
         "♻️ Restarting — the steer was not sent and nothing was cancelled. Try again in a moment."
@@ -16767,8 +16747,7 @@ export class Orchestrator {
     // Preemptive cancel — identical to `/seam cancel` (graceful ACP cancel).
     const cancelOutcome = await this.router.abortTurn(record.id, { force: false });
 
-    // #155: the durable record goes up BEFORE the turn runs, so the thread
-    // shows what was sent even if the steered turn then fails or times out.
+    // Post the durable instruction before the turn so failures still leave it visible.
     await this.postSteerCard({
       target,
       prompt,
@@ -16792,16 +16771,8 @@ export class Orchestrator {
   }
 
   /**
-   * #155: a slash steer leaves a DURABLE card in the steered thread saying
-   * what was sent. Until now the instruction reached the agent and then
-   * existed nowhere visible — the thread showed a response to a prompt nobody
-   * could see.
-   *
-   * Provenance follows the same rules as a dispatched turn's card (#153): the
-   * operator is always named; the source thread appears only when the steer
-   * came from a DIFFERENT thread, and the source channel only when that
-   * thread also sits in a different channel. Best-effort — a posting failure
-   * must never break the steer itself.
+   * Name the operator; include source thread/channel only when different from the target.
+   * Card delivery is best-effort so a posting failure does not break the steer.
    */
   private async postSteerCard(opts: {
     target: ChannelRef;

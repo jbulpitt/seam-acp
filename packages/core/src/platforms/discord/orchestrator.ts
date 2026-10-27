@@ -17394,8 +17394,7 @@ export class Orchestrator {
     const compactLocation = compactBinding.location.value;
     const profile = this.router.getProfile(compactAgentId, compactLocation);
     if (!profile) throw new Error(`Agent profile "${compactAgentId}" not found.`);
-    // #308: protects the direct Discord-history compactor; deleting it makes
-    // this temporary AgentRuntime a bypass around normal turn resolution.
+    // Temporary compaction runtimes follow the same agent restrictions as ordinary turns.
     this.router.assertAgentAllowedForRecord(record, profile.id);
     const manager = this.sessionManagerFor(profile, compactAgentId, compactLocation);
     if (typeof this.adapter.fetchThreadMessages !== "function") {
@@ -17539,12 +17538,8 @@ export class Orchestrator {
   }
 
   /**
-   * #631: one ACP session must have one thread. When this thread shares its
-   * session with an older thread, it gets its own copy before the turn: a
-   * native fork where the agent supports one (exact context), otherwise the
-   * deterministic rebuild from this thread's Discord history. Both threads
-   * keep going and diverge from here. A failure leaves the turn on the shared
-   * session, as before, and says why in the log.
+   * Prefer a native fork for a non-owner's copy; otherwise rebuild deterministically from Discord history.
+   * Failures preserve the current session and log the cause.
    */
   private async ensureOwnSession(record: SessionRecord, channel: ChannelRef): Promise<void> {
     if (!record.acpSessionId) return;
@@ -17576,10 +17571,8 @@ export class Orchestrator {
   }
 
   /**
-   * Agent-callable cross-thread Rebuild. Addressing and same-channel scope are
-   * enforced by seam-MCP before this platform method receives the bound record;
-   * this owns Discord history, the durable card, exact destination warming,
-   * seeding, and compare-and-swap attachment just like `/seamadmin rebuild`.
+   * seam-MCP owns addressing and same-channel scope; this platform owns history and the durable card.
+   * It warms the exact destination, seeds it and attaches with compare-and-swap.
    */
   async rebuildThreadFromDiscord(record: SessionRecord): Promise<{
     newSessionId: string;

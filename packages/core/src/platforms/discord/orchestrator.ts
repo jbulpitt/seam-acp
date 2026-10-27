@@ -16996,9 +16996,6 @@ export class Orchestrator {
   }
   private async editConfigEditorCard(channel: ChannelRef, messageId: string, panel: StructuredPanel) { await this.configUi.ready; return this.configUi.ui.editConfigEditorCard(channel, messageId, panel); }
 
-  /** `/seam workflows` — read-only view of the delegation ledger. Renders the
-   *  still-in-flight rows and a correlation-grouped recent tail as an embed; no
-   *  writes, no schema, purely observability. */
   private async cmdWorkflows(i: ChatInputCommandInteraction): Promise<void> {
     try {
       await this.cmdWorkflowsDeferred(i);
@@ -17042,8 +17039,7 @@ export class Orchestrator {
       return;
     }
 
-    // Wake cancel (#59, D6): fold into /seam workflows per #26 rather than a new
-    // top-level subcommand (the /seam tree is at Discord's 25-option cap).
+    // Lifecycle actions share /seam workflows to stay within Discord's 25-option limit.
     const cancelWakeInput = i.options.getString("cancel-wake");
     const cancelWakeId = cancelWakeInput
       ? await this.normalizeAutocompleteSubmission(
@@ -17065,8 +17061,6 @@ export class Orchestrator {
       return;
     }
 
-    // Watch cancel (#60, D7): same surface as wake cancel — the /seam tree is at
-    // Discord's option cap, so watch lifecycle folds into /seam workflows too.
     const cancelLiveInput = i.options.getString("cancel-live");
     const cancelLiveId = cancelLiveInput
       ? await this.normalizeAutocompleteSubmission(
@@ -17169,8 +17163,7 @@ export class Orchestrator {
       return;
     }
 
-    // #159: Resume/Cancel rebuilds this card from authoritative state, so the
-    // inventory is a re-runnable render rather than a one-shot build.
+    // Rebuild from the store after Resume/Cancel so controls reflect current state.
     const initial = await this.renderWorkflowInventory(i, limit, 0);
     await replyToInteraction(i, {
       embeds: initial.embeds,
@@ -17182,8 +17175,7 @@ export class Orchestrator {
       filter: (c) => c.user.id === i.user.id,
       time: 600_000,
     });
-    // #159: the inventory had no end handler, so Resume/Cancel stayed
-    // clickable long after the collector expired.
+    // Collector expiry makes the controls terminal.
     const lifecycle = this.attachListLifecycle(i, collector, () =>
       expiredCardView("\u23f0 Workflow inventory expired \u2014 run `/seam workflows` again.")
     );
@@ -17214,15 +17206,6 @@ export class Orchestrator {
     }, err => this.logger.warn({ err }, "workflows resume/cancel button failed"));
   }
 
-  /**
-   * One render of the `/seam workflows` inventory, built fresh from the store.
-   *
-   * `/seam workflows` is rarely used, so this stays deliberately compact: one
-   * summary page of ledger/wake/watch/ingest/choice state, plus controls (and
-   * pagination) only for the interrupted rows that still have a live action.
-   * Rebuilt after every Resume/Cancel so a consumed row cannot be clicked
-   * twice (#159).
-   */
   private async renderWorkflowInventory(
     i: ChatInputCommandInteraction,
     limit: number,
@@ -17306,10 +17289,8 @@ export class Orchestrator {
         });
       }
 
-      // Additive anomaly scan (issue #26). Detection over a wider history than
-      // the displayed `recent` tail so frequency spikes are actually visible;
-      // union with active so a long-quiet dispatched row isn't missed if it
-      // falls past the recent cutoff. Read-only — no parking, no writes.
+      // A wider history plus active rows exposes spikes and long-quiet workflows.
+      // Anomaly detection is read-only.
       const scanRows = [
         ...new Map(
           [
@@ -17338,15 +17319,13 @@ export class Orchestrator {
     let page = 0;
     let pageCount = 1;
     if (interrupted.length > 0) {
-      // Controls exist only for rows a click can still act on, and the visible
-      // Lines and controls use the same rows and available actions.
+      // Visible rows and controls share the same available actions.
       const slice = buildInterruptedInventory(interrupted, requestedPage, now);
       page = slice.page;
       pageCount = slice.pageCount;
       if (slice.actionable) {
         embed.addFields(slice.actionable);
-        // Never dropped by the embed budget below: these are the rows the
-        // buttons act on.
+        // Keep fields referenced by action buttons when trimming the embed.
         requiredFieldNames.add(slice.actionable.name);
       }
       for (const field of slice.details ?? []) {
@@ -17354,8 +17333,7 @@ export class Orchestrator {
         requiredFieldNames.add(field.name);
       }
       if (slice.inert) embed.addFields(slice.inert);
-      // Per-entry Resume / Cancel \u2014 same pattern as schedule-list cards.
-      // Zero extra command slots. Four rows leave the fifth for pagination.
+      // Four action rows leave Discord's fifth row for pagination.
       for (const row of slice.items) {
         const actions = interruptedRowActions(row);
         const buttons: ButtonBuilder[] = [];
@@ -17382,10 +17360,8 @@ export class Orchestrator {
     }
     components.push(workflowNavigation(page, pageCount));
 
-    // Discord caps the WHOLE embed at 6000 chars across title/description/
-    // fields/footer, independently of the 1024 per-field cap — and this card
-    // can carry ten independently-clamped sections. Trim optional ones rather
-    // than letting the API reject the card outright.
+    // Discord limits the whole embed to 6000 characters, independently of each field's 1024.
+    // Trim optional sections while preserving fields used by controls.
     const footerText = embed.data.footer?.text ?? "";
     const overhead =
       (embed.data.title?.length ?? 0) +

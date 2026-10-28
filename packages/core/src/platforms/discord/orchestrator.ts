@@ -2446,12 +2446,8 @@ export class Orchestrator {
       }
     }
 
-    // #63: cooperative mid-turn reply routing (flag-gated, DARK by default). When
-    // a turn is already active on this thread and SEAM_MIDTURN_REPLY_MODE="inbox",
-    // a bare reply joins the running agent's inbox (#61) instead of force-aborting
-    // the turn — pull-only, so NO generation bump, NO abort, NO new turn. Handled
-    // before the bump/abort below precisely so it pre-empts neither. The default
-    // "abort" mode falls through to the priority-interrupt path unchanged.
+    // Inbox mode routes replies before generation changes or aborts; the agent
+    // reads them cooperatively. Abort mode continues through the interrupt path.
     if (
       this.config.SEAM_MIDTURN_REPLY_MODE === "inbox" &&
       preemptive &&
@@ -2473,9 +2469,8 @@ export class Orchestrator {
       }
     }
 
-    // #89 D9: a live (non-park) user message supersedes any parked queue item
-    // BEFORE aborting, so a turn-end fire cannot sneak the old prompt in after
-    // abort completes. Offline-bridge parks skip this — they REPLACE the row.
+    // Clear superseded parked work before abort so turn-end cannot fire it.
+    // Offline-bridge parking replaces the row instead.
     if (msg.raw && preemptive && !this.wouldParkForOfflineBridge(msg)) {
       this.lastUserMessageAt.set(channelId, Date.now());
       await this.clearParkedForChannel(
@@ -2558,22 +2553,8 @@ export class Orchestrator {
         ...(channel.parentId ? { parentRef: channel.parentId } : {}),
         cwd: msg.cwd ?? this.config.REPOS_ROOT,
       });
-      // `channelQueues.has()` answers "does this channel hold an unresolved
-      // queue link", which stays true through the whole POST-TURN TAIL —
-      // finalization, delivery, report-back, voice. Measured on a live thread:
-      // the agent turn logged `turn timing` and the tail ran on for another
-      // one to three minutes.
-      //
-      // So a user who read the answer and replied promptly was classified as
-      // interrupting a running turn. The abort then tore down the tail that was
-      // about to settle the status card, which is why that thread's card never
-      // left Working and its next prompt always queued behind an abort. Every
-      // turn, indefinitely.
-      //
-      // Aborting is only meaningful while an agent prompt is actually in
-      // flight. Without one there is nothing to cancel, and the new message
-      // should simply queue behind the tail — which `queueOnChannel` already
-      // does correctly.
+      // Queue links include finalization and delivery after the prompt ends.
+      // Only cancel an active prompt; queue new messages behind its post-turn tail.
       const promptInFlight = this.router.isBusy(record.id);
       if (!promptInFlight) {
         this.logger.info(
@@ -2584,9 +2565,7 @@ export class Orchestrator {
         this.logger.info({ channelId, sessionId: record.id }, "new message arrived while turn active; aborting running turn");
         interruptedDispatchFence = this.dispatchWatcher?.fenceTarget(channelId);
         try {
-          // User intent: the new message replaces the running turn. Clear the
-          // marker at this layer (NOT dispose) so a crash mid-abort does not
-          // resume the turn the user just superseded.
+          // Clear the superseded turn's marker before abort so a crash cannot replay it.
           await this.clearTurnMarkersForChannel(channelId, "cancelled", {
             cancelLiveOnly: true,
           });
@@ -2600,9 +2579,8 @@ export class Orchestrator {
       }
     }
 
-    // #88 D8: park BEFORE getOrStartRuntime when this thread is bound to a
-    // remote bridge that is not ready. After aborting any in-flight turn so
-    // this message replaces it. Does not hold the Discord turn open.
+    // Park offline bridges after interruption, before runtime acquisition.
+    // Recover fenced dispatches on exit so interrupted work is not stranded.
     let parked = false;
     try {
       parked = await this.tryParkForOfflineBridge(msg, admissionId);

@@ -3082,9 +3082,8 @@ export class Orchestrator {
   }
 
   /**
-   * Drop `link` from `channelQueues` once it is the last waiter, then try to
-   * fire a parked `/seam queue` (or leftover #88) row. #89 D7: turn-end is a
-   * fire hook alongside `onBridgeReady`.
+   * Fire parked work at turn-end as well as bridge readiness, only after the
+   * last queue link releases.
    */
   private releaseChannelQueue(channelId: string, link: Promise<void>): void {
     // FIFO release can precede handler settlement; track these hooks separately.
@@ -3114,11 +3113,8 @@ export class Orchestrator {
   }
 
   /**
-   * Register a fire-and-forget post-turn continuation so shutdown can await it.
-   *
-   * The set is self-clearing: each promise removes itself on settle, so a long
-   * -running process does not accumulate references. Failures are already
-   * handled inside the continuations, so this only ever observes completion.
+   * Track post-turn work through shutdown; settled promises release references.
+   * Continuations handle their own failures.
    */
   private trackContinuation(p: Promise<void>): void {
     const tracked = p.catch(() => undefined).finally(() => {
@@ -3127,38 +3123,23 @@ export class Orchestrator {
     this.pendingContinuations.add(tracked);
   }
 
-  /** How many post-turn continuations are still outstanding. */
   get pendingContinuationCount(): number {
     return this.pendingContinuations.size;
   }
 
   /**
-   * Gateway handlers admitted but not yet finished (#174).
-   *
-   * Gating ingress at entry stops NEW work; it does nothing for a handler
-   * admitted a millisecond before the gate closed. That handler is in no
-   * channel queue, counts as no turn, and registers no continuation — so
-   * without this it is invisible to the barrier and can be mid-await over the
-   * store when `store.close()` lands.
+   * Shutdown must await admitted gateway handlers even before they join a
+   * channel queue, so the store stays open until those handlers settle.
    */
   private readonly inboundWork = new Set<Promise<void>>();
 
-  /** How many admitted gateway handlers are still running. */
   get inboundWorkCount(): number {
     return this.inboundWork.size;
   }
 
   /**
-   * The one wrapper every store-backed Discord ingress goes through: refuse
-   * when admission is closed, otherwise TRACK until it finishes.
-   *
-   * `refuse` runs instead of the handler and is deliberately not tracked — it
-   * must touch nothing but the transport.
-   *
-   * Tracking is NOT an error boundary. Every caller is reached from an adapter
-   * event handler that already catches and logs ("… handler crashed"), so a
-   * failure has to keep reaching it; swallowing it here would turn a crashed
-   * command into a silent no-op that looks like it worked.
+   * Track admitted ingress until it settles. Untracked refusals must touch
+   * only the transport; handler failures still reach the adapter's boundary.
    */
   private async runInbound(
     label: string,
@@ -3167,17 +3148,14 @@ export class Orchestrator {
   ): Promise<void> {
     if (this.admissionClosed) {
       this.logger.info({ ingress: label }, "inbound refused; shutting down");
-      // `.then(() => refuse?.())` rather than `Promise.resolve(refuse?.())`:
-      // the latter calls `refuse` outside the chain, so a SYNCHRONOUS throw
-      // (an already-acknowledged interaction, a dead transport) escapes the
-      // `.catch` and propagates out of a refusal that is meant to be silent.
+      // Defer refusal into the chain so synchronous transport errors are
+      // swallowed along with asynchronous refusal failures.
       await Promise.resolve()
         .then(() => refuse?.())
         .catch(() => {});
       return;
     }
-    // Same reasoning for `run`: a synchronous throw must land inside the
-    // tracked promise, not escape before anything has been registered.
+    // Defer synchronous throws into the tracked promise.
     const running = Promise.resolve().then(run).then(() => this.identityEffects.flush());
     const tracked = running
       .catch((err) => {

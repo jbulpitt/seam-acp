@@ -2622,20 +2622,12 @@ export class Orchestrator {
   }
 
   /**
-   * Run `task` on a channel's turn queue — the same FIFO `handleIncomingMessage`
-   * uses — so a programmatic turn can never run concurrently with a user turn on
-   * that thread. This is what makes `injectTurn(session: "live")` safe: it calls
-   * `runtime.onEvent()`, which *replaces* the handler an in-flight turn
-   * installed, so overlapping the two would silently steal the user's stream.
+   * Serialize channel turns: runtime.onEvent replaces a single handler, so
+   * concurrent user and programmatic turns would steal each other's stream.
+   * Programmatic work waits; user interruptions retain priority.
    *
-   * Unlike a user message this never pre-empts what is already running: no
-   * `channelGenerations` bump, no `abortTurn`. It just waits its place in line.
-   * (The converse still holds — a user message arriving mid-dispatch aborts the
-   * dispatch, because the user is the priority interrupt.)
-   *
-   * New programmatic work checks `intakeStopped` at its caller or watcher.
-   * Discord ingress checks `admissionClosed` before it can touch the store;
-   * admitted handlers are tracked separately until they settle.
+   * Callers/watchers stop programmatic intake during shutdown; Discord ingress
+   * closes admission before store access and tracks admitted handlers.
    */
   private queueOnChannel<T>(
     channelId: string,
@@ -2671,8 +2663,6 @@ export class Orchestrator {
       meta.runtimeIdleSinceMs = undefined;
       // Tracked by the bounded shutdown barrier.
       const endTurn = this.beginTurn();
-      // #570: from here the turn is executing. Released in the finally below,
-      // on every path including the watchdog and a fence thrown after the turn.
       meta.executing = (meta.executing ?? 0) + 1;
       let work!: Promise<T>;
       try {
@@ -2738,9 +2728,8 @@ export class Orchestrator {
         if (inboundMessageId) meta.inboundMessageIds?.delete(inboundMessageId);
       }
     });
-    // The link stored in channelQueues must never reject: the next task chains
-    // off it, and a rejected link would both skip that task and surface as an
-    // unhandled rejection. The real outcome still goes to our caller.
+    // Keep the stored link nonrejecting so later tasks run without unhandled
+    // rejections; return this task's actual outcome to the caller.
     const link: Promise<void> = Promise.race([
       result.then(
         () => undefined,

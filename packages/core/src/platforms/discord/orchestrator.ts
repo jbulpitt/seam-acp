@@ -3403,15 +3403,13 @@ export class Orchestrator {
       if (a?.state === "suspended" && a.stalledUtc && !isAwaitingReauth(a.stalledReason)) {
         await this.notifyParkedTurn(a).catch(noticeErr => this.logger.warn({ err: noticeErr, attempt: a.id }, "parked-turn notice failed"));
       }
-      // Only this still-current invocation can prove its setup failed before
-      // an execution claim (and therefore before any provider prompt). Missing
-      // attempt metadata alone is never a terminal result or boot replay proof.
+      // Only this current invocation can prove setup failed before an execution claim.
+      // Missing attempt metadata alone is neither terminal-result nor replay proof.
       if (!a && !scheduledAttempt && msg.messageId && queueFence && this.queueFenceCurrent(queueFence)) {
         this.store.releaseUnstartedInbound(msg.messageId, queueFence.epoch, new Date().toISOString());
       }
-      // Setup before the streaming finalizer exists can fail too (e.g. initial
-      // Discord panel). Persist that genuine unsubmitted failure; restart and
-      // strict-resume refusal must never become an ordinary terminal result.
+      // Setup can fail before the streaming finalizer; persist genuine unsubmitted
+      // failures while leaving shutdown and strict-resume refusals nonterminal.
       if (a && a.ownerBoot === this.attemptBoot && a.state === "active" && !a.promptStarted &&
         !this.restartCutoff && !(err instanceof DispatchSuspendedError)) {
         this.store.turnAttempts.complete(a, { id: a.id, target: a.spec.target,
@@ -3455,9 +3453,8 @@ export class Orchestrator {
           "a newer attempt generation owns this scheduled occurrence");
       }
     }
-    // #80 v1: detach is a handleMessage gate only. Schedules / wakes / watches
-    // / handoffs / steer synthesize an IncomingMessage and enter HERE, so they
-    // still run in a detached thread. Do not treat detach as a full mute.
+    // Detach gates handleMessage; synthetic schedules, wakes, watches and
+    // dispatches still enter here and run in detached threads.
     const channel = msg.channel;
     const record = await this.bindThreadRecord(channel, msg.cwd ?? this.config.REPOS_ROOT);
     const admission = msg.messageId ? this.store.getInbound(msg.messageId) : null;
@@ -3489,19 +3486,11 @@ export class Orchestrator {
       }
       const d = this.router.describeConfig(record);
       const p = this.router.getProfile(d.agent.value, d.location.value);
-      // #302: no vendor allowlist here. Whether this adapter can reattach is a
-      // capability the provider answers — the runtime reads `loadSession` from
-      // the ACP handshake and the reattach itself fails if the session is gone.
-      // `agent !== "codex"` refused Claude, which advertises loadSession and
-      // resumes with `--resume=<uuid>` on its bound host. The old
-      // `!acpSessionId` check was unreachable
-      // because startPrompt's UPDATE requires `acp_session_id IS NOT NULL` and
-      // throws otherwise. The suspended attempt still carries promptStarted, so
-      // the resume below reattaches instead of replaying.
+      // ACP loadSession advertises adapter reattachment support; the provider checks
+      // session existence. Submitted attempts reattach rather than replay the prompt.
       const { lastContextUsage: _usage, ...identityConfig } = this.store.readConfig(record);
-      // #302: `source` is already compared as its own column in claim(), and
-      // providerScope/runtime drift with credentials rather than with where the
-      // work belongs.
+      // claim compares source separately; credential-driven providerScope/runtime
+      // changes do not change where the work belongs.
       const identity = executionIdentity({ agent: d.agent.value,
         location: d.location.value, model: d.model.value, effort: d.effort.value,
         cwd: d.cwd.value, config: identityConfig });
@@ -3519,10 +3508,8 @@ export class Orchestrator {
         createdUtc: admission.createdUtc,
         }, identity, this.attemptBoot, "inbound", operatorResume);
       }
-      // Never restage old attachments, re-transcribe voice or rebuild the
-      // original brief while resuming a submitted human turn. The model gets
-      // the situation appended to "continue" (#451), from the attempt as it
-      // was recorded — claim() clears the stall reason after this snapshot.
+      // Resume from saved data without redoing attachments, transcription or the brief.
+      // The pre-claim snapshot preserves the stall reason for the continuation.
       if (humanResume && priorHuman) {
         const staged = this.stagedRecovery.get(channel.id);
         this.stagedRecovery.delete(channel.id);
@@ -3536,15 +3523,7 @@ export class Orchestrator {
       }
     }
     const humanCurrent = () => !humanAttempt || (!this.restartCutoff && this.store.turnAttempts.isCurrent(humanAttempt));
-    /**
-     * `humanCurrent` as a REASON rather than a boolean (#333).
-     *
-     * The predicate is false for two unrelated events — this process is going
-     * down, or a newer generation took the turn — and collapsing them into one
-     * silent throw is what made an ordinary restart look like it stranded
-     * work. Neither is operator-actionable, but they are not the same event
-     * and the log has to be able to tell them apart.
-     */
+    /** Preserve distinct shutdown and supersession reasons when humanCurrent is false. */
     const humanRefusal = (): DispatchSuspendedError | null => {
       if (!humanAttempt) return null;
       if (this.restartCutoff) {

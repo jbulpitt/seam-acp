@@ -3237,10 +3237,8 @@ export class Orchestrator {
   }
 
   /**
-   * Run Discord messages newer than the last one this controller took (#653):
-   * those refused while shutting down and those sent while no process held the
-   * gateway, after a clean restart or a crash. Called once, after the adapter
-   * is up.
+   * Catch up after the adapter is ready, starting after the newest durable
+   * inbound message to cover shutdown refusals and gateway downtime.
    */
   async catchUpAfterRestart(): Promise<void> {
     if (!this.adapter.catchUpMessagesAfter) return;
@@ -3252,34 +3250,16 @@ export class Orchestrator {
   }
 
   /**
-   * True once SHUTDOWN has closed gateway admission — the single bound every
-   * Discord ingress checks at handler ENTRY.
-   *
-   * Entry is the only safe place. `adapter.stop()` stops future events but does
-   * not cancel a handler already admitted before it, and none of that work sits
-   * in a drain set — so a handler that got past the door can resume after
-   * `store.close()`. Checking here, before any await, is what makes that
-   * impossible.
-   *
-   * Applied uniformly, INCLUDING read-only commands: classifying which ones are
-   * "safe" would be a per-command judgement that rots the moment a command
-   * grows a store read. That uniformity is affordable precisely BECAUSE this is
-   * scoped to the seconds after SIGTERM — see `closeAdmission()`.
+   * Check every ingress, including read-only commands, before awaits or store
+   * access so no new handler enters while shutdown closes the store.
    */
   get admissionClosed(): boolean {
     return this.gatewayClosed;
   }
 
   /**
-   * Bounded pre-close barrier (#174).
-   *
-   * Resolves when every claimed dispatch, active channel turn, and tracked
-   * post-turn continuation has settled — while the adapter and store are still
-   * usable, so their DB-first completion work (ledger status, report-back
-   * claim, chain advance) actually lands.
-   *
-   * Always bounded by the shutdown budget. On timeout this returns
-   * `timedOut: true` and boot-time reconciliation repairs unfinished work.
+   * Drain while adapter/store completions can persist; report the bounded
+   * outcome and leave unfinished work for boot-time reconciliation.
    */
   async quiesce(opts: { timeoutMs?: number; clock?: DeadlineClock } = {}): Promise<QuiesceOutcome> {
     return this.runBoundedDrain(
@@ -3301,38 +3281,14 @@ export class Orchestrator {
   }
 
   /**
-   * The single definition of "no work is outstanding", shared by both shutdown
-   * phases so they can never drift apart.
-   *
-   * Five kinds of outstanding work, and they are not nested:
-   *   - claimed dispatches — the watcher's per-target queues; their report-back
-   *     and chain advance are awaited inside the queue task, so this covers
-   *     those side effects too;
-   *   - channel FIFOs — user turns and `session: "live"` dispatches;
-   *   - registered turns (`beginTurn`) — the ONLY thing that sees an ISOLATED
-   *     turn: an isolated dispatch, an isolated scheduled fire, or an ingest
-   *     job has no channel queue and no continuation. `runScheduledPrompt`
-   *     is the sharpest case — after `scheduledManager.stop()` an already
-   *     running fire is referenced by nothing else, and its `finally` still has
-   *     a schedule-status patch to write;
-   *   - tracked post-turn continuations — the fire-and-forget work that runs
-   *     after a turn is released and is therefore invisible to the turn set;
-   *   - tracked CARD jobs (#179) — a premium compaction, Rebuild, Compact from
-   *     Thread, AI summary, migration or import launched from an interactive card. These outlive
-   *     their click handler by minutes and belong to none of the sets above.
-   *
-   * Runs to a real fixpoint over all four: settling one can create another (a
-   * finishing dispatch enqueues a report-back; a queue release fires a parked
-   * prompt). No internal cap — a cap would let this report "drained" with work
-   * still running, which is the failure it exists to prevent. Termination comes
-   * from outside: intake is closed, and `runBoundedDrain` races a deadline.
+   * Both shutdown phases await dispatches, channel queues, registered turns,
+   * admitted ingress, post-turn continuations and card jobs.
+   * Completions can create work, so settle to a fixpoint within the caller's
+   * deadline after intake closes.
    */
   private async settleAllWork(onStageError: (err: unknown) => void): Promise<void> {
     for (;;) {
-      // Per-stage capture, so one throwing stage cannot skip the others. A
-      // single try around all four looked like it handled failure but did not:
-      // a stage-1 throw jumped past the queue, turn and continuation waits
-      // entirely, and if it threw on every pass they never ran at all.
+      // Catch each stage separately so a failure cannot skip the remaining waits.
       let stageFailed = false;
       const stage = async (run: () => Promise<unknown>): Promise<void> => {
         try {
@@ -3347,30 +3303,17 @@ export class Orchestrator {
       await stage(() => Promise.allSettled([...this.activeTurnSettles]));
       await stage(() => Promise.allSettled([...this.inboundWork]));
       await stage(() => this.settleTrackedContinuations());
-      // #179: card jobs are the fifth kind of outstanding work, and the only
-      // one that is neither a turn nor a continuation: a premium compaction
-      // launched from `/seam info sessions` runs for MINUTES after the click
-      // handler that started it returned. It sits in no channel queue, is no
-      // registered turn, and registers no post-turn continuation — so before
-      // this stage existed, shutdown could report a perfectly clean drain while
-      // one was mid-pipeline, and then close the store underneath its
-      // compare-and-swap. Exactly the #174 failure, on a surface #174 predates.
+      // Card jobs outlive their click handlers and are neither turns nor continuations.
       await stage(() => this.settleCardJobs());
 
-      // Every stage got its chance; now stop. Looping on a failing stage would
-      // spin the CPU until the deadline for no benefit — a stage that threw
-      // cannot prove quiescence, so the phase reports `barrierFailed` and
-      // shutdown proceeds bounded, exactly as it does on a timeout. Honest
-      // even when the other stages drained fine: we still cannot say "drained".
+      // Stop after all stages run: a failed stage cannot prove quiescence,
+      // and retrying it here would spin until the deadline. Report barrierFailed.
       if (stageFailed) return;
       // Yield once so work those settlements just registered is visible before
       // we decide we are finished.
       await new Promise((resolve) => setImmediate(resolve));
-      // Deliberately NOT `channelQueues.size === 0`: an emptied queue is
-      // deleted by a continuation, so requiring it here would make map
-      // bookkeeping a termination condition. The queue PROMISES are awaited
-      // above, and a queue that admits a late turn re-arms this loop through
-      // that turn's registration.
+      // Queue promises settle above; map deletion is continuation bookkeeping.
+      // Late turns re-arm the loop through registration, not map size.
       if (
         this.activeTurnSettles.size === 0 &&
         this.pendingContinuations.size === 0 &&
@@ -3384,10 +3327,8 @@ export class Orchestrator {
   }
 
   /**
-   * Await tracked continuations to a fixpoint: a settling continuation may
-   * register another (a queue release firing a parked prompt), so one pass
-   * over the set is not enough. Bounded by the caller's deadline, never
-   * internally — an internal cap would report "drained" while work runs.
+   * Settling a continuation can register more; await the fixpoint.
+   * The caller's deadline bounds the wait without an internal cap.
    */
   private async settleTrackedContinuations(): Promise<void> {
     while (this.pendingContinuations.size > 0) {
@@ -3397,11 +3338,8 @@ export class Orchestrator {
   }
 
   /**
-   * Race `barrier` against a bounded deadline and report which won.
-   *
-   * The timeout is the ONLY thing that terminates a drain — the barriers
-   * themselves run to a true fixpoint on purpose, so they can never claim to
-   * be finished while work is outstanding. Callers must always pass a bound.
+   * Bound the fixpoint barrier with a deadline; distinguish completed work,
+   * stage failures and timeouts in the outcome.
    */
   private async runBoundedDrain(
     phase: "pre-dispose" | "post-dispose",
@@ -3409,9 +3347,8 @@ export class Orchestrator {
     barrier: (onStageError: (err: unknown) => void) => Promise<void>,
     clock?: DeadlineClock,
   ): Promise<QuiesceOutcome> {
-    // Both drains are shutdown-only, so this closes the gateway too — a
-    // handler admitted after the snapshot is work the barrier is not waiting
-    // for and the store is about to close underneath.
+    // Close admission before the drain snapshots work, so no new handler can
+    // enter while the store is closing.
     this.closeAdmission();
     let barrierFailed = false;
 
@@ -3420,9 +3357,8 @@ export class Orchestrator {
       barrierFailed = true;
       this.logger.warn({ err, phase }, "quiesce barrier stage failed");
     };
-    // The barrier itself throwing (rather than one of its stages) is the same
-    // story: do not let it escape as an unhandled rejection during shutdown,
-    // and do not let the swallow turn into a report of a clean drain.
+    // Record barrier-level rejection as failure too; swallowing it alone
+    // would report a clean drain.
     const running = barrier(noteFailure).catch(noteFailure);
 
     const deadline = await raceDeadline(running, timeoutMs, clock);

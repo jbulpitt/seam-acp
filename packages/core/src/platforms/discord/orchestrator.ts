@@ -3609,9 +3609,7 @@ export class Orchestrator {
       ? TurnStatus.restore(humanAttempt.statusCardState.status) : new TurnStatus({
       model: described.model.value,
       repoDisplay,
-      // #236: the selected model's catalog provenance travels with the turn
-      // status, so the surface an operator actually watches can show WHY the
-      // row says what it says. Cache-only and already screened.
+      // Carry catalog provenance onto the status card the operator watches.
       ...(described.catalog?.model?.description
         ? { modelDescription: described.catalog.model.description }
         : {}),
@@ -3774,9 +3772,7 @@ export class Orchestrator {
         humanAttempt
       );
       if (!projection) return;
-      // Closing this controller does not grant execution ownership. It only
-      // permits one final edit of the immutable message ref captured above;
-      // replacement turns own different refs and remain unreachable here.
+      // Final settlement grants no execution ownership; it edits only this captured card.
       statusCardSettled = true;
       if (pendingRefresh) {
         clearTimeout(pendingRefresh);

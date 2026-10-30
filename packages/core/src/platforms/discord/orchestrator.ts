@@ -3564,10 +3564,8 @@ export class Orchestrator {
     let voiceConsoleSpeech: VoiceConsoleVisibleTurnHandle | null = null;
     let voiceConsoleEventOrdinal = 0;
 
-    // #76: live-turn marker — written at START, removed at terminal state
-    // (this finally, or the command layer). Markers are written even when
-    // SEAM_TURN_RESUME_ENABLED is off (inventory + truthful ledger). Dispose
-    // / onDead / SIGTERM must NOT clear them.
+    // Markers keep the inventory and ledger truthful even when resume is disabled.
+    // Only terminal owners clear them; detach/dispose/onDead/SIGTERM leave them.
     const reuseMarker = this.pendingLiveResume.get(channel.id);
     this.pendingLiveResume.delete(channel.id);
     const liveMarkerId = humanAttempt?.id ?? reuseMarker?.id ?? `live-${randomUUID()}`;
@@ -3592,10 +3590,8 @@ export class Orchestrator {
     voiceConsoleSpeech = this.voiceConsole?.beginVisibleTurn(channel.id, liveMarkerId) ?? null;
     if (voiceConsoleSpeech) this.voiceConsoleSpeechByChannel.set(channel.id, voiceConsoleSpeech);
 
-    // `turnFinalized`: the main turn has fully finalized, so any *further*
-    // generative activity is output that actually resumed (not the trailing
-    // in-turn backlog the idle() drain handles) and flips the card back to
-    // Working. A finished turn says Done. Display-only.
+    // Resumed generative output after finalization returns the card to Working;
+    // trailing in-turn backlog belongs to the idle() drain.
     const BG_SETTLE_MS = 10_000;
     let turnFinalized = false;
     // Each callback owns its captured card, including after the next turn starts.

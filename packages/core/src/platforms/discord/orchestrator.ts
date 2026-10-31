@@ -3885,12 +3885,7 @@ export class Orchestrator {
         if (!force) return;
       }
     };
-    // Serialize every drain. maybeFlush(), the idle timer, fence boundaries,
-    // and end-of-turn all trigger drains; without this they could run
-    // concurrently, each reassigning `textBuffer` and issuing an independent
-    // sendMessage whose delivery order isn't guaranteed — reordering output.
-    // Enqueueing is synchronous, so drains (and their sends) run strictly in
-    // call order.
+    // Serialize drains and their sends in call order; each drain mutates textBuffer.
     const flushQueue = new SerialQueue();
     const drainBuffer = (
       force: boolean,
@@ -3898,21 +3893,11 @@ export class Orchestrator {
       terminalProof = false
     ): Promise<void> => flushQueue.run(() => drainBufferInner(force, allowUnsafeCut, terminalProof));
     const flushChunks = async (terminalProof = false) => {
-      // End-of-turn: must drain everything. An open link will never be
-      // closed, so allow unsafe cuts here.
+      // Final flush may cut an open link; no later chunks can close it.
       await drainBuffer(true, true, terminalProof);
     };
-    /**
-     * Idle-flush timer: if text has been buffered for IDLE_FLUSH_MS
-     * with no new chunks arriving, force-flush whatever's there. This
-     * keeps UX responsive when the agent emits a slow trickle that
-     * never crosses HARD_MAX or hits a clean paragraph boundary
-     * (e.g. a short poem).
-     */
+    // Flush idle prose even below the normal size and paragraph thresholds.
     const IDLE_FLUSH_MS = 4000;
-    // Hard ceiling: even inside an open fence, force-flush if the buffer
-    // grows past this. Defends against runaway model loops (e.g. Copilot
-    // spamming the language tag) without losing legitimate long fences.
     const FENCE_BUFFER_CEILING = 16000;
     let idleTimer: NodeJS.Timeout | undefined;
     const cancelFlushTimer = () => {
@@ -3926,9 +3911,7 @@ export class Orchestrator {
       if (!textBuffer) return;
       idleTimer = setTimeout(() => {
         idleTimer = undefined;
-        // Idle for IDLE_FLUSH_MS — any open markdown link is probably
-        // never going to close. Allow unsafe cuts so we don't strand
-        // the buffer waiting for a `)` that won't come.
+        // Idle flushes may cut open links so buffered prose can be delivered.
         if (textBuffer) void drainBuffer(true, true);
       }, IDLE_FLUSH_MS);
     };

@@ -3893,7 +3893,7 @@ export class Orchestrator {
       terminalProof = false
     ): Promise<void> => flushQueue.run(() => drainBufferInner(force, allowUnsafeCut, terminalProof));
     const flushChunks = async (terminalProof = false) => {
-      // Final flush may cut an open link; no later chunks can close it.
+      // Drain all buffered prose, allowing cuts through open links.
       await drainBuffer(true, true, terminalProof);
     };
     // Flush idle prose even below the normal size and paragraph thresholds.

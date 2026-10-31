@@ -222,22 +222,22 @@ describe("ScheduledPromptManager.runNow", () => {
 describe("ScheduledPromptManager catch-up", () => {
   it.each(['cron', 'catch-up'] as const)("does not consume a %s slot if durable admission itself fails", async trigger => {
     const due = '2026-09-09T00:01:00.000Z';
-    const row = makeRow({ nextRunUtc: due });
+    vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout"] });
+    vi.setSystemTime(Date.parse(due) + (trigger === 'cron' ? -1 : 1000));
+    const row = makeRow({ nextRunUtc: due, timezone: "UTC" });
     const { store } = makeStore(row);
     const onFire = vi.fn(async () => {});
     vi.spyOn(store.scheduledOccurrences, 'reserve').mockImplementation(() => { throw new Error('synthetic admission write failure'); });
     const manager = new ScheduledPromptManager({ store, onFire, resolveExecution: syntheticScheduleExecution, logger: silentLogger });
     try {
-      if (trigger === 'cron') {
-        (manager as any).nextDue.set(row.id, due);
-        (manager as any).onCronTick(row.id);
-      } else manager.start();
+      manager.start();
+      if (trigger === 'cron') await vi.advanceTimersByTimeAsync(1);
       await manager.drain();
       expect(onFire).not.toHaveBeenCalled();
       expect(row.nextRunUtc).toBe(due);
       expect(row.lastStatus).toBe('error: scheduled occurrence admission failed');
       expect(store.scheduledOccurrences.pending()).toEqual([]);
-    } finally { manager.stop(); }
+    } finally { manager.stop(); vi.useRealTimers(); }
   });
 
   it("fires once on start when nextRunUtc is in the past, even far outside catchupSeconds", async () => {

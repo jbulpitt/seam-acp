@@ -29,7 +29,7 @@ export interface ScheduledPromptManagerOpts {
 
 export class ScheduledPromptManager {
   private readonly jobs = new Map<string, Cron>();
-  /** Armed slot identity, independent of manual-fire completion timestamps. */
+  /** Admission intent; a failed reservation can outlive its clock wake. */
   private readonly nextDue = new Map<string, string>();
   /** Duplicate callbacks for one occurrence; SQL owns per-schedule overlap. */
   private readonly inFlight = new Set<string>();
@@ -85,7 +85,7 @@ export class ScheduledPromptManager {
 
   /** (Re)arm a single schedule from its current row. No-op (disarms) if disabled
    *  or quarantined by a legacy attachment manifest (#158). */
-  armFromRow(row: ScheduledPrompt): void {
+  armFromRow(row: ScheduledPrompt, after = new Date(), retainedDue?: string): void {
     if (this.stopped) return;
     this.disarm(row.id);
     if (!row.enabled) return;
@@ -98,18 +98,26 @@ export class ScheduledPromptManager {
       this.patchRow(row.id, { lastStatus: legacyAttachmentStatus(row), nextRunUtc: null });
       return;
     }
-    let job: Cron;
+    if (retainedDue) this.nextDue.set(row.id, retainedDue);
+    let job: Cron | undefined;
+    let calendar: Cron | undefined;
     try {
-      job = new Cron(row.cron, { timezone: row.timezone, name: row.id }, () => {
-        this.onCronTick(row.id);
-      });
+      calendar = new Cron(row.cron, { timezone: row.timezone });
+      const target = calendar.nextRun(after);
+      if (target) {
+        job = new Cron(target, { name: row.id, allowPast: true }, fired => {
+          this.onCronTick(row.id, fired);
+        });
+      }
     } catch (err) {
       this.logger.error({ id: row.id, cron: row.cron, err }, "invalid cron; not armed");
       this.patchRow(row.id, { lastStatus: `error: invalid cron (${(err as Error).message})` });
       return;
+    } finally {
+      calendar?.stop();
     }
-    this.jobs.set(row.id, job);
-    const due = job.nextRun()?.toISOString() ?? null;
+    if (job) this.jobs.set(row.id, job);
+    const due = retainedDue ?? (job ? job.getOnce()!.toISOString() : null);
     if (due) this.nextDue.set(row.id, due);
     this.patchRow(row.id, { nextRunUtc: due });
   }
@@ -143,20 +151,22 @@ export class ScheduledPromptManager {
   }
 
   /** Cron entry: a tick queued before stop is a no-op once admission is closed. */
-  private onCronTick(id: string): void {
-    if (this.stopped) return;
+  private onCronTick(id: string, fired: Cron): void {
+    if (this.stopped || this.jobs.get(id) !== fired) return;
     const due = this.nextDue.get(id);
     if (!due) return; // no stable scheduled-for identity: do not guess Date.now
     let admittedOrSkipped = false;
     void this.fire(id, scheduledOccurrenceKey(id, due), () => { admittedOrSkipped = true; });
-    // Advance only after durable intent (or intentional overlap/quarantine
-    // skip), never because a fallible onFire callback was merely invoked.
-    if (!admittedOrSkipped) return;
-    const job = this.jobs.get(id);
-    if (job) {
-      const next = job.nextRun()?.toISOString() ?? null;
-      if (next) this.nextDue.set(id, next); else this.nextDue.delete(id);
-      this.patchRow(id, { nextRunUtc: next });
+    if (this.jobs.get(id) !== fired) return;
+    const after = new Date(Math.max(Date.now(), fired.getOnce()!.getTime()));
+    fired.stop();
+    this.jobs.delete(id);
+    const row = this.store.getScheduled(id);
+    if (row) {
+      // Keep ordinary wakes; a failed reservation retains its old admission due.
+      this.armFromRow(row, after, admittedOrSkipped ? undefined : due);
+    } else {
+      this.disarm(id);
     }
   }
 
@@ -249,7 +259,7 @@ export class ScheduledPromptManager {
     } finally {
       this.inFlight.delete(occurrence.id);
       const job = this.jobs.get(id);
-      if (job) this.patchRow(id, { nextRunUtc: this.nextDue.get(id) ?? job.nextRun()?.toISOString() ?? null });
+      if (job) this.patchRow(id, { nextRunUtc: this.nextDue.get(id) ?? job.getOnce()?.toISOString() ?? null });
     }
   }
 

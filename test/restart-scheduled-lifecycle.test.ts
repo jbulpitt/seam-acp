@@ -292,8 +292,14 @@ describe("#252 actual isolated scheduler + injectTurn, synthetic transport", () 
         resolveExecution: row => orch.scheduleExecution(row), onFire });
       try {
         if (trigger === 'manual') await manager.runNow(h.row.id);
-        else { manager.start(); (manager as any).onCronTick(h.row.id); await manager.drain(); }
-      } finally { manager.stop(); }
+        else {
+          vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout"] });
+          vi.setSystemTime(new Date("2026-10-31T08:39:59.999Z"));
+          manager.start();
+          await vi.advanceTimersByTimeAsync(1);
+          await manager.drain();
+        }
+      } finally { manager.stop(); if (trigger === 'cron') vi.useRealTimers(); }
       const pending = h.store.scheduledOccurrences.pending();
       expect(pending).toHaveLength(1);
       const occurrence = pending[0]!;

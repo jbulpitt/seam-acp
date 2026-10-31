@@ -36,6 +36,11 @@ deployment contract.
 
 ## Lifecycle
 
+The controller retries every exit after five seconds without a start-rate limit,
+including permanent configuration or startup errors. These unit settings apply
+when the rendered unit is installed; `npm run redeploy` does not install unit
+files.
+
 Enable the session supervisor and local bridge before the controller. Apply
 Seam code changes with `npm run redeploy`; do not directly restart
 the controller from an active agent turn. The command builds, runs the bounded

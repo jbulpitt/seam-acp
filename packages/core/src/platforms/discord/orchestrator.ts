@@ -3791,11 +3791,8 @@ export class Orchestrator {
     }, STATUS_HEARTBEAT_MS);
     heartbeat.unref?.();
 
-    // Typing indicator: refresh on real agent activity (text, tool calls,
-    // thoughts) rather than a dumb timer. Discord's typing indicator
-    // expires after ~10s, so we re-arm it every 8s while the agent is
-    // working. Stops once we start posting actual messages — keeping it
-    // alive past that point looks wrong.
+    // Discord typing expires after ~10s; refresh every 8s on real agent activity
+    // until we start posting messages.
     const TYPING_INTERVAL_MS = 8_000;
     let lastTypingSentAt = 0;
     let typingDone = false;
@@ -3820,26 +3817,18 @@ export class Orchestrator {
     let totalAgentChars = 0;
     // Latest usage/window decides end-of-turn compaction; metadata may correct size.
     let agyAutoCompactNeeded = false;
-    // Streaming fence extractor: pulls every ```lang ... ``` block out
-    // of the agent's text and emits ordered segments. Fence-close
-    // segments are routed to inline-or-attachment rendering based on
-    // size; bare-filename fences resolve to a host-file upload.
+    // Preserve fence/prose ordering; render fences by size and resolve bare
+    // filename fences as host-file uploads.
     const fenceStream = new FenceStream();
     let fenceCounter = 0;
-    // Watchdog: if a fence stays open longer than this with no closer,
-    // we emit whatever's accumulated and treat the fence as closed so
-    // subsequent bytes flow as prose. Checked on each chunk.
+    // On each chunk, flush and close fences open past 60s so later bytes flow as prose.
     const FENCE_MAX_OPEN_MS = 60_000;
     let fenceWatchdogTripped = false;
-    // Per-turn timing for diagnosing slow turns. Set when we send the
-    // prompt; first-chunk + total recorded as info logs.
+    // Log prompt-to-first-chunk and total turn latency at info level.
     let turnStartedAt = 0;
     let firstChunkAt: number | undefined;
-    // Streaming policy: only flush mid-turn when we have a *substantial*
-    // amount of buffered text AND a clean paragraph boundary exists.
-    // Otherwise wait for end-of-turn — Discord rate-limits us hard if we
-    // send one tiny message per paragraph (e.g. each verse of "99 bottles"
-    // would be its own message).
+    // Soft-flush substantial text at paragraph boundaries to avoid Discord rate
+    // limits from tiny messages; otherwise defer until a forced flush.
     const HARD_MAX = 1800;
     const SOFT_MIN = 800;
     let humanStreamIndex = humanAttempt?.deliveryPayload?.kind === "messages"

@@ -2,8 +2,7 @@
 Description=Seam ACP Discord bot
 Wants=network-online.target seam-local-bridge.service
 After=network-online.target seam-local-bridge.service
-StartLimitIntervalSec=300
-StartLimitBurst=6
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple

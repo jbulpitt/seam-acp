@@ -3927,22 +3927,14 @@ export class Orchestrator {
     const RETRY_REGEX = /response was interrupted.*retrying/i;
     let currentMessageId: string | undefined;
     let postedRetryNotice = false;
-    // Runaway-loop detector: some agent models get stuck repeating the
-    // same chunk — Copilot spams short language tags (e.g. "markdown"),
-    // Gemini sometimes loops a full sentence. Cancel the turn once the
-    // exact same trimmed chunk repeats. Threshold is lower for long
-    // chunks (a repeated full sentence is much more obviously broken
-    // than a repeated short token).
+    // Repeated long chunks are a stronger loop signal than short tokens.
     const LOOP_THRESHOLD_SHORT = 12; // for chunks <= 40 chars
     const LOOP_THRESHOLD_LONG = 4; // for longer chunks
     const LOOP_SHORT_MAX = 40;
     let loopChunk: string | null = null;
     let loopCount = 0;
     let loopAborted = false;
-    // Whitespace runaway: when the model gets stuck emitting nothing but
-    // newlines/spaces, no trimmed chunk ever lands so the repeat-detector
-    // can't fire. Count whitespace-only chunks separately and bail out
-    // after enough of them in a row.
+    // Blank chunks bypass the trimmed-text repeat counter; track them separately.
     const WHITESPACE_RUN_THRESHOLD = 30;
     let whitespaceRun = 0;
     const noteRetry = async () => {

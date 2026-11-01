@@ -3959,24 +3959,17 @@ export class Orchestrator {
       );
     };
 
-    // A 400 error from the agent means the current prompt was rejected (e.g.
-    // invalid image). The session itself may still be valid, but we invalidate
-    // anyway so the next message doesn't replay the same bad content.
+    // Non-human rejections clear the ACP ID to avoid replaying bad content,
+    // unless a content-repair path keeps it.
     const isAgentRejectionError = (e: unknown): boolean => {
       return (e as any)?.code === 400;
     };
 
-    // The Anthropic vision API caps per-image dimensions at 2000px once a request
-    // carries many images (~20+). A run of high-res testing screenshots trips
-    // this, and then EVERY follow-up turn that re-sends the history fails the same
-    // way. Recognize it so we can auto-strip images (repairSession) and recover.
+    // Dimension errors can use repairSession when the session manager supports it.
     const isImageDimensionError = (msg: string): boolean =>
       /dimension limit for many-image|exceeds the dimension limit/i.test(msg);
 
-    // ACP connection dropped mid-turn — typically the remote bridge restarted or
-    // the underlying WS dropped after the agent had already finished its response.
-    // Different from session-gone: the session files are still intact, so we can
-    // invalidate (keeping the session ID) and replay the prompt on reconnect.
+    // Non-human reconnect retries keep the ACP ID so the saved session can resume.
     const isConnectionClosedError = (e: unknown): boolean => {
       const msg = e instanceof Error ? e.message : String(e);
       return msg.includes("ACP connection closed");

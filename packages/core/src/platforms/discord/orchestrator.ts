@@ -4100,16 +4100,10 @@ export class Orchestrator {
           }
           case "agent-text": {
             refreshTyping();
-            // Detect Copilot CLI retry: either the agent emits a "Retrying"
-            // sentinel, or the messageId rolls over mid-turn.
+            // Recognize retry sentinels from any agent for the notice below.
             const isRetrySentinel = RETRY_REGEX.test(event.text);
-            // A messageId rollover means "a new message started" (ACP schema
-            // v1.16.0). For Copilot CLI that's how an in-band retry surfaces —
-            // but for other agents (Claude on claude-agent-acp ≥0.54, which now
-            // stamps a distinct messageId per message) it's just a normal
-            // multi-message turn (e.g. text → tool call → text). Only treat it
-            // as a retry for Copilot, else every post-tool continuation posts a
-            // spurious "retried" notice.
+            // Gate message-ID rollover to Copilot: other agents use distinct IDs for
+            // normal multi-message turns, which must not produce retry notices.
             const isNewMessage =
               described.agent.value.startsWith("copilot") &&
               event.messageId !== undefined &&

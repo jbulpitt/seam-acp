@@ -4383,10 +4383,8 @@ export class Orchestrator {
       extraRules.push(
         ...choiceAuthoringRules({ fence: seamFences && canAuthorChoice, mcp: seamMcp && canAuthorChoice })
       );
-      // Per-turn time facts so the agent reasons about wall-clock/duration in
-      // the user's local zone instead of off UTC timestamps. `updatedUtc` holds
-      // the PREVIOUS turn's end (this turn upserts it later), so it is the gap
-      // since the last turn. Omit the gap on the first/only turn or a bad stamp.
+      // Add local time and a valid gap from the last update to the new preamble.
+      // Resume prompts bypass it; gaps of one second or less are omitted.
       const nowMs = Date.now();
       const lastTurnMs = Date.parse(record.updatedUtc ?? "");
       let promptText = humanResume ? msg.text : withHarnessPreamble(msg.text, extraRules, speaker, {
@@ -4444,12 +4442,8 @@ export class Orchestrator {
         msg.attachments &&
         msg.attachments.length > 0
       ) {
-        // Local agent: text + standard images go inline; everything else
-        // (PDF/Office/HEIC/binary) is staged to a temp path the agent opens with
-        // its file tools. Shared with the scheduled fire runner. Images are only
-        // inlineable when the agent advertises image prompt capability — for a
-        // no-vision ACP bridge (e.g. Grok) they're staged to disk instead so its
-        // own tools can read them, rather than becoming a bytes-less link.
+        // Model vision mode and advertised transport support govern inline images.
+        // Stage non-inline files on the agent host, including images in tool/none modes.
         const selectedModel = described.model.value;
         const visionMode = this.modelCatalog.model(
           { agentId: described.agent.value, location: described.location.value },

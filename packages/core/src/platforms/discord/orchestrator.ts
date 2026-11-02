@@ -4349,40 +4349,23 @@ export class Orchestrator {
       turnStartedAt = Date.now();
       const timeoutMs = this.config.TURN_TIMEOUT_SECONDS * 1000;
 
-      // If the active profile is on a Discord-restricted host (e.g. remote
-      // Mac with strict network policy), don't expose Discord CDN URLs to
-      // the LLM. Instead, download the bytes server-side and stream them to
-      // the agent's filesystem via the bridge's `writeAttachment` cmd. The
-      // model gets a local path in the prompt; attachments are stripped.
-      // Prepend the standing agent conventions (attach-fence, table rendering)
-      // as a provenance-tagged preamble so every backend knows the operating
-      // rules without depending on a per-backend system-prompt path. Channel
-      // and thread riders from CHANNEL_PRESETS_FILE stack on top (additive,
-      // never replacing the base conventions above).
+      // Channel and thread riders add to the standing harness conventions.
       const { riders } = resolveChannelPreset(
         this.config,
         record.parentRef ?? record.channelRef,
         record.channelRef
       );
-      // Speaker identity (#57): stamp the human's name/id into the preamble when
-      // the flag is on and we have an author id. Gated here (single decision
-      // point) rather than in the adapter. Dispatch gets a harness with
-      // seamFences off (#108) and still emits no speaker line (D7).
+      // Supply optional speaker identity to the harness preamble.
       const speaker =
         this.config.SPEAKER_IDENTITY_ENABLED && msg.authorId
           ? { id: msg.authorId, name: msg.authorName ?? "" }
           : undefined;
-      // #71: expose the CURRENT turn's trusted speaker id to the config_propose
-      // lock gate for the duration of this turn (cleared in the finally below).
-      // Only set when we have a harness-stamped id — with speaker identity off
-      // the gate sees nothing and keeps refusing (never fail open).
+      // The config gate uses this optional speaker ID, not author attribution.
       if (speaker) this.currentSpeakerIds.set(record.channelRef, speaker.id);
       if (msg.authorId) this.currentAuthorIds.set(record.channelRef, msg.authorId);
       const secretFiles = await listThreadSecrets(this.config.DATA_DIR, channel.id).catch(() => []);
       const extraRules = [...riders, ...secretHarnessRules(secretFiles)];
-      // Compact, authoritative identity stamp. It makes a runtime immediately
-      // aware of a cross-thread MCP reconfiguration without requiring it to
-      // infer its own backend from stale conversation history.
+      // Give the preamble current identity instead of stale conversation history.
       extraRules.push(
         `Runtime identity for this thread: agent=${described.agent.value}; ` +
           `model=${described.model.value}; effort=${described.effort.value ?? "auto"}. ` +

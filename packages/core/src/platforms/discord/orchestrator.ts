@@ -4185,10 +4185,7 @@ export class Orchestrator {
                 event.text
               );
             }
-            // Run text through the fence extractor and process each
-            // ordered segment. Prose flows into the chat pipeline;
-            // fence-open forces a flush of preceding prose; fence-close
-            // routes to inline-or-attachment rendering based on size.
+            // Keep prose and fence output in segment order.
             const fenceResult = fenceStream.feed(event.text);
             for (const seg of fenceResult.segments) {
               if (seg.kind === "prose") {
@@ -4198,8 +4195,7 @@ export class Orchestrator {
                   armIdleFlush();
                 }
               } else if (seg.kind === "fence-open") {
-                // Commit any pending prose before the fence so message
-                // ordering matches the agent's stream order.
+                // Await the prose drain to preserve stream order.
                 cancelFlushTimer();
                 await drainBuffer(true);
               } else {
@@ -4212,9 +4208,8 @@ export class Orchestrator {
                 typingDone = true;
               }
             }
-            // Watchdog: if a fence has been open too long, snapshot what
-            // we have, emit it with a notice, and treat the fence as
-            // closed so subsequent bytes flow as prose.
+            // On incoming text, force-close overdue fences with a notice so later
+            // chunks flow as prose.
             if (
               !fenceWatchdogTripped &&
               fenceStream.inFence &&

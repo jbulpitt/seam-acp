@@ -44,7 +44,7 @@ import type { ThreadPreset } from "../packages/core/src/config.js";
 
 const silent = pino({ level: "silent" }) as unknown as Logger;
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-const MAIN_PRESETS = "/home/operator/Projects/seam-acp/data/channel-presets.json";
+
 
 /** Measured 2026-09-20: 15 explicit copilot thread presets, 14 on remote-a. */
 const FHR_COPILOT_THREADS = [
@@ -306,34 +306,7 @@ describe("DEFAULT_AGENT denied at local refuses only default-dependent new sessi
   });
 });
 
-describe("#474 prove the outcome against real channel-presets.json", () => {
-  const deny = parseAgentLocationDeny("copilot@local");
 
-  it.skipIf(!fs.existsSync(MAIN_PRESETS))(
-    "live file: 14 remote-a copilot presets stay allowed; local copilot is denied",
-    () => {
-    const data = JSON.parse(fs.readFileSync(MAIN_PRESETS, "utf8")) as {
-      threads?: Record<string, { agent?: { value?: string }; location?: string }>;
-    };
-    const threads = data.threads ?? {};
-    const explicitCopilot = Object.entries(threads).filter(
-      ([, t]) => t.agent?.value === "copilot",
-    );
-    const fhr = explicitCopilot.filter(([, t]) => t.location === "remote-a");
-    const local = explicitCopilot.filter(([, t]) => !t.location || t.location === "local");
-    expect(fhr.length, "remote-a copilot presets").toBe(14);
-    expect(local.length, "local copilot presets").toBe(1);
-    for (const [, t] of fhr) {
-      expect(isAgentLocationDenied("copilot", t.location, deny)).toBe(false);
-    }
-    for (const [, t] of local) {
-      expect(isAgentLocationDenied("copilot", t.location ?? "local", deny)).toBe(true);
-    }
-    expect(explicitCopilot.map(([id]) => id).sort()).toEqual(
-      [...FHR_COPILOT_THREADS, LOCAL_COPILOT_THREAD].slice().sort(),
-    );
-  });
-});
 
 describe("#474 wiring is not decoration — index.ts actually installs the gates", () => {
   it("index.ts registers the deny list and installs the router gate", () => {

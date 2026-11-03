@@ -4477,12 +4477,8 @@ export class Orchestrator {
 
       if (voiceNoteText) promptText = promptText ? `${promptText}\n\n${voiceNoteText}` : voiceNoteText;
 
-      // One transparent retry on transient failures. Both cases fire before any
-      // output is buffered so the retry is invisible to the user.
-      //   session-gone: session files are lost; start a fresh session.
-      //   connection-closed: bridge/agent restarted mid-turn but session files
-      //     are intact; keep the session ID so loadSession() resumes context.
-      //     getOrStartRuntime will wait up to 44s for the bridge to reconnect.
+      // Owned attempts use recorded-session recovery or rethrow.
+      // The fallback resets lost sessions and keeps session IDs on connection loss.
       let result: PromptOutcome | "timeout";
       let submissionEvidence: SubmissionEvidence | undefined;
       try {
@@ -4570,10 +4566,7 @@ export class Orchestrator {
           () => activeRuntime.lastActivityAtMs,
         );
         } else {
-          // #448: AgentRuntime owns the bounded prompt budget, including turns
-          // with output. Refuse only an exhausted operation and report it here;
-          // the thread/session stay usable. Starting another loop would multiply
-          // that budget (#421/#424's failure mode), not improve recovery.
+          // Propagate other errors without multiplying the runtime's recovery budget.
           throw promptErr;
         }
       }

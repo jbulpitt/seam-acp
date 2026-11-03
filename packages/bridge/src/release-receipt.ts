@@ -1,4 +1,5 @@
 import fs from "node:fs/promises";
+import path from "node:path";
 import { fileURLToPath } from "node:url";
 import type { HostAdapterRefusal } from "./inventory.js";
 
@@ -94,7 +95,8 @@ export class ReleaseReceiptWriter {
   private write(): Promise<void> {
     const snapshot = `${JSON.stringify(this.receipt)}\n`;
     this.pending = this.pending.then(async () => {
-      const temporary = `${this.receiptPath}.next-${process.pid}`;
+      const releaseDirectory = path.dirname(this.receiptPath);
+      const temporary = path.join(releaseDirectory, "..", `.${path.basename(releaseDirectory)}.${path.basename(this.receiptPath)}.next-${process.pid}`);
       await fs.writeFile(temporary, snapshot, { flag: "wx", mode: 0o600 });
       await fs.rename(temporary, this.receiptPath);
     });

@@ -4703,11 +4703,8 @@ export class Orchestrator {
         status.setAction(result.stopReason);
       }
 
-      // Surface context-window usage after the turn. Two paths:
-      //   1. Profiles with a side-channel `getUsage` (e.g. remote bridge that
-      //      reads Claude Code's JSONL transcript) — preferred, no extra prompt.
-      //   2. Copilot CLI fallback — probe its `/context` slash command, which
-      //      the CLI handles client-side (no LLM call).
+      // Read available usage on the execution host.
+      // Fall back to /context for Copilot if the side channel emits no usage.
       if (result !== "timeout" && !result.cancelled) {
         const location = described.location.value;
         // Every transcript belongs to its execution host.
@@ -4743,8 +4740,7 @@ export class Orchestrator {
               status.contextUsedHighWater = usage.totalUsed;
               status.contextWindowSize = size;
               status.context = formatContextUsage(usage.totalUsed, size);
-              // Record the resolved model id (e.g. "claude-opus-4-8") so
-              // the status card can display the actual model alongside the alias.
+              // Keep the usage-reported model alongside the selected alias.
               if (usage.model) {
                 status.resolvedModel = usage.model;
               }

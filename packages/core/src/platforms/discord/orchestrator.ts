@@ -4704,7 +4704,7 @@ export class Orchestrator {
       }
 
       // Read available usage on the execution host.
-      // Fall back to /context only for Copilot when no usage is displayed.
+      // Fall back to /context for Copilot if the side channel emits no usage.
       if (result !== "timeout" && !result.cancelled) {
         const location = described.location.value;
         // Every transcript belongs to its execution host.

@@ -4812,9 +4812,7 @@ export class Orchestrator {
       this.logger.error({ err, session: record.id }, "turn failed");
       cancelFlushTimer();
       await flushChunks();
-      // If the agent reports that the session is gone (e.g. bridge restarted
-      // with a fresh agent process), evict the dead runtime so the next message
-      // triggers a clean newSession rather than repeatedly failing.
+      // Evict missing sessions so the next message opens a fresh session.
       const errMsg = err instanceof Error ? err.message : String(err);
       if (isSessionGoneError(err) && !humanAttempt) {
         this.logger.warn({ session: record.id }, "session not found on agent; invalidating runtime");
@@ -4823,9 +4821,7 @@ export class Orchestrator {
       } else if (!humanAttempt && (isAgentRejectionError(err) || errMsg.includes("Prompt is too long") || isImageDimensionError(errMsg))) {
         const isPromptTooLong = errMsg.includes("Prompt is too long");
         const isImageDimension = isImageDimensionError(errMsg);
-        // Both "prompt too long" and the many-image dimension cap are fixed by
-        // stripping images from the on-disk history; keep the ACP session ID so
-        // the repaired (image-stripped) JSONL is re-resumed on retry.
+        // Preserve the ACP session ID so retries resume image-stripped history.
         const needsRepair = isPromptTooLong || isImageDimension;
         this.logger.warn(
           { session: record.id, isPromptTooLong, isImageDimension },

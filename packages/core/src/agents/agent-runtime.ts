@@ -1173,11 +1173,7 @@ export class AgentRuntime {
     // to whatever is in settings.json (typically the default model, not the
     // per-session override the user selected).
     const wantedModel = opts.model ?? this.profile.defaultModel;
-    // Do NOT require `currentModelId` here: some ACP agents' session/new (and
-    // loadSession) returns no `models`, so currentModelId is undefined — gating
-    // on it would skip set_model entirely and leave the agent on its own built-in
-    // default. `wantedModel !== undefined` is true, so we (re)apply; if it
-    // already matches the reported current model we still skip the redundant call.
+    // Forward explicit model choices even when ACP omits the current model.
     if (wantedModel && wantedModel !== this.sessionInfo.currentModelId) {
       const isExplicit = opts.model !== undefined;
       const isAvailable = this.sessionInfo.availableModels.some((m) => m.modelId === wantedModel);
@@ -1198,8 +1194,7 @@ export class AgentRuntime {
       }
     }
 
-    // Re-apply reasoning effort on resume (config options don't persist across
-    // a subprocess restart any more than the model does).
+    // Reapply effort because session settings can be lost on subprocess restart.
     await this.applyConfigOptionEffort(opts.effort);
 
     // Claude resumes observe only; live descriptors can restore the saved flag.

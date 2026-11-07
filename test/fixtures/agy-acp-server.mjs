@@ -26,6 +26,9 @@ for await (const line of readline.createInterface({ input: process.stdin })) {
     result = { protocolVersion: 1, agentInfo: { name: "Fixture AGY", version: "fixture-1" },
       agentCapabilities: { loadSession: true, promptCapabilities: { image: true, embeddedContext: true } } };
   } else if (method === "session/new") {
+    if (process.env.AGY_ACP_TEST_NEW_ERROR) {
+      write({ jsonrpc: "2.0", id, error: JSON.parse(process.env.AGY_ACP_TEST_NEW_ERROR) }); continue;
+    }
     const sessionId = "fixture-" + ++next;
     const session = { model: "fixture-flash", effort: "medium" }; sessions.set(sessionId, session);
     result = { sessionId, configOptions: options(session) };

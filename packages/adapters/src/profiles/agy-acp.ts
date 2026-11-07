@@ -10,8 +10,10 @@ import {
 } from "@agentclientprotocol/sdk";
 import { AGENT_ADAPTER_VERSION, asLocalAdapter, type AgentProfile } from "../agent-profile.js";
 import { agyWait } from "../agy-lifecycle.js";
+import { classifyAndAttach } from "../error-classification.js";
 import { manifestCatalogSource, manifestCatalogScope } from "../model-catalog.js";
 import { runBoundedProbe } from "../probe-process.js";
+import { classifyAgyError } from "./agy.js";
 
 export const AGY_ACP_ARGS = ["acp", "--process-per-session"] as const;
 export const AGY_ACP_BACKEND = "agy-acp-stdio-v1";
@@ -31,7 +33,6 @@ export interface AgyAcpCatalogModel {
 }
 
 export interface AgyAcpCatalog {
-  defaultModel: string;
   models: AgyAcpCatalogModel[];
   cliVersion?: string;
   image: boolean;
@@ -115,7 +116,6 @@ export async function probeAgyAcpCatalog(opts: AgyAcpLaunch & {
         sessionId = undefined;
       }
       return {
-        defaultModel: model.currentValue,
         models,
         cliVersion: init.agentInfo?.version,
         image: init.agentCapabilities?.promptCapabilities?.image === true,
@@ -145,6 +145,9 @@ export function makeAgyAcpProfile(opts: {
     displayName: "Antigravity",
     defaultModel: opts.defaultModel,
     effort: { mechanism: "configOption", configId: "thought_level", levels: [] },
+    classifyError(error: unknown) {
+      return classifyAndAttach(error, classifyAgyError(error));
+    },
     catalog: {
       scope: () => manifestCatalogScope(scope),
       async fetch() {

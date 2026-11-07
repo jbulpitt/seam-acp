@@ -21,6 +21,10 @@ into a default. Canonical model ids and `thought_level` values pass through
 without baking effort into the model id. The existing core applies them on
 new/load; no second persistence or reapplication mechanism is added.
 
+Errors use the existing AGY classifier and retain their ACP code, message and
+data for core and bridge consumers. Established authentication failures reach
+the existing sign-in routing; unknown failures remain unclassified.
+
 The catalog has a separate `agy-acp-stdio-v1` backend scope. Context remains
 unknown when no context metadata is supplied. Per-turn token totals are not
 converted to context occupancy. Image support in the catalog describes the
@@ -104,7 +108,9 @@ not select a fallback, new state store, guard, sandbox or runtime feature flag.
 `test/agy-acp-profile.test.ts` runs a real stdio fixture through the SDK and
 existing core. It covers fresh per-model catalog sessions, variable and absent
 effort selectors, honest client identity, unknown context, load/reapplication,
-exact thought/context events and native model-error propagation. Its usage
+exact thought/context events and fixture ACP error passthrough. Bare fixture
+auth errors also pass through core classification into the existing sign-in
+decision; these tests do not establish new native error semantics. Its usage
 fixture deliberately differs from the prompt token totals.
 
 The live checks used disposable owned conversations and HTTP MCP fixtures;

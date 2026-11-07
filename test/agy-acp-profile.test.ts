@@ -4,28 +4,61 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
 import { normalizeCatalogCandidate } from "../packages/adapters/src/catalog-evidence.js";
+import { readErrorClassification } from "../packages/adapters/src/error-classification.js";
 import { makeAgyAcpProfile, AGY_ACP_ARGS } from "../packages/adapters/src/profiles/agy-acp.js";
 import { AgentRuntime, type AgentEvent } from "../packages/core/src/agents/agent-runtime.js";
+import { negotiateReauth } from "../packages/core/src/core/reauth-negotiation.js";
 import type { Logger } from "../packages/core/src/lib/logger.js";
 
 const fixture = fileURLToPath(new URL("./fixtures/agy-acp-server.mjs", import.meta.url));
 const dirs: string[] = [];
 const logger = { child() { return this; }, debug() {}, info() {}, warn() {}, error() {} } as unknown as Logger;
 afterEach(async () => { for (const dir of dirs.splice(0)) await rm(dir, { recursive: true, force: true }); });
-async function setup() {
+async function setup(newSessionError?: { code: number; message: string; data: Record<string, unknown> }) {
   const dir = await mkdtemp(path.join(os.tmpdir(), "seam-agy-acp-test-")); dirs.push(dir);
   const requests = path.join(dir, "requests.jsonl");
   const profile = makeAgyAcpProfile({
     defaultModel: "fixture-deep", cliPath: process.execPath, acpArgs: [fixture], cwd: dir,
-    environment: { ...process.env, AGY_ACP_TEST_REQUESTS: requests },
+    environment: { ...process.env, AGY_ACP_TEST_REQUESTS: requests,
+      ...(newSessionError ? { AGY_ACP_TEST_NEW_ERROR: JSON.stringify(newSessionError) } : {}) },
   });
   return { dir, requests, profile };
 }
 
 describe("native AGY ACP integration", () => {
-  it("uses the documented HTTP-MCP-capable launch without changing the active AGY factory", () => {
+  it("defaults to process-per-session arguments and a separate catalog backend", () => {
     expect(AGY_ACP_ARGS).toEqual(["acp", "--process-per-session"]);
     expect(makeAgyAcpProfile({ defaultModel: "configured-model" }).catalog.scope().backend).toBe("agy-acp-stdio-v1");
+  });
+
+  it.each([
+    { code: -32000, message: "Authentication required", data: { fixture: "auth" }, kind: "auth_required", action: "park" },
+    { code: -32603, message: "Fixture upstream unavailable", data: { status: 503, fixture: "server" }, kind: "overloaded", action: "inconclusive" },
+    { code: -32603, message: "The Antigravity process serving this session exited unexpectedly", data: { fixture: "worker" }, kind: "unclassified", action: "inconclusive" },
+  ])("routes $kind from a bare ACP error through core without losing its cause", async ({ kind, action, ...wireError }) => {
+    const { profile, dir } = await setup(wireError);
+    const runtime = new AgentRuntime({ profile, logger, spawnFn: () => profile.spawn() });
+    try {
+      await runtime.start();
+      const error = await runtime.newSession({ cwd: dir }).then(
+        () => { throw new Error("Fixture should reject session/new"); },
+        error => error,
+      );
+      expect(error).toMatchObject({ code: wireError.code, message: wireError.message, data: wireError.data });
+      expect(readErrorClassification(error)).toMatchObject({ agentId: "agy", errorKind: kind });
+      expect(negotiateReauth({ ...readErrorClassification(error), message: error.message }).action).toBe(action);
+    } finally { await runtime.dispose(); }
+  });
+
+  it("retains an existing classification and the original error object and cause", () => {
+    const profile = makeAgyAcpProfile({ defaultModel: "fixture-flash" });
+    const cause = new Error("Fixture cause");
+    const error = Object.assign(new Error("Authentication required", { cause }), {
+      data: { agentId: "agy", errorKind: "rate_limit", fixture: "preserved" },
+    });
+    expect(profile.classifyError!(error)).toMatchObject({ agentId: "agy", errorKind: "rate_limit" });
+    expect(error.cause).toBe(cause);
+    expect(error.data).toMatchObject({ agentId: "agy", errorKind: "rate_limit", fixture: "preserved" });
   });
 
   it("discovers model-specific effort over real ACP, retaining unknown context instead of token estimates", async () => {

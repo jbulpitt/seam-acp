@@ -9,6 +9,15 @@ let buffer = "";
 let clientReply;
 let formReplyPending = false;
 let currentModeId = "agent";
+let currentModel = "fixture-flash";
+let currentEffort = "low";
+let loaded = false;
+const configOptions = () => process.env.FAKE_AGENT_CONFIG_OPTIONS ? { configOptions: [
+  { id: "model", name: "Model", type: "select", category: "model", currentValue: currentModel,
+    options: ["fixture-flash", "fixture-deep", "fixture-fixed"].map(value => ({ value, name: value })) },
+  ...(currentModel === "fixture-fixed" ? [] : [{ id: process.env.FAKE_AGENT_CONFIG_OPTIONS, name: "Effort", type: "select",
+    currentValue: currentEffort, options: ["low", "medium", "max"].map(value => ({ value, name: value })) }]),
+] } : {};
 const modes = () => process.env.FAKE_AGENT_REQUIRE_MODE ? { modes: { currentModeId, availableModes: [
   { id: "agent", name: "Auto review" }, { id: "agent-full-access", name: "Full access" },
 ] } } : {};
@@ -42,7 +51,7 @@ process.stdin.on("data", (chunk) => {
       send({ id: message.id, result: { protocolVersion: 1, agentCapabilities: { loadSession: true } } });
     } else if (message.method === "session/new") {
       currentModeId = "agent";
-      const reply = () => send({ id: message.id, result: { sessionId: process.env.FAKE_AGENT_NEW_SESSION_ID ?? "s1", ...modes() } });
+      const reply = () => send({ id: message.id, result: { sessionId: process.env.FAKE_AGENT_NEW_SESSION_ID ?? "s1", ...modes(), ...configOptions() } });
       if (process.env.FAKE_AGENT_NEW_GATE && !fs.existsSync(process.env.FAKE_AGENT_NEW_GATE)) {
         const timer = setInterval(() => {
           if (fs.existsSync(process.env.FAKE_AGENT_NEW_GATE)) { clearInterval(timer); reply(); }
@@ -78,8 +87,11 @@ process.stdin.on("data", (chunk) => {
         continue;
       }
       currentModeId = "agent";
+      loaded = true;
+      currentModel = "fixture-flash";
+      currentEffort = "low";
       update("replayed history");
-      const reply = () => send({ id: message.id, result: modes() });
+      const reply = () => send({ id: message.id, result: { ...modes(), ...configOptions() } });
       if (process.env.FAKE_AGENT_LOAD_GATE && !fs.existsSync(process.env.FAKE_AGENT_LOAD_GATE)) {
         const timer = setInterval(() => {
           if (fs.existsSync(process.env.FAKE_AGENT_LOAD_GATE)) { clearInterval(timer); reply(); }
@@ -89,7 +101,16 @@ process.stdin.on("data", (chunk) => {
       currentModeId = message.params.modeId;
       send({ id: message.id, result: {} });
     } else if (message.method === "session/set_config_option") {
-      send({ id: message.id, result: { configOptions: [] } });
+      if (process.env.FAKE_AGENT_CONFIG_OPTIONS) {
+        if (message.params.value === "pending") continue;
+        if (message.params.value === "rejected" || (loaded && process.env.FAKE_AGENT_RESTORE_FAILURE === message.params.configId)) {
+          send({ id: message.id, error: { code: -32000, message: "Fixture selection rejected", data: { trace: "fixture-selection-cause" } } });
+          continue;
+        }
+        if (message.params.configId === "model") { currentModel = message.params.value; currentEffort = "medium"; }
+        else currentEffort = message.params.value;
+      }
+      send({ id: message.id, result: { configOptions: [], ...configOptions() } });
     } else if (message.method === "session/prompt") {
       const text = message.params.prompt.map((part) => part.text ?? "").join("");
       if (process.env.FAKE_AGENT_CONNECTION_FAILURE && fs.existsSync(process.env.FAKE_AGENT_CONNECTION_FAILURE)) {
@@ -108,6 +129,12 @@ process.stdin.on("data", (chunk) => {
         continue;
       }
       if (text.includes("continue")) {
+        if ((process.env.FAKE_AGENT_REQUIRE_MODEL && currentModel !== process.env.FAKE_AGENT_REQUIRE_MODEL)
+          || (currentModel !== "fixture-fixed" && process.env.FAKE_AGENT_REQUIRE_EFFORT && currentEffort !== process.env.FAKE_AGENT_REQUIRE_EFFORT)) {
+          send({ id: message.id, error: { code: -32602, message: `Selection lost on resume: ${currentModel}/${currentEffort}`,
+            data: { status: 400 } } });
+          continue;
+        }
         if (process.env.FAKE_AGENT_REQUIRE_MODE && currentModeId !== process.env.FAKE_AGENT_REQUIRE_MODE) {
           send({ id: message.id, error: { code: -32000, message: "Codex mode lost on resume" } });
           continue;

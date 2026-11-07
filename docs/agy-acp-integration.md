@@ -55,6 +55,16 @@ accounts. An unresolved item is not an accepted feature gap.
   existing core reapplied Flash/high, both readbacks matched, and literal
   continuity worked. Actual served-model identity was not independently
   established. This does not validate older Seam backend mappings.
+- **Host restart selections — fixture verified:** the real sessiond, holder
+  and adapter-child restart path reapplies the last acknowledged model and
+  config-option effort before continuation. It uses the existing resume
+  record; pending/rejected values are not saved, and a snapshot without an
+  effort selector clears the previous effort. Old records, legacy model-baked
+  profiles and Codex mode restoration retain their existing behavior. Setter
+  errors retain their RPC code/message/data and prevent continuation through
+  the existing failure path. The restart fixture uses a fake ACP agent through
+  registered config-option profiles; it does not establish native AGY host
+  restart parity or served-model identity.
 - **Cancellation — observed:** cancellation during an owned waiting MCP tool
   settled as cancelled, then the immediate next turn completed. Both native
   front processes exited with code zero. This is one scenario, not arbitrary

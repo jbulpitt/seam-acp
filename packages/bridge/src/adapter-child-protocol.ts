@@ -25,6 +25,11 @@ export interface AdapterChildResume {
   load: { sessionId: string; cwd: unknown; mcpServers: unknown };
   /** The acknowledged Codex mode, reapplied after load. */
   modeId?: string;
+  /** Acknowledged selectors, reapplied in model/effort order after load. */
+  configOptions?: {
+    model?: { configId: string; value: string };
+    effort?: { configId: string; value: string };
+  };
   recovery: {
     submissionId: string;
     acpSessionId: string;

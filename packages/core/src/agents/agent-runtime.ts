@@ -1964,9 +1964,7 @@ export class AgentRuntime {
         configId,
         value,
       });
-    // Whether the agent echoed a FRESH option snapshot. Without it the cached
-    // `sessionConfigOptions` still describes the state BEFORE this call, so any
-    // read-back would report the stale value as if it were the result (#37).
+    // Cached readbacks may be stale unless the response refreshes configOptions.
     this.lastConfigOptionRefreshed = Boolean(result?.configOptions);
     if (result?.configOptions) {
       this.sessionConfigOptions = result.configOptions;
@@ -2097,13 +2095,7 @@ export class AgentRuntime {
     try {
       const option = this.sessionConfigOptions.find(option => option.id === spec.configId);
       await this.setConfigOption(spec.configId, option?.type === "boolean" ? want : wanted);
-      // A resolved RPC is NOT proof the session is in Fast: upstream can snap it
-      // back off (it carries a `fast_mode_disabled_reason` for exactly that).
-      // setConfigOption stores the echoed configOptions, so re-read and derive
-      // `applied` from what the session now reports — the status card claims to
-      // show the applied state, so it must be observed, not assumed.
-      // Only trust a read-back when the response actually refreshed the
-      // snapshot; otherwise `getConfigCurrentValue` returns the PRE-set value.
+      // Read back Fast because the agent can accept the RPC and still leave it off.
       const echoed = this.lastConfigOptionRefreshed
         ? this.getConfigCurrentValue(spec.configId)
         : undefined;

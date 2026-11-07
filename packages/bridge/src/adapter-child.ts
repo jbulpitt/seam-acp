@@ -194,6 +194,7 @@ function start(config: AdapterChildBootstrap): void {
       || (resuming.phase === "mode" && message.id === RESUME_MODE)
       || (resuming.phase === "model" && message.id === RESUME_MODEL)
       || (resuming.phase === "effort" && message.id === RESUME_EFFORT)) {
+      if (resuming.phase === "model" || resuming.phase === "effort") resumeRecord.observeOutput(line);
       if (message.error) {
         if (resuming.phase === "model" || resuming.phase === "effort") {
           publish({ v: ADAPTER_CHILD_PROTOCOL_VERSION, type: "data",
@@ -213,14 +214,18 @@ function start(config: AdapterChildBootstrap): void {
       const selections = resuming.resume.configOptions;
       if ((resuming.phase === "load" || resuming.phase === "mode") && selections?.model) {
         resuming.phase = "model";
-        writeAgent(`${JSON.stringify({ jsonrpc: "2.0", id: RESUME_MODEL, method: "session/set_config_option",
-          params: { sessionId: resuming.resume.load.sessionId, ...selections.model } })}\n`);
+        const request = `${JSON.stringify({ jsonrpc: "2.0", id: RESUME_MODEL, method: "session/set_config_option",
+          params: { sessionId: resuming.resume.load.sessionId, ...selections.model } })}\n`;
+        resumeRecord.observeInput(request);
+        writeAgent(request);
         return true;
       }
       if (resuming.phase !== "effort" && selections?.effort) {
         resuming.phase = "effort";
-        writeAgent(`${JSON.stringify({ jsonrpc: "2.0", id: RESUME_EFFORT, method: "session/set_config_option",
-          params: { sessionId: resuming.resume.load.sessionId, ...selections.effort } })}\n`);
+        const request = `${JSON.stringify({ jsonrpc: "2.0", id: RESUME_EFFORT, method: "session/set_config_option",
+          params: { sessionId: resuming.resume.load.sessionId, ...selections.effort } })}\n`;
+        resumeRecord.observeInput(request);
+        writeAgent(request);
         return true;
       }
       const { recovery: turn } = resuming.resume;

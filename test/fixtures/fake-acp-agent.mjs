@@ -109,8 +109,19 @@ process.stdin.on("data", (chunk) => {
         }
         if (message.params.configId === "model") { currentModel = message.params.value; currentEffort = "medium"; }
         else currentEffort = message.params.value;
+        if (loaded && process.env.FAKE_AGENT_READBACK_FILE && fs.existsSync(process.env.FAKE_AGENT_READBACK_FILE)) {
+          const accepted = JSON.parse(fs.readFileSync(process.env.FAKE_AGENT_READBACK_FILE, "utf8"));
+          if (message.params.configId === "model") currentModel = accepted.model;
+          else currentEffort = accepted.effort ?? currentEffort;
+        }
       }
-      send({ id: message.id, result: { configOptions: [], ...configOptions() } });
+      const reply = () => send({ id: message.id, result: { configOptions: [], ...configOptions() } });
+      if (loaded && message.params.configId === process.env.FAKE_AGENT_CONFIG_OPTIONS
+        && process.env.FAKE_AGENT_SETTER_GATE && !fs.existsSync(process.env.FAKE_AGENT_SETTER_GATE)) {
+        const timer = setInterval(() => {
+          if (fs.existsSync(process.env.FAKE_AGENT_SETTER_GATE)) { clearInterval(timer); reply(); }
+        }, 20);
+      } else reply();
     } else if (message.method === "session/prompt") {
       const text = message.params.prompt.map((part) => part.text ?? "").join("");
       if (process.env.FAKE_AGENT_CONNECTION_FAILURE && fs.existsSync(process.env.FAKE_AGENT_CONNECTION_FAILURE)) {
@@ -143,7 +154,12 @@ process.stdin.on("data", (chunk) => {
           update("resumed ok");
           send({ id: message.id, result: { stopReason: "end_turn" } });
         };
-        if (text.includes("form question")) {
+        if (process.env.FAKE_AGENT_CONTINUE_GATE && !fs.existsSync(process.env.FAKE_AGENT_CONTINUE_GATE)) {
+          update("continuation held");
+          const timer = setInterval(() => {
+            if (fs.existsSync(process.env.FAKE_AGENT_CONTINUE_GATE)) { clearInterval(timer); finish(); }
+          }, 20);
+        } else if (text.includes("form question")) {
           formReplyPending = true;
           clientReply = finish;
           send({ id: "fixture-form-reply", method: "elicitation/create", params: {

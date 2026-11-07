@@ -42,6 +42,7 @@ const line = (message: Record<string, unknown>) => `${JSON.stringify({ jsonrpc: 
 
 async function host(root: string, modeId?: string, options: {
   legacy?: boolean; loadGate?: string; selectors?: boolean; fixed?: boolean; restoreFailure?: string;
+  agentEnv?: Record<string, string>;
 } = {}) {
   const bin = path.join(root, "bin");
   if (modeId) {
@@ -73,11 +74,25 @@ async function host(root: string, modeId?: string, options: {
         FAKE_AGENT_REQUESTS: path.join(root, "requests.jsonl"),
       } : {}),
       ...(options.restoreFailure ? { FAKE_AGENT_RESTORE_FAILURE: options.restoreFailure } : {}),
+      ...options.agentEnv,
     },
     onStderr: () => undefined,
     onFrame: (frame) => frames.push(frame),
   });
   return { server, client, slots, frames };
+}
+
+async function shutdown(root: string, app: Awaited<ReturnType<typeof host>>) {
+  await app.server.close();
+  servers.splice(servers.indexOf(app.server), 1);
+  app.client.close();
+  const state = JSON.parse(await fs.readFile(path.join(root, "slots.json"), "utf8")) as { slots: Array<{ identity: { pid: number; pgid: number } }> };
+  const agentPid = Number((await fs.readFile(path.join(root, "agent.pids"), "utf8")).trim().split("\n").at(-1));
+  for (const slot of state.slots) try { process.kill(-slot.identity.pgid, "SIGKILL"); } catch { /* gone */ }
+  try { process.kill(agentPid, "SIGKILL"); } catch { /* gone */ }
+  await until(() => [...state.slots.map(slot => slot.identity.pid), agentPid]
+    .every(pid => !readSessiondProcessIdentity(pid)) ? true : undefined, "shutdown to finish");
+  return agentPid;
 }
 
 describe("large prompts reach the agent", () => {
@@ -186,6 +201,78 @@ describe("#777 the retained adapter child decides reconciliation", () => {
 });
 
 describe("#631 host restart mid-turn", () => {
+  it.each([
+    { model: "fixture-flash", effort: "low" },
+    { model: "fixture-fixed", effort: undefined },
+  ])("records changed replay readbacks for a second restart: %j", async accepted => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "seam-repeat-resume-"));
+    roots.push(root);
+    const readbackFile = path.join(root, "readback.json");
+    const setterGate = path.join(root, "setter.ready");
+    const continueGate = path.join(root, "continue.ready");
+    const requests = async () => (await fs.readFile(path.join(root, "requests.jsonl"), "utf8")).trim().split("\n").map(row => JSON.parse(row));
+    const record = path.join(root, "resume", "5.json");
+    const saved = async () => JSON.parse(Buffer.from(JSON.parse(await fs.readFile(record, "utf8")).initialStdinBase64, "base64").toString()).resume;
+    const original = { model: { configId: "model", value: "fixture-deep" }, effort: { configId: "reasoning_effort", value: "max" } };
+    const first = await host(root, undefined, { selectors: true, agentEnv: {
+      FAKE_AGENT_READBACK_FILE: readbackFile,
+      FAKE_AGENT_SETTER_GATE: setterGate,
+      FAKE_AGENT_CONTINUE_GATE: continueGate,
+      FAKE_AGENT_REQUIRE_MODEL: accepted.model,
+      FAKE_AGENT_REQUIRE_EFFORT: accepted.effort ?? "max",
+    } });
+    first.slots.configure(5, { agentId: "copilot", cwd: root, rung1Recovery: DEFAULT_REMOTE_RUNG1_POLICY });
+    await first.slots.writeInput(5, line({ id: 1, method: "initialize", params: { protocolVersion: 1 } }));
+    await first.slots.writeInput(5, line({ id: 2, method: "session/new", params: { cwd: root, mcpServers: [] } }));
+    await until(() => first.frames.find(f => f.data?.includes('"sessionId":"s1"')), "session/new");
+    for (const [id, configId, value] of [[3, "model", "fixture-deep"], [4, "reasoning_effort", "max"]] as const) {
+      await first.slots.writeInput(5, line({ id, method: "session/set_config_option", params: { sessionId: "s1", configId, value } }));
+      await until(() => first.frames.find(f => f.data?.includes(`"id":${id}`) && f.data.includes('"result"')), "selector acknowledgement");
+    }
+    await first.slots.armRecovery(5, { submissionId: "repeat", acpSessionId: "s1", continuation: "continue" });
+    await first.slots.writeInput(5, line({ id: 7, method: "session/prompt", params: { sessionId: "s1", prompt: [{ type: "text", text: "long job" }] } }));
+    await until(() => first.frames.find(f => f.data?.includes("working on it")), "initial turn");
+    expect((await saved()).configOptions).toEqual(original);
+    const firstPid = await shutdown(root, first);
+    await fs.writeFile(readbackFile, JSON.stringify(accepted));
+
+    const second = await host(root);
+    await second.slots.rebind();
+    const replay = await second.slots.replay(5, 0); replay.activate();
+    const secondFrames = () => [...replay.result.frames, ...second.frames];
+    await until(async () => (await requests()).find(row => row.pid !== firstPid && row.method === "session/set_config_option"
+      && row.params.configId === "reasoning_effort"), "frozen effort target to be sent");
+    // Intermediate model defaults must not replace the intended pair on disk.
+    expect((await saved()).configOptions).toEqual(original);
+    await fs.writeFile(setterGate, "ready");
+    await until(() => secondFrames().find(f => f.data?.includes("continuation held")), "resumed continuation in flight");
+    expect((await saved()).configOptions).toEqual({ model: { configId: "model", value: accepted.model },
+      ...(accepted.effort ? { effort: { configId: "reasoning_effort", value: accepted.effort } } : {}) });
+    const secondPid = await shutdown(root, second);
+    const firstReplay = (await requests()).filter(row => row.pid === secondPid && row.method === "session/set_config_option");
+    expect(firstReplay.map(row => row.params)).toEqual([
+      { sessionId: "s1", ...original.model }, { sessionId: "s1", ...original.effort },
+    ]);
+    await fs.unlink(readbackFile);
+    await fs.writeFile(continueGate, "ready");
+
+    const third = await host(root);
+    await third.slots.rebind();
+    const finalReplay = await third.slots.replay(5, 0); finalReplay.activate();
+    const finalFrames = () => [...finalReplay.result.frames, ...third.frames];
+    const answer = await until(() => finalFrames().find(f => f.data?.includes('"id":7')
+      && (f.data.includes('"result"') || f.data.includes('"error"'))), "second resume result");
+    expect(JSON.parse(answer.data!)).toMatchObject({ id: 7, result: { stopReason: "end_turn" } });
+    const thirdRequests = (await requests()).filter(row => row.pid !== firstPid && row.pid !== secondPid);
+    expect(thirdRequests.map(row => row.method)).toEqual(["initialize", "session/load", "session/set_config_option",
+      ...(accepted.effort ? ["session/set_config_option"] : []), "session/prompt"]);
+    expect(thirdRequests.filter(row => row.method === "session/set_config_option").map(row => row.params)).toEqual([
+      { sessionId: "s1", configId: "model", value: accepted.model },
+      ...(accepted.effort ? [{ sessionId: "s1", configId: "reasoning_effort", value: accepted.effort }] : []),
+    ]);
+    await until(() => existsSync(record) ? undefined : true, "completed resume record to clear");
+  }, 60_000);
+
   it.each([
     { modeId: undefined, legacy: false },
     { modeId: "agent-full-access", legacy: false },

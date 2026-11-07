@@ -1038,10 +1038,7 @@ const ThreadPresetSchema = PresetValuesSchema.extend({
   ttsVoice: z.string().min(1).max(64).optional(),
   ttsPace: z.enum(["slow", "natural", "fast", "faster"]).optional(),
   ttsStyle: z.enum(["neutral", "warm", "clear"]).optional(),
-  // Claude Fast mode (#37): raw boolean, default false — exactly the shape of
-  // `detached`/`tts`. The default only materializes in the in-memory map: the
-  // Tier-C writer builds its candidate from the RAW file JSON, so an omitted
-  // `fastMode` is never serialized back as an explicit `false`.
+  // Fast defaults to false in memory; raw-JSON writes preserve an omitted key.
   // A session-start dimension, so changing it forces a fresh ACP session.
   fastMode: z.boolean().optional().default(false),
 });
@@ -1064,10 +1061,7 @@ export const BridgeHostSchema = z.object({
 
 export type BridgeHostConfig = z.infer<typeof BridgeHostSchema> & { id: string };
 
-// Exported (#58 P3 / D7): the Tier-C mutation path builds a candidate presets
-// object and MUST round-trip it through this exact schema before writing the
-// file. Boot drops invalid entries, but mutation must reject rather than
-// persist a setting that would disappear on restart.
+// Mutations use the boot schema to reject settings that boot would discard.
 export const PresetsFileSchema = z.object({
   channels: z.record(numericId, ChannelPresetSchema).optional().default({}),
   threads: z.record(threadPresetId, ThreadPresetSchema).optional().default({}),

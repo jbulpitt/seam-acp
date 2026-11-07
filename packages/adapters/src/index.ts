@@ -40,6 +40,7 @@ export * from "./profiles/claude.js";
 export * from "./profiles/claude-catalog.js";
 export * from "./profiles/copilot.js";
 export * from "./profiles/agy.js";
+export * from "./profiles/agy-acp.js";
 export * from "./profiles/codex.js";
 export * from "./profiles/codex-session-manager.js";
 export * from "./profiles/grok.js";

@@ -6531,16 +6531,15 @@ export class Orchestrator {
         ...(effort ? { effort } : {}),
         sessionId: args.sessionId ?? restrictionChannelId,
       });
-      const effortDescriptor = this.modelCatalog.model(
-        { agentId: profile.id, location }, model ?? profile.defaultModel,
-      )?.effort;
       rt = new AgentRuntime({
         profile,
         logger: this.logger.child({ compaction: "seed" }),
         ...this.router.permissionOptions(args.sessionId ? this.store.get(args.sessionId) ?? undefined : undefined),
         mcpServers: launch.mcpServers,
         spawnFn: launch.spawnFn,
-        ...(effortDescriptor ? { effortDescriptor } : {}),
+        effortDescriptor: (wantedModel) => this.modelCatalog.model(
+          { agentId: profile.id, location }, wantedModel,
+        )?.effort,
       });
       await rt.start();
       const info = await rt.newSession({ cwd, ...(model ? { model } : {}), ...(effort ? { effort } : {}) });

@@ -460,7 +460,7 @@ export class AgentRuntime {
     model?: string,
     effort?: string
   ) => ReturnType<AgentProfile["spawn"]> | Promise<ReturnType<AgentProfile["spawn"]>>;
-  private readonly catalogEffort?: CatalogEffort;
+  private readonly catalogEffort?: CatalogEffort | ((model: string) => CatalogEffort | undefined);
   private readonly bridgeHealth?: Partial<BridgeHealthSource>;
   private readonly modelFallbacks?: (model: string, used?: number, effort?: string) => ModelFallbackPlan;
   private observedContextUsed?: number;
@@ -619,8 +619,8 @@ export class AgentRuntime {
     permissionMode?: () => PermissionPolicyMode;
     onSessionModes?: (info: SessionInfo) => void;
     mcpServers?: McpServer[];
-    /** Model-specific transport declaration from the pinned catalog generation. */
-    effortDescriptor?: CatalogEffort;
+    /** Pinned declaration, or binding-owned lookup for the runtime's chosen model. */
+    effortDescriptor?: CatalogEffort | ((model: string) => CatalogEffort | undefined);
     /** Bridge child owner; absent only in narrow test/embedding shims. */
     bridgeHealth?: Partial<BridgeHealthSource>;
     /** Upstream precomputation, called before trying a model, never on failure. */
@@ -1085,7 +1085,7 @@ export class AgentRuntime {
     }
 
     // Apply reasoning effort for agents that take it as a config option (Copilot).
-    await this.applyConfigOptionEffort(opts.effort);
+    await this.applyConfigOptionEffort(opts.effort, wantedModel);
 
     // #37: Fast mode is a session-start dimension — this is the ONLY place it
     // is applied, and only against the options this fresh session advertised.
@@ -1195,7 +1195,7 @@ export class AgentRuntime {
     }
 
     // Reapply effort because session settings can be lost on subprocess restart.
-    await this.applyConfigOptionEffort(opts.effort);
+    await this.applyConfigOptionEffort(opts.effort, wantedModel);
 
     // Claude resumes observe only; live descriptors can restore the saved flag.
     if (this.profile.fastMode?.applicationMode === "live") await this.applyFastMode(opts.fastMode);
@@ -1975,8 +1975,8 @@ export class AgentRuntime {
    *  (e.g. Copilot's "reasoning_effort"). Claude folds effort into `_meta` via
    *  newSessionMeta instead; modelBaked/none agents have nothing to set. Must
    *  run after the session exists — config options require a live session. */
-  private async applyConfigOptionEffort(effort?: string): Promise<void> {
-    const eff = this.catalogEffort;
+  private async applyConfigOptionEffort(effort: string | undefined, model: string): Promise<void> {
+    const eff = typeof this.catalogEffort === "function" ? this.catalogEffort(model) : this.catalogEffort;
     if (!eff || eff.mechanism !== "configOption" || !eff.configId) return;
     const declared = eff.choices.map((choice) => choice.raw ?? choice.id);
     if (!effort || effort === "default" || !declared.includes(effort)) return;

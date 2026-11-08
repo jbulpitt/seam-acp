@@ -4,6 +4,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
 import { normalizeCatalogCandidate } from "../packages/adapters/src/catalog-evidence.js";
+import { readProcessIdentity, terminateProcessGroup, type CatalogEffort } from "@seam/adapters";
 import { readErrorClassification } from "../packages/adapters/src/error-classification.js";
 import { makeAgyAcpProfile, readAgyAcpTranscript, AGY_ACP_ARGS } from "../packages/adapters/src/profiles/agy-acp.js";
 import { makeAgyProfile } from "../packages/adapters/src/profiles/agy.js";
@@ -266,4 +267,126 @@ describe("native ACP text transcript reader", () => {
     expect(readErrorClassification(error)).toMatchObject({ agentId: "agy-acp" });
     await closed(r.lifecycle, code !== "output_overflow");
   });
+});
+
+
+describe("runtime-owned model identity for catalog effort metadata", () => {
+  const descriptor = (selectionDefault: string, choices: string[]): CatalogEffort => ({
+    mechanism: "configOption", configId: "thought_level", selectionDefault,
+    choices: choices.map(id => ({ id, raw: id })),
+  });
+  const flash = descriptor("medium", ["low", "medium", "high"]);
+  const deep = descriptor("high", ["high", "extra", "max"]);
+  type EffortInput = ConstructorParameters<typeof AgentRuntime>[0]["effortDescriptor"];
+  async function withRuntime(effortDescriptor: EffortInput,
+    body: (runtime: AgentRuntime, h: Awaited<ReturnType<typeof setup>>) => Promise<void>,
+    newError?: { code: number; message: string; data: Record<string, unknown> },
+    environment: Record<string, string> = {},
+  ) {
+    const h = await setup(newError, environment);
+    let actor: { identity: ReturnType<typeof readProcessIdentity>; closed: Promise<void> } | undefined;
+    const runtime = new AgentRuntime({ profile: h.profile, logger, effortDescriptor,
+      spawnFn: () => {
+        const child = h.profile.spawn();
+        actor = { identity: child.pid === undefined ? undefined : readProcessIdentity(child.pid, true),
+          closed: new Promise<void>(resolve => child.once("close", () => resolve())) };
+        return child;
+      },
+    });
+    let first: { error: unknown } | undefined;
+    const cleanup: unknown[] = [];
+    try { await body(runtime, h); } catch (error) { first = { error }; }
+    try { await runtime.dispose(); } catch (error) { cleanup.push(error); }
+    if (actor) {
+      try {
+        expect(actor.identity).toBeDefined();
+        expect(actor.identity!.pgid).toBe(actor.identity!.pid);
+        expect(await terminateProcessGroup(actor.identity!)).toBe(true);
+        await actor.closed;
+        expect(readProcessIdentity(actor.identity!.pid, true)?.started).not.toBe(actor.identity!.started);
+      } catch (error) { cleanup.push(error); }
+    }
+    if (first || cleanup.length) throw new AggregateError([
+      ...(first ? [first.error] : []), ...cleanup,
+    ], "Descriptor fixture operation and cleanup outcomes", first ? { cause: first.error } : undefined);
+  }
+
+  it.each([
+    { operation: "new" as const, model: "fixture-flash", effort: "high", wanted: "fixture-flash" },
+    { operation: "new" as const, model: undefined, effort: "max", wanted: "fixture-deep" },
+    { operation: "load" as const, model: "fixture-flash", effort: "high", wanted: "fixture-flash" },
+    { operation: "load" as const, model: undefined, effort: "max", wanted: "fixture-deep" },
+  ])("resolves effort for runtime $operation requested/default identity ($wanted)",
+    async ({ operation, model, effort, wanted }) => {
+      // Independent cache input; the profile has no declared effort levels.
+      const cache = new Map<string, CatalogEffort>();
+      const requested: string[] = [];
+      await withRuntime((chosen: string) => { requested.push(chosen); return cache.get(chosen); }, async (runtime, h) => {
+        expect(requested).toEqual([]);
+        await runtime.start();
+        expect(requested).toEqual([]);
+        cache.set("fixture-flash", flash);
+        cache.set("fixture-deep", deep);
+        const input = { cwd: h.dir, ...(model === undefined ? {} : { model }), effort, strictModel: true };
+        const info = operation === "new" ? await runtime.newSession(input)
+          : await runtime.loadSession({ ...input, sessionId: "own-descriptor-session" });
+        expect(requested).toEqual([wanted]);
+        expect(runtime.getConfigCurrentValue("model")).toBe(wanted);
+        expect(runtime.getConfigCurrentValue("thought_level")).toBe(effort);
+        expect(await runtime.prompt("descriptor fixture turn")).toMatchObject({ stopReason: "end_turn" });
+        await runtime.request("session/close", { sessionId: info.sessionId });
+        const calls = (await readFile(h.requests, "utf8")).trim().split("\n").map(line => JSON.parse(line));
+        const sessionAt = calls.findIndex(row => row.method === (operation === "new" ? "session/new" : "session/load"));
+        const setters = calls.filter(row => row.method === "session/set_config_option");
+        expect(setters.map(row => row.params)).toEqual([
+          ...(wanted === "fixture-flash" ? [] : [{ sessionId: info.sessionId, configId: "model", value: wanted }]),
+          { sessionId: info.sessionId, configId: "thought_level", value: effort },
+        ]);
+        expect(calls.findIndex(row => row.method === "session/set_config_option")).toBeGreaterThan(sessionAt);
+        expect(calls.findIndex(row => row.method === "session/prompt"))
+          .toBeGreaterThan(calls.findLastIndex(row => row.method === "session/set_config_option"));
+        expect(calls.filter(row => row.method === "session/prompt")).toHaveLength(1);
+        expect(h.profile.effort?.levels).toEqual([]);
+        expect(input).toEqual({ cwd: h.dir, ...(model === undefined ? {} : { model }), effort, strictModel: true });
+      });
+    }, 15_000);
+
+  it("keeps an undefined model descriptor non-blocking without inventing effort capability", async () => {
+    const requested: string[] = [];
+    await withRuntime((model: string) => { requested.push(model); return undefined; }, async (runtime, h) => {
+      await runtime.start();
+      const info = await runtime.newSession({ cwd: h.dir, model: "fixture-deep", effort: "max", strictModel: true });
+      expect(requested).toEqual(["fixture-deep"]);
+      expect(runtime.getConfigCurrentValue("model")).toBe("fixture-deep");
+      expect(runtime.getConfigCurrentValue("thought_level")).toBe("high");
+      expect(await runtime.prompt("missing metadata fixture turn")).toMatchObject({ stopReason: "end_turn" });
+      await runtime.request("session/close", { sessionId: info.sessionId });
+      const calls = (await readFile(h.requests, "utf8")).trim().split("\n").map(line => JSON.parse(line));
+      expect(calls.filter(row => row.method === "session/set_config_option").map(row => row.params)).toEqual([
+        { sessionId: info.sessionId, configId: "model", value: "fixture-deep" },
+      ]);
+      expect(calls.filter(row => row.method === "session/prompt")).toHaveLength(1);
+    });
+  }, 15_000);
+
+  it.each(["new", "load"] as const)("does not resolve metadata before a rejected native session/%s", async operation => {
+    const native = { code: -32603, message: "Fixture session unavailable", data: { status: 503, fixture: "descriptor-session-cause" } };
+    const requested: string[] = [];
+    const resolve = (model: string): CatalogEffort | undefined => {
+      requested.push(model); throw new Error("Metadata must not replace the earlier session error");
+    };
+    await withRuntime(resolve, async (runtime, h) => {
+      await runtime.start();
+      const input = { cwd: h.dir, model: "fixture-deep", effort: "max", strictModel: true };
+      const error = await (operation === "new" ? runtime.newSession(input)
+        : runtime.loadSession({ ...input, sessionId: "own-descriptor-rejected" }))
+        .then(() => null, error => error);
+      expect(error).toMatchObject(native);
+      expect(readErrorClassification(error)).toMatchObject({ agentId: "agy-acp", errorKind: "overloaded" });
+      expect(requested).toEqual([]);
+      const calls = (await readFile(h.requests, "utf8")).trim().split("\n").map(line => JSON.parse(line));
+      expect(calls.map(row => row.method)).toEqual(["initialize", operation === "new" ? "session/new" : "session/load"]);
+    }, operation === "new" ? native : undefined,
+    operation === "load" ? { AGY_ACP_TEST_LOAD_ERROR: JSON.stringify(native) } : {});
+  }, 15_000);
 });

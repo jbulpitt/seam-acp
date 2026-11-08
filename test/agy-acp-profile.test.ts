@@ -220,6 +220,13 @@ describe("native ACP text transcript reader", () => {
     await closed(r.lifecycle);
   });
 
+  it("keeps supplied empty message IDs distinct while coalescing their repeated and absent-ID chunks", async () => {
+    const r = await reader({ AGY_ACP_TEST_EMPTY_MESSAGE_ID: "1" });
+    const transcript = await r.profile.getTranscript(r.dir, r.launch.sessionId);
+    await closed(r.lifecycle);
+    expect(transcript).toBe(expected + "\n\n### Assistant\nNamed γ\n\n### Assistant\nEmpty id δ no-id chunks");
+  });
+
   it("preserves a load error after partial replay and its separate close error", async () => {
     const native = { code: -32603, message: "Fixture load failed", data: { status: 503, fixture: "load-cause" } };
     const cleanup = { code: -32603, message: "Fixture close failed", data: { fixture: "close-cause" } };

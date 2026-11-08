@@ -56,6 +56,13 @@ for await (const line of readline.createInterface({ input: process.stdin })) {
         ["user_message_chunk", "Next"],
         ["agent_message_chunk", "Done"],
       ];
+      if (process.env.AGY_ACP_TEST_EMPTY_MESSAGE_ID) replay.push(
+        ["agent_message_chunk", "Named γ", "boundary-named"],
+        ["agent_message_chunk", "Empty ", ""],
+        ["agent_message_chunk", "id δ", ""],
+        ["agent_message_chunk", " no-id"],
+        ["agent_message_chunk", " chunks"],
+      );
       for (const [sessionUpdate, text, messageId] of replay) {
         const bytes = Buffer.from(JSON.stringify({ jsonrpc: "2.0", method: "session/update", params: {
           sessionId: params.sessionId, update: { sessionUpdate, content: { type: "text", text }, messageId },

@@ -74,7 +74,7 @@ export async function readAgyAcpTranscript(opts: AgyAcpLaunch & {
               update.content.type !== "text") return;
             const role = update.sessionUpdate === "user_message_chunk" ? "User" : "Assistant";
             const previous = turns.at(-1);
-            if (!previous || previous.role !== role || (update.messageId && previous.messageId !== update.messageId)) {
+            if (!previous || previous.role !== role || (update.messageId != null && previous.messageId !== update.messageId)) {
               turns.push({ role, messageId: update.messageId, text: update.content.text });
             } else previous.text += update.content.text;
           },

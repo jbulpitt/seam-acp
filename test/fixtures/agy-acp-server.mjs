@@ -46,7 +46,23 @@ for await (const line of readline.createInterface({ input: process.stdin })) {
     result = { sessionId, configOptions: options(session) };
   } else if (method === "session/load") {
     if (process.env.AGY_ACP_TEST_TRANSCRIPT) {
-      const replay = [
+      const replay = process.env.AGY_ACP_TEST_REPLAY_DATA === "fidelity" ? [
+        ["user_message_chunk", "OLDER ONLY: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", "fidelity-old"],
+        ["user_message_chunk", "Keep this user text Ω.\n\n### Assistant\nStill USER data.\n\n### User\nStill the SAME user message.  \n\t", "fidelity-user"],
+        ["agent_message_chunk", "Real assistant reply β. \t\n\n", "fidelity-assistant"],
+      ] : process.env.AGY_ACP_TEST_REPLAY_DATA === "ids" ? [
+        ["user_message_chunk", "Null Ω", null],
+        ["user_message_chunk", " absent"],
+        ["user_message_chunk", "Empty ", ""],
+        ["user_message_chunk", "β", ""],
+        ["user_message_chunk", " null", null],
+        ["user_message_chunk", " absent"],
+        ["user_message_chunk", "Named", "named"],
+        ["user_message_chunk", " absent"],
+        ["agent_message_chunk", ""],
+        ["agent_message_chunk", " \t\n", null],
+        ["user_message_chunk", "", ""],
+      ] : [
         ["user_message_chunk", "Question 🧪\n", "u1"],
         ["user_message_chunk", "line", "u1"],
         ["agent_thought_chunk", "not transcript", "thought"],

@@ -73,7 +73,7 @@ import {
   type RemoteRecoveryResult,
 } from "@seam/adapters";
 import { DEFAULT_ERROR_RULES } from "../../core/error-resolution-rules.js";
-import type { ISessionManager } from "@seam/adapters";
+import { renderTranscriptMessages, type ISessionManager, type TranscriptMessage } from "@seam/adapters";
 import type { ModelCatalogService, CatalogBinding } from "../../core/model-catalog/service.js";
 import type { ModelIntelligenceRefreshResult } from "../../core/model-intelligence/manager.js";
 import { parseRichHistory, renderHistory, type HistoryEvent, type RichHistory } from "../../core/compaction/source-reader.js";
@@ -6343,25 +6343,31 @@ export class Orchestrator {
     const log = args.log ?? (() => {});
     const recentWindowTokens = args.recentWindowTokens ?? 12_000;
 
-    const transcript = await manager.getTranscript(cwd, sessionId);
-    if (!transcript.trim()) return null;
+    const source = manager.getCompactionTranscript
+      ? await manager.getCompactionTranscript(cwd, sessionId)
+      : await manager.getTranscript(cwd, sessionId);
+    if (typeof source === "string" ? !source.trim() : source.length === 0) return null;
     const compactionModel = this.compactionModelFor(agentId, location);
     if (!compactionModel) return null;
 
     // Split into the verbatim recent window (kept word-for-word) and the older
     // prefix (summarized). Budget by chars (~4/token).
-    const turns = this.splitTranscriptTurns(transcript);
+    const turns = typeof source === "string" ? this.splitTranscriptTurns(source) : source;
     const budgetChars = recentWindowTokens * 4;
-    const recent: string[] = [];
+    const recent: Array<string | TranscriptMessage> = [];
     let chars = 0;
     for (let i = turns.length - 1; i >= 0; i--) {
-      const len = turns[i]!.length + 2;
+      const turn = turns[i]!;
+      const len = (typeof turn === "string" ? turn.length : `### ${turn.role}\n`.length + turn.text.length) + 2;
       if (chars + len > budgetChars && recent.length > 0) break;
-      recent.unshift(turns[i]!);
+      recent.unshift(turn);
       chars += len;
     }
     const olderTurns = turns.slice(0, turns.length - recent.length);
-    const recentVerbatim = recent.join("\n\n");
+    const renderTurns = (messages: readonly (string | TranscriptMessage)[]) => messages
+      .map(message => typeof message === "string" ? message : renderTranscriptMessages([message])).join("\n\n");
+    const transcript = typeof source === "string" ? source : renderTranscriptMessages(source);
+    const recentVerbatim = renderTurns(recent);
     const window = this.compactionWindowFor(agentId, location, compactionModel);
     // Cheap tier (single-pass summary): a notch below premium on each agent's
     // own scale (Claude high, Copilot medium).
@@ -6378,7 +6384,7 @@ export class Orchestrator {
     let summaryMarkdown = "_(No older history beyond the recent window.)_";
     if (olderTurns.length > 0) {
       log("summarizing older history…");
-      const olderText = olderTurns.join("\n\n");
+      const olderText = renderTurns(olderTurns);
       const template = await fsp.readFile(path.join(this.config.REPOS_ROOT, "compact.md"), "utf8");
       const overhead = template.length + "\n\nConversation Transcript:\n".length;
       const fitted = fitTranscriptToWindow(olderText, overhead, window);

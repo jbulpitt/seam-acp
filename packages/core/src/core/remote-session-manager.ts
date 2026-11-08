@@ -1,4 +1,4 @@
-import { SESSION_HISTORY_CHUNK_BYTES, type SessionHistoryChunk, type ISessionManager, type SessionSummary } from "@seam/adapters";
+import { SESSION_HISTORY_CHUNK_BYTES, type SessionHistoryChunk, type ISessionManager, type CompactionTranscript, type SessionSummary } from "@seam/adapters";
 import type { BridgeHub } from "./bridge-hub.js";
 
 type SessionRpc = Pick<BridgeHub, "rpc">;
@@ -41,6 +41,8 @@ export function remoteSessionManager(
     listSessions: (cwd) => call<SessionSummary[]>("listSessions", { cwd }),
     getTranscript: (cwd, sessionId) =>
       call<string>("getTranscript", { cwd, sessionId }),
+    getCompactionTranscript: (cwd, sessionId) =>
+      call<CompactionTranscript>("getTranscript", { cwd, sessionId, format: "messages" }),
     cloneSession: async (cwd, oldSessionId, newSessionId) => {
       await call("cloneSession", { cwd, oldSessionId, newSessionId });
     },

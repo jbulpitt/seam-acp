@@ -14,6 +14,7 @@ import { agyWait } from "../agy-lifecycle.js";
 import { classifyAndAttach } from "../error-classification.js";
 import { manifestCatalogSource, manifestCatalogScope } from "../model-catalog.js";
 import { runBoundedProbe } from "../probe-process.js";
+import { renderTranscriptMessages, type TranscriptMessage } from "../session-manager.js";
 import { classifyAgyError } from "./agy.js";
 
 export const AGY_ACP_ARGS = ["acp", "--process-per-session"] as const;
@@ -49,12 +50,12 @@ function choices(option: ReturnType<typeof select>): SessionConfigSelectOption[]
 }
 
 /** Read text replay without exposing it as a live turn or a full session manager. */
-export async function readAgyAcpTranscript(opts: AgyAcpLaunch & {
+export async function readAgyAcpTranscriptMessages(opts: AgyAcpLaunch & {
   sessionId: string;
   signal?: AbortSignal;
   timeoutMs?: number;
-}): Promise<string> {
-  const turns: Array<{ role: string; messageId?: string | null; text: string }> = [];
+}): Promise<readonly TranscriptMessage[]> {
+  const turns: TranscriptMessage[] = [];
   let operationError: { error: unknown } | undefined;
   const cleanupErrors: unknown[] = [];
   try {
@@ -132,7 +133,16 @@ export async function readAgyAcpTranscript(opts: AgyAcpLaunch & {
     classifyAndAttach(error, classifyAgyError(error, "agy-acp"));
     throw error;
   }
-  return turns.map(turn => `### ${turn.role}\n${turn.text}`).join("\n\n");
+  return turns;
+}
+
+/** Existing readable view of the same successful, fully closed replay. */
+export async function readAgyAcpTranscript(opts: AgyAcpLaunch & {
+  sessionId: string;
+  signal?: AbortSignal;
+  timeoutMs?: number;
+}): Promise<string> {
+  return renderTranscriptMessages(await readAgyAcpTranscriptMessages(opts));
 }
 
 /** Metadata only: inspect each model's own selector; never send a prompt. */
@@ -273,6 +283,9 @@ export function makeAgyAcpProfile(opts: {
     },
   });
   profile.getTranscript = (sessionCwd, sessionId) => readAgyAcpTranscript({
+    cliPath, args, cwd: sessionCwd, env: environment(), sessionId,
+  });
+  profile.getCompactionTranscript = (sessionCwd, sessionId) => readAgyAcpTranscriptMessages({
     cliPath, args, cwd: sessionCwd, env: environment(), sessionId,
   });
   return profile;

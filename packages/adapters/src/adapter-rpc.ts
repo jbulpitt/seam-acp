@@ -106,6 +106,9 @@ export async function invokeAdapterRpc(
       if (!adapter) throw new Error("no adapter for getTranscript");
       const sessionId = str(p.sessionId);
       if (!sessionId) throw new Error("sessionId required");
+      if (p.format === "messages" && adapter.getCompactionTranscript) {
+        return adapter.getCompactionTranscript(cwd, sessionId);
+      }
       return adapter.getTranscript(cwd, sessionId);
     }
     case "getUsage":

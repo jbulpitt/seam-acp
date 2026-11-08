@@ -2,11 +2,11 @@ import { mkdtemp, readFile, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { normalizeCatalogCandidate } from "../packages/adapters/src/catalog-evidence.js";
-import { readProcessIdentity, terminateProcessGroup, type CatalogEffort } from "@seam/adapters";
+import { asLocalAdapter, readProcessIdentity, terminateProcessGroup, type CatalogEffort, type ISessionManager } from "@seam/adapters";
 import { readErrorClassification } from "../packages/adapters/src/error-classification.js";
-import { makeAgyAcpProfile, readAgyAcpTranscript, AGY_ACP_ARGS } from "../packages/adapters/src/profiles/agy-acp.js";
+import { makeAgyAcpProfile, readAgyAcpTranscript, readAgyAcpTranscriptMessages, AGY_ACP_ARGS } from "../packages/adapters/src/profiles/agy-acp.js";
 import { makeAgyProfile } from "../packages/adapters/src/profiles/agy.js";
 import { controllerMetadataAdapter } from "../packages/core/src/agents/controller-metadata.js";
 import { AgentRuntime, type AgentEvent } from "../packages/core/src/agents/agent-runtime.js";
@@ -257,6 +257,29 @@ describe("native ACP text transcript reader", () => {
     expect((await records(r.lifecycle)).map(row => row.event)).toEqual(["start", "eof", "exit"]);
   });
 
+  it("keeps readable fidelity replay headers and terminal whitespace byte-exact", async () => {
+    const r = await reader({ AGY_ACP_TEST_REPLAY_DATA: "fidelity" });
+    const transcript = await r.profile.getTranscript(r.dir, r.launch.sessionId);
+    await closed(r.lifecycle);
+    expect(transcript).toBe("### User\nOLDER ONLY: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\n\n### User\nKeep this user text Ω.\n\n### Assistant\nStill USER data.\n\n### User\nStill the SAME user message.  \n\t\n\n### Assistant\nReal assistant reply β. \t\n\n");
+    expect((await records(r.requests)).map(row => row.method)).toEqual(["initialize", "session/load", "session/close"]);
+  });
+
+  it("retains null, supplied-empty and omitted source IDs without changing same-role coalescing", async () => {
+    const r = await reader({ AGY_ACP_TEST_REPLAY_DATA: "ids" });
+    const messages = await readAgyAcpTranscriptMessages(r.launch);
+    await closed(r.lifecycle);
+    expect(messages).toStrictEqual([
+      { role: "User", messageId: null, text: "Null Ω absent" },
+      { role: "User", messageId: "", text: "Empty β null absent" },
+      { role: "User", messageId: "named", text: "Named absent" },
+      { role: "Assistant", messageId: undefined, text: " \t\n" },
+      { role: "User", messageId: "", text: "" },
+    ]);
+    expect((await records(r.requests)).map(row => row.method)).toEqual(["initialize", "session/load", "session/close"]);
+    expect(r.profile.sessionManager).toBeUndefined();
+  });
+
   it.each([
     { environment: { AGY_ACP_TEST_LOAD_HANG: "1" }, code: "timeout" },
     { environment: { AGY_ACP_TEST_LOAD_HANG: "1", AGY_ACP_TEST_LOAD_OVERFLOW: "1" }, code: "output_overflow" },
@@ -389,4 +412,38 @@ describe("runtime-owned model identity for catalog effort metadata", () => {
     }, operation === "new" ? native : undefined,
     operation === "load" ? { AGY_ACP_TEST_LOAD_ERROR: JSON.stringify(native) } : {});
   }, 15_000);
+});
+
+
+describe("local adapter compaction transcript compatibility", () => {
+  it("delegates a manager's typed view with its receiver, otherwise uses the current readable override", async () => {
+    const readable = vi.fn(async (_cwd: string, _sid: string) => "manager text");
+    const manager: ISessionManager = {
+      listSessions: async () => [], cloneSession: async () => {}, deleteSession: async () => {},
+      getTranscript: readable,
+      async getCompactionTranscript(cwd, sid) {
+        expect(this).toBe(manager);
+        expect([cwd, sid]).toEqual(["fixture-cwd", "same-sid"]);
+        return [{ role: "User", messageId: "", text: " \t" }];
+      },
+    };
+    const adapter = asLocalAdapter({ id: "fixture", displayName: "Fixture", defaultModel: "fixture",
+      spawn() { throw new Error("Transcript delegation must not spawn"); }, sessionManager: manager });
+    expect(await adapter.getCompactionTranscript!("fixture-cwd", "same-sid"))
+      .toStrictEqual([{ role: "User", messageId: "", text: " \t" }]);
+    expect(readable).not.toHaveBeenCalled();
+    const nativeError = Object.assign(new Error("Fixture metadata read failed"), { code: -32603, data: { fixture: "delegation-cause" } });
+    manager.getCompactionTranscript = async () => { throw nativeError; };
+    await expect(adapter.getCompactionTranscript!("fixture-cwd", "same-sid")).rejects.toBe(nativeError);
+    expect(readable).not.toHaveBeenCalled();
+    manager.getCompactionTranscript = undefined;
+    expect(await adapter.getCompactionTranscript!("fixture-cwd", "same-sid")).toBe("manager text");
+    expect(readable).toHaveBeenCalledExactlyOnceWith("fixture-cwd", "same-sid");
+    adapter.sessionManager = undefined;
+    const late = vi.fn(async (_cwd: string, _sid: string) => "late native-shaped override");
+    adapter.getTranscript = late;
+    expect(await adapter.getCompactionTranscript!("fixture-cwd", "same-sid")).toBe("late native-shaped override");
+    expect(late).toHaveBeenCalledExactlyOnceWith("fixture-cwd", "same-sid");
+    expect(readable).toHaveBeenCalledTimes(1);
+  });
 });

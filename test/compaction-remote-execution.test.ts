@@ -12,8 +12,8 @@ import { fileURLToPath } from "node:url";
 import { EventEmitter } from "node:events";
 import { PassThrough, Readable, Writable } from "node:stream";
 import { agent, methods, ndJsonStream, PROTOCOL_VERSION } from "@agentclientprotocol/sdk";
-import { classifyAgyError, readErrorClassification, readProcessIdentity, terminateProcessGroup,
-  type AgentProfile, type CatalogModel } from "@seam/adapters";
+import { classifyAgyError, readErrorClassification, readProcessIdentity, terminateProcessGroup, renderTranscriptMessages,
+  type AgentProfile, type CatalogModel, type TranscriptMessage } from "@seam/adapters";
 import { makeAgyAcpProfile } from "../packages/adapters/src/profiles/agy-acp.js";
 import { dispatchBridgeRpc } from "../packages/bridge/src/rpc.js";
 import { pino } from "pino";
@@ -97,7 +97,7 @@ function setup(location = REMOTE) {
 }
 
 
-function nativeSeedSetup(location: string, newSessionError?: { code: number; message: string; data: Record<string, unknown> }, withReplay = false) {
+function nativeSeedSetup(location: string, newSessionError?: { code: number; message: string; data: Record<string, unknown> }, withReplay = false, replayData?: "fidelity") {
   const h = setup(location);
   const requests = path.join(h.cwd, "native-seed-requests.jsonl");
   const promptStates = path.join(h.cwd, "native-seed-state.jsonl");
@@ -107,6 +107,7 @@ function nativeSeedSetup(location: string, newSessionError?: { code: number; mes
     acpArgs: [fileURLToPath(new URL("./fixtures/agy-acp-server.mjs", import.meta.url))], cwd: h.cwd,
     environment: { ...process.env, AGY_ACP_TEST_REQUESTS: requests, AGY_ACP_TEST_PROMPT_STATE: promptStates,
       ...(withReplay ? { AGY_ACP_TEST_TRANSCRIPT: "1", AGY_ACP_TEST_LIFECYCLE: lifecycle } : {}),
+      ...(replayData ? { AGY_ACP_TEST_REPLAY_DATA: replayData } : {}),
       ...(newSessionError ? { AGY_ACP_TEST_NEW_ERROR: JSON.stringify(newSessionError) } : {}) },
   });
   // Cache-owned metadata is independent of the profile's empty effort levels.
@@ -357,8 +358,15 @@ describe("#480 compaction execution boundary", () => {
       });
       expect(reads).toHaveLength(1);
       expect(reads[0]!.request).toEqual({ location: REMOTE, method: "getTranscript", agentId: "agy-acp",
-        params: { cwd: h.cwd, sessionId: "live-session-untouched" } });
-      expect(reads[0]!.value).toBe(canonical);
+        params: { cwd: h.cwd, sessionId: "live-session-untouched", format: "messages" } });
+      expect(reads[0]!.value).toStrictEqual([
+        { role: "User", messageId: "u1", text: "Question 🧪\nline" },
+        { role: "Assistant", messageId: "a1", text: "Answer αβ" },
+        { role: "Assistant", messageId: "a2", text: "Separate assistant" },
+        { role: "User", messageId: undefined, text: "Next" },
+        { role: "Assistant", messageId: undefined, text: "Done" },
+      ]);
+      expect(renderTranscriptMessages(reads[0]!.value as readonly TranscriptMessage[])).toBe(canonical);
       expect(reads[0]!.requests.map(row => row.method)).toEqual(["initialize", "session/load", "session/close"]);
       expect(reads[0]!.requests[0].params).toEqual({ protocolVersion: PROTOCOL_VERSION,
         clientInfo: { name: "seam-acp", version: "0.1.0" }, clientCapabilities: {} });
@@ -478,5 +486,243 @@ describe("#480 compaction execution boundary", () => {
         cleanupOutcomes.map(outcome => outcome.error), "Compaction composition cleanup outcomes",
       ), { cleanupOutcomes });
     }
+  });
+
+  it("preserves source-message boundaries and exact whitespace through native compaction and replacement seed", async () => {
+    const h = nativeSeedSetup(REMOTE, undefined, true, "fidelity");
+    // Independent literal blocks, including role-looking data and terminal whitespace.
+    const older = "### User\nOLDER ONLY: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+    const user = "### User\nKeep this user text Ω.\n\n### Assistant\nStill USER data.\n\n### User\nStill the SAME user message.  \n\t";
+    const assistant = "### Assistant\nReal assistant reply β. \t\n\n";
+    const canonical = `${older}\n\n${user}\n\n${assistant}`;
+    const recent = `${user}\n\n${assistant}`;
+    const template = "Summarize the supplied older conversation.";
+    writeFileSync(path.join(h.cwd, "compact.md"), template);
+    const legacyRead = vi.fn(async () => "legacy same-SID sentinel");
+    const context = { adapters: new Map([
+      ["agy", { ...h.legacyProfile, getTranscript: legacyRead }],
+      ["agy-acp", h.execution],
+    ]), workspaceRoot: h.cwd, cwd: h.cwd };
+    const reads: Array<{ request: unknown; value: unknown; requests: any[]; lifecycle: any[] }> = [];
+    // Mocked transport; production host dispatcher and native getter remain actual.
+    (h.hub.rpc as any).mockImplementation(async (location: string, method: string, params: unknown, agentId?: string) => {
+      const value = await dispatchBridgeRpc(method, params, agentId, context);
+      if (method === "getTranscript") reads.push({ request: { location, method, params, agentId }, value,
+        requests: h.records(h.requests), lifecycle: h.records(h.lifecycle) });
+      return value;
+    });
+    vi.spyOn(h.router, "describeConfig").mockReturnValue({
+      agent: { value: "agy-acp" }, model: { value: "fixture-flash" }, effort: { value: "high" },
+      cwd: { value: h.cwd }, location: { value: REMOTE }, fastMode: { value: false },
+    });
+    const modelRows = vi.spyOn(h.catalog, "models");
+    const modelLookups = vi.spyOn(h.catalog, "model");
+    const selections = vi.spyOn(h.catalog, "resolve");
+    let primary: { error: unknown } | undefined;
+    const cleanupOutcomes: Array<{ phase: string; error: unknown }> = [];
+    let completedBody = false;
+    try {
+      const manager = h.orch.sessionManagerFor(h.profile, "agy-acp", REMOTE);
+      const built = await h.orch.buildDefaultCompactionSeed({
+        profile: h.profile, manager, agentId: "agy-acp", location: REMOTE, cwd: h.cwd,
+        sessionId: "live-session-untouched", restrictionChannelId: "parent", recentWindowTokens: 64,
+        bindingThread: { platform: "discord", id: "author", parentId: "parent" },
+      });
+      const seeded = await h.orch.seedNewSession({
+        profile: h.profile, restrictionChannelId: "parent", cwd: h.cwd, location: REMOTE,
+        sessionId: h.record.id, model: "fixture-flash", effort: "high", summary: built.seed,
+      });
+      const calls = h.records(h.requests);
+      const prompts = calls.filter(row => row.method === "session/prompt");
+      const text = prompts.map(row => row.params.prompt[0]?.text as string);
+      // Retain controlled fixture observations before any desired-fidelity comparison.
+      console.info("native-fidelity-composition-observed", JSON.stringify({
+        getter: reads[0]?.value, builder: built, seeded, promptText: text,
+      }));
+      expect(reads[0]?.value).toStrictEqual([
+        { role: "User", messageId: "fidelity-old", text: "OLDER ONLY: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" },
+        { role: "User", messageId: "fidelity-user", text: "Keep this user text Ω.\n\n### Assistant\nStill USER data.\n\n### User\nStill the SAME user message.  \n\t" },
+        { role: "Assistant", messageId: "fidelity-assistant", text: "Real assistant reply β. \t\n\n" },
+      ]);
+      expect(reads).toHaveLength(1);
+      expect(reads[0]!.request).toEqual({ location: REMOTE, method: "getTranscript", agentId: "agy-acp",
+        params: { cwd: h.cwd, sessionId: "live-session-untouched", format: "messages" } });
+      expect(reads[0]!.requests.map(row => row.method)).toEqual(["initialize", "session/load", "session/close"]);
+      expect(reads[0]!.requests[0].params).toEqual({ protocolVersion: PROTOCOL_VERSION,
+        clientInfo: { name: "seam-acp", version: "0.1.0" }, clientCapabilities: {} });
+      expect(reads[0]!.requests[1].params).toEqual({ sessionId: "live-session-untouched", cwd: h.cwd, mcpServers: [] });
+      expect(reads[0]!.requests[2].params).toEqual({ sessionId: "live-session-untouched" });
+      expect(reads[0]!.lifecycle.map(row => row.event)).toEqual(["start", "close", "eof", "exit"]);
+      expect(new Set(reads[0]!.lifecycle.map(row => `${row.pid}/${row.start}`)).size).toBe(1);
+      expect(legacyRead).not.toHaveBeenCalled();
+      expect(seeded).toBe("fixture-1");
+      expect(prompts).toHaveLength(3);
+      for (const prompt of prompts) {
+        expect(prompt.params.prompt).toEqual([expect.objectContaining({ type: "text", text: expect.any(String) })]);
+      }
+      // The canned response deliberately retains the existing zero-pinned parse fallback.
+      expect(built.pinnedCount).toBe(0);
+      expect(built.seed).toContain("\n\nfixture response\n\n## Pinned constraints (verbatim)");
+      const leadIn = "[Loading prior-session context after compaction — read the summary below, reply with a one-line acknowledgement, then await the next instruction. Do not begin work yet.]";
+      expect(text[2]).toContain(`${leadIn}\n\n${built.seed}`);
+      expect(text[2]!.split(built.seed)).toHaveLength(2);
+      expect(text[2]!.endsWith(built.seed)).toBe(true);
+      for (const prompt of text) {
+        for (const excluded of ["wrong SID", "not transcript", "AA==", "fixture-tool"]) {
+          expect(prompt).not.toContain(excluded);
+        }
+      }
+      expect(calls.filter(row => row.method === "session/set_config_option").map(row => row.params)).toEqual([
+        { sessionId: "fixture-1", configId: "model", value: "fixture-fixed" },
+        { sessionId: "fixture-1", configId: "model", value: "fixture-fixed" },
+        { sessionId: "fixture-1", configId: "thought_level", value: "high" },
+      ]);
+      const highAt = calls.findIndex(row => row.method === "session/set_config_option" && row.params.configId === "thought_level");
+      expect(highAt).toBeGreaterThan(calls.indexOf(prompts[1]));
+      expect(highAt).toBeLessThan(calls.indexOf(prompts[2]));
+      expect(h.records(h.promptStates)).toEqual([
+        { sessionId: "fixture-1", model: "fixture-fixed", effort: "medium" },
+        { sessionId: "fixture-1", model: "fixture-fixed", effort: "medium" },
+        { sessionId: "fixture-1", model: "fixture-flash", effort: "high" },
+      ]);
+      const spawns = (h.mux.rpc.mock.calls as any[][]).filter(row => row[0] === "spawn");
+      expect(spawns).toHaveLength(3);
+      expect(spawns.map(row => row[1].model)).toEqual(["fixture-fixed", "fixture-fixed", "fixture-flash"]);
+      expect(spawns.map(row => row[1].effort)).toEqual([undefined, undefined, "high"]);
+      for (const spawn of spawns) {
+        expect(spawn[1]).toMatchObject({ agentId: "agy-acp", cwd: h.cwd, mcpServers: [h.remoteSeam],
+          threadIdentity: { threadId: "author", channelId: "parent", agentId: "agy-acp@remote-synthetic" } });
+        expect(spawn[2]).toEqual({ agentId: "agy-acp" });
+        expect(spawn[1].mcpServers).not.toEqual(expect.arrayContaining([expect.objectContaining({ name: "controllerOnly" })]));
+      }
+      for (const calls of [modelRows.mock.calls, modelLookups.mock.calls, selections.mock.calls]) {
+        expect(calls.length).toBeGreaterThan(0);
+        for (const call of calls) expect(call[0]).toEqual({ agentId: "agy-acp", location: REMOTE });
+      }
+      expect(h.localSpawn).not.toHaveBeenCalled();
+      expect(h.remoteSpawn).toHaveBeenCalledTimes(3);
+      expect((h.hub.get.mock.calls as unknown[][]).every(call => call[0] === REMOTE)).toBe(true);
+      expect(h.hub.markSessionBridge).toHaveBeenCalledWith(h.record.id, REMOTE);
+      const deletions = (h.hub.rpc.mock.calls as any[][]).filter(row => row[1] === "deleteSession");
+      expect(deletions).toHaveLength(2);
+      for (const deletion of deletions) expect(deletion).toEqual([
+        REMOTE, "deleteSession", { cwd: h.cwd, sessionId: "fixture-1" }, "agy-acp",
+      ]);
+      expect(h.localDelete).not.toHaveBeenCalled();
+      expect(h.store.get(h.record.id)).toEqual(h.original);
+      expect(h.profile.sessionManager).toBeUndefined();
+      const pinnedBegin = "=== BEGIN TRANSCRIPT DATA ===\n";
+      const pinnedEnd = "\n\n=== END OF TRANSCRIPT ===\n";
+      expect(text[1]!.split(pinnedBegin)).toHaveLength(2);
+      const pinnedBodyAndCloser = text[1]!.split(pinnedBegin)[1]!;
+      expect(pinnedBodyAndCloser.split(pinnedEnd)).toHaveLength(2);
+      expect(text[1]!.split(canonical)).toHaveLength(2);
+      const recentMarker = "--- Recent context (verbatim) ---\n";
+      expect(built.seed.split(recentMarker)).toHaveLength(2);
+      expect(text[2]!.split(recentMarker)).toHaveLength(2);
+      // Observable contract only: a typed implementation may bypass the old splitter.
+      expect({
+        getter: renderTranscriptMessages(reads[0]!.value as readonly TranscriptMessage[]),
+        partition: { older: built.summarizedTurns, recent: built.keptTurns },
+        summaryInput: text[0],
+        pinnedInput: pinnedBodyAndCloser.slice(0, pinnedBodyAndCloser.indexOf(pinnedEnd)),
+        builtRecent: built.seed.split(recentMarker)[1],
+        submittedRecent: text[2]!.split(recentMarker)[1],
+      }).toEqual({
+        getter: canonical,
+        partition: { older: 1, recent: 2 },
+        summaryInput: `${template}\n\nConversation Transcript:\n${older}`,
+        pinnedInput: canonical,
+        builtRecent: recent,
+        submittedRecent: recent,
+      });
+      completedBody = true;
+    } catch (error) {
+      primary = { error };
+    }
+
+    try { await h.close(); }
+    catch (error) { cleanupOutcomes.push({ phase: "consumer-close", error }); }
+    let starts: any[] | undefined;
+    try { starts = h.records(h.lifecycle).filter(row => row.event === "start"); }
+    catch (error) { cleanupOutcomes.push({ phase: "lifecycle-records", error }); }
+    if (starts) {
+      if (completedBody) {
+        try {
+          expect(starts).toHaveLength(4); // One actual getter child plus three consumer runtimes.
+          expect(new Set(starts.map(row => `${row.pid}/${row.start}`)).size).toBe(4);
+        } catch (error) { cleanupOutcomes.push({ phase: "completed-start-inventory", error }); }
+      }
+      if (process.platform === "linux") for (const start of starts) {
+        try {
+          expect(start.start).toEqual(expect.any(String));
+          expect(readProcessIdentity(start.pid, true)?.started).not.toBe(`linux:${start.start}`);
+        } catch (error) { cleanupOutcomes.push({ phase: "captured-start-retirement", error }); }
+      }
+    }
+    if (primary !== undefined) {
+      if (cleanupOutcomes.length) {
+        throw Object.assign(new AggregateError(
+          [primary.error, ...cleanupOutcomes.map(outcome => outcome.error)],
+          "Compaction composition body and cleanup outcomes", { cause: primary.error },
+        ), { cleanupOutcomes });
+      }
+      throw primary.error;
+    }
+    if (cleanupOutcomes.length) {
+      throw Object.assign(new AggregateError(
+        cleanupOutcomes.map(outcome => outcome.error), "Compaction composition cleanup outcomes",
+      ), { cleanupOutcomes });
+    }
+  });
+});
+
+
+describe("typed compaction no-history contract", () => {
+  it.each([
+    { name: "empty array", messages: [] as readonly TranscriptMessage[], expectedPrompts: 0 },
+    { name: "one zero-length message", messages: [{ role: "User", text: "" }] as readonly TranscriptMessage[], expectedPrompts: 2 },
+    { name: "one whitespace-only message", messages: [{ role: "User", messageId: "", text: " \t\n" }] as readonly TranscriptMessage[], expectedPrompts: 2 },
+  ])("reads $name once without falling back to readable history", async ({ messages, expectedPrompts }) => {
+    const h = setup();
+    const orch = h.make() as any;
+    const readable = vi.fn(async () => { throw new Error("Typed history must not trigger a readable fallback"); });
+    const selected = vi.fn(async (_cwd: string, _sid: string) => messages);
+    const manager = { ...h.manager, getTranscript: readable, getCompactionTranscript: selected };
+    const seed = vi.spyOn(orch, "seedNewSession");
+    const original = h.store.get(h.record.id);
+    const built = await orch.buildDefaultCompactionSeed({
+      profile: h.profile, manager, agentId: h.profile.id, location: h.location, cwd: h.cwd,
+      sessionId: "live-session-untouched", restrictionChannelId: "parent",
+      bindingThread: { platform: "discord", id: "author", parentId: "parent" },
+    });
+    const seeded = built === null ? null : await orch.seedNewSession({
+      profile: h.profile, restrictionChannelId: "parent", cwd: h.cwd, location: h.location,
+      sessionId: h.record.id, model: MODEL, effort: "high", summary: built.seed,
+    });
+    expect(selected).toHaveBeenCalledExactlyOnceWith(h.cwd, "live-session-untouched");
+    expect(readable).not.toHaveBeenCalled();
+    expect(h.calls.prompts).toHaveLength(expectedPrompts);
+    if (messages.length === 0) {
+      expect(built).toBeNull();
+      expect(seeded).toBeNull();
+      expect(seed).not.toHaveBeenCalled();
+      expect(h.remoteSpawn).not.toHaveBeenCalled();
+      expect(h.mux.rpc).not.toHaveBeenCalled();
+    } else {
+      expect(built).toMatchObject({ keptTurns: 1, summarizedTurns: 0 });
+      expect(seeded).toBe("compaction-acp");
+      expect(seed).toHaveBeenCalledOnce();
+      const literal = `### User\n${messages[0]!.text}`;
+      const prompts = h.calls.prompts.map(row => row.prompt[0].text as string);
+      const begin = "=== BEGIN TRANSCRIPT DATA ===\n", end = "\n\n=== END OF TRANSCRIPT ===\n";
+      expect(prompts[0]!.split(begin)[1]!.split(end)[0]).toBe(literal);
+      expect(built.seed.endsWith(`--- Recent context (verbatim) ---\n${literal}`)).toBe(true);
+      expect(prompts[1]!.endsWith(built.seed)).toBe(true);
+      expect(prompts[1]!.split(built.seed)).toHaveLength(2);
+      expect(h.remoteSpawn).toHaveBeenCalledTimes(2);
+    }
+    expect(h.localSpawn).not.toHaveBeenCalled();
+    expect(h.store.get(h.record.id)).toEqual(original);
   });
 });

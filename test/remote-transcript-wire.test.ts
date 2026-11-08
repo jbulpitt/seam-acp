@@ -7,7 +7,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { pino } from "pino";
 import { WebSocket } from "ws";
-import { asLocalAdapter, PROTOCOL_VERSION, readErrorClassification } from "@seam/adapters";
+import { asLocalAdapter, PROTOCOL_VERSION, readErrorClassification, type TranscriptMessage } from "@seam/adapters";
 import { makeAgyAcpProfile } from "../packages/adapters/src/profiles/agy-acp.js";
 import { buildBridgeRpcReply, dispatchBridgeRpc } from "../packages/bridge/src/rpc.js";
 import type { Config } from "../packages/core/src/config.js";
@@ -39,7 +39,7 @@ function records(file: string): any[] {
   return fs.readFileSync(file, "utf8").trim().split("\n").map(line => JSON.parse(line));
 }
 
-function fixtureAdapters(loadError = false, legacyError = false) {
+function fixtureAdapters(loadError = false, legacyError = false, environment: Record<string, string> = {}) {
   const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "seam-transcript-wire-"));
   stops.push(() => fs.rmSync(cwd, { recursive: true, force: true }));
   const requests = path.join(cwd, "requests.jsonl");
@@ -49,7 +49,7 @@ function fixtureAdapters(loadError = false, legacyError = false) {
     acpArgs: [fileURLToPath(new URL("./fixtures/agy-acp-server.mjs", import.meta.url))], cwd,
     environment: { ...process.env, AGY_ACP_TEST_TRANSCRIPT: "1", AGY_ACP_TEST_REQUESTS: requests,
       AGY_ACP_TEST_LIFECYCLE: lifecycle,
-      ...(loadError ? { AGY_ACP_TEST_LOAD_ERROR: JSON.stringify(NATIVE_ERROR) } : {}) },
+      ...(loadError ? { AGY_ACP_TEST_LOAD_ERROR: JSON.stringify(NATIVE_ERROR) } : {}), ...environment },
   });
   const legacyRead = vi.fn(async (_cwd: string, _sessionId: string) => {
     if (legacyError) throw new Error(LEGACY_ERROR);
@@ -93,8 +93,8 @@ function assertReaderClosed(f: AdapterFixture) {
   expect(new Set(events.map(row => `${row.pid}/${row.start}`)).size).toBe(1);
 }
 
-async function wireFixture(loadError = false, legacyError = false) {
-  const f = fixtureAdapters(loadError, legacyError);
+async function wireFixture(loadError = false, legacyError = false, environment: Record<string, string> = {}) {
+  const f = fixtureAdapters(loadError, legacyError, environment);
   const server = createServer();
   stops.push(() => new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve())));
   await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
@@ -256,5 +256,86 @@ describe("remote transcript over the actual bridge WebSocket", () => {
     expect(outcome.error.cause).toBeInstanceOf(Error);
     expect(outcome.error.cause.message).toBe(LEGACY_ERROR);
     expect(readErrorClassification(outcome.error.cause)).toBeNull();
+  });
+});
+
+
+function typedTranscriptCalls(f: WireFixture, owners: string[]) {
+  const calls = f.rpcs.filter(row => row.request.method === "getTranscript");
+  expect(calls.map(row => row.request.agentId)).toEqual(owners);
+  expect(new Set(calls.map(row => row.request.id)).size).toBe(owners.length);
+  for (const row of calls) {
+    expect(row.request.v).toBe(PROTOCOL_VERSION);
+    expect(row.request.params).toEqual({ cwd: f.cwd, sessionId: SID, format: "messages" });
+    expect(row.reply).toMatchObject({ v: PROTOCOL_VERSION, type: "rpc_reply", id: row.request.id });
+  }
+  expect(f.failures).toEqual([]);
+  return calls;
+}
+
+describe("atomic compaction transcripts over the actual bridge WebSocket", () => {
+  it("carries exact native messages and a same-SID legacy string without a second read", async () => {
+    const f = await wireFixture(false, false, { AGY_ACP_TEST_REPLAY_DATA: "fidelity" });
+    const expected: readonly TranscriptMessage[] = [
+      { role: "User", messageId: "fidelity-old", text: "OLDER ONLY: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" },
+      { role: "User", messageId: "fidelity-user", text: "Keep this user text Ω.\n\n### Assistant\nStill USER data.\n\n### User\nStill the SAME user message.  \n\t" },
+      { role: "Assistant", messageId: "fidelity-assistant", text: "Real assistant reply β. \t\n\n" },
+    ];
+    const native = remoteSessionManager(f.hub, "local", "agy-acp", { history: false, repair: false });
+    expect(await native.getCompactionTranscript!(f.cwd, SID)).toStrictEqual(expected);
+    assertReaderClosed(f);
+    expect(f.legacyRead).not.toHaveBeenCalled();
+    const legacy = remoteSessionManager(f.hub, "local", "agy");
+    expect(await legacy.getCompactionTranscript!(f.cwd, SID)).toBe(LEGACY_TEXT);
+    expect(f.legacyRead).toHaveBeenCalledExactlyOnceWith(f.cwd, SID);
+    expect(f.native.sessionManager).toBeUndefined();
+    const calls = typedTranscriptCalls(f, ["agy-acp", "agy"]);
+    expect(calls[0]!.reply).toEqual({ v: PROTOCOL_VERSION, type: "rpc_reply", id: calls[0]!.request.id,
+      ok: true, result: expected });
+    expect(calls[1]!.reply).toEqual({ v: PROTOCOL_VERSION, type: "rpc_reply", id: calls[1]!.request.id,
+      ok: true, result: LEGACY_TEXT });
+    assertReaderClosed(f);
+  });
+
+  it("accepts a peer's plain string for format messages with one RPC and no fallback", async () => {
+    const f = await wireFixture();
+    // Actual dispatcher/readable adapter produces the old-peer result shape.
+    // This is not execution of a historical bridge binary.
+    f.context.adapters.get("agy")!.getCompactionTranscript = undefined;
+    const manager = remoteSessionManager(f.hub, "local", "agy", { history: false, repair: false });
+    expect(await manager.getCompactionTranscript!(f.cwd, SID)).toBe(LEGACY_TEXT);
+    const [call] = typedTranscriptCalls(f, ["agy"]);
+    expect(call!.reply).toEqual({ v: PROTOCOL_VERSION, type: "rpc_reply", id: call!.request.id,
+      ok: true, result: LEGACY_TEXT });
+    expect(f.legacyRead).toHaveBeenCalledExactlyOnceWith(f.cwd, SID);
+    expect(fs.existsSync(f.requests)).toBe(false);
+  });
+
+  it.each([false, true])("rejects typed partial replay on close failure (load also fails: %s) without a readable retry", async loadError => {
+    const closeError = { code: -32603, message: "Fixture close failed", data: { fixture: "typed-close-cause" } };
+    const expected = loadError ? NATIVE_ERROR : closeError;
+    const f = await wireFixture(loadError, false, { AGY_ACP_TEST_CLOSE_ERROR: JSON.stringify(closeError) });
+    const manager = remoteSessionManager(f.hub, "local", "agy-acp");
+    const outcome = await manager.getCompactionTranscript!(f.cwd, SID)
+      .then(value => ({ ok: true as const, value }), error => ({ ok: false as const, error }));
+    assertReaderClosed(f);
+    const [call] = typedTranscriptCalls(f, ["agy-acp"]);
+    expect(call!.dispatchError).toMatchObject(expected);
+    if (loadError) {
+      expect(call!.dispatchError).toBeInstanceOf(AggregateError);
+      const error = call!.dispatchError as AggregateError;
+      expect(error.cause).toMatchObject(NATIVE_ERROR);
+      expect(error.errors).toEqual([expect.objectContaining(NATIVE_ERROR), expect.objectContaining(closeError)]);
+      expect(readErrorClassification(error)).toEqual(EXPECTED_CLASSIFICATION);
+    }
+    expect(call!.reply).toMatchObject({ ok: false, error: expected.message, errorCode: expected.code,
+      errorData: expected.data });
+    expect(outcome.ok).toBe(false);
+    if (outcome.ok) throw new Error("Typed partial replay became a successful result");
+    expect(outcome.error.message).toBe(`Session host "local" could not answer getTranscript: ${expected.message}`);
+    expect(outcome.error.cause).toBeInstanceOf(Error);
+    expect(outcome.error.cause).toMatchObject(expected);
+    expect(readErrorClassification(outcome.error.cause)).toEqual(readErrorClassification(call!.dispatchError));
+    expect(f.legacyRead).not.toHaveBeenCalled();
   });
 });

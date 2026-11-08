@@ -23,20 +23,41 @@ without baking effort into the model id. The existing core applies them on
 new/load; no second persistence or reapplication mechanism is added.
 
 Errors use the existing AGY classifier with `agy-acp` ownership and retain
-their ACP code, message and data for core and bridge consumers. Established
+their ACP code, message and data at the direct adapter/core boundary. Established
 authentication failures reach the existing sign-in routing; unknown failures
-remain unclassified.
+remain unclassified. The existing management RPC transport carries error
+strings; structured error parity across that transport is not established.
 
 The catalog keeps the Antigravity brand and `google-antigravity` provider with
 a separate `agy-acp-stdio-v1` backend scope. Existing routing keys catalog and
 retained-session ownership by agent identity, so an `agy` binding does not
 become an `agy-acp` binding even if their ACP session ids match. Legacy `agy`
 invalidation still preserves its cascade id; `agy-acp` uses ordinary ACP
-invalidation. This adds no session-management implementation or migration.
+invalidation. No binding migration is added.
 Context remains unknown when no context metadata is supplied. Per-turn token
 totals are not converted to context occupancy. Image support in the catalog describes the
 agent's advertised ACP transport capability; it is not a live vision result
 for every advertised model.
+
+The native adapter's `getTranscript(cwd, sessionId)` uses a separate owned ACP
+connection to initialize, load the supplied session, collect matching-session
+user/assistant text replay, then negotiate close and end/reap the transport.
+It preserves Unicode, chunk order and supplied message boundaries, and renders
+the existing `### User` / `### Assistant` format. It sends no new-session,
+prompt, selector, list, fork or delete request. Thoughts, tools, non-text blocks
+and context counters are not part of this text-only transcript. Core's live
+replay suppression is unchanged.
+
+The getter uses the existing bounded collector, including its 45-second
+default and 1,000,000-byte stdout ceiling; these are collector bounds, not
+native history limits. Native RPC failures are retained through cleanup, and
+close/transport cleanup failures cannot yield a successful partial transcript.
+The existing mux's 30-second default wait remains a separate remote-transport
+limitation. No full session manager is advertised: clone/delete, raw rich
+history, list/browser semantics and active-session reader isolation still need
+their own evidence. In particular, absent manager metadata does not disable
+the orchestrator's remote transcript proxy or its AGY-prefix compaction path.
+Registration and compaction policy remain unchanged.
 
 ## Evidence and unresolved questions
 
@@ -72,6 +93,15 @@ accounts. An unresolved item is not an accepted feature gap.
   the existing failure path. The restart fixture uses a fake ACP agent through
   registered config-option profiles; it does not establish native AGY host
   restart parity or served-model identity.
+- **Owned native host recovery — observed separately:** the standard sessiond,
+  holder and adapter-child path recovered one disposable in-flight native
+  conversation after precisely owned process loss. It loaded the same ID,
+  reapplied Flash/high, completed original request7 once with the resumed MCP
+  literal and `end_turn`, then closed. Untouched load readback was Argon/medium.
+  This used an unregistered worktree inventory entry, passive byte observation,
+  a minimal Seam client and retryCount0; it is not full Discord/reboot,
+  production retry-policy or served-model proof. Earlier startup/worker-exit
+  failures retain their original outcomes and unknown causes.
 - **Cancellation — observed:** cancellation during an owned waiting MCP tool
   settled as cancelled, then the immediate next turn completed. Both native
   front processes exited with code zero. This is one scenario, not arbitrary
@@ -90,7 +120,9 @@ accounts. An unresolved item is not an accepted feature gap.
   remain distinct.
 - **Legacy sessions and management — unresolved:** mapping/cascade ids,
   high-water marks, history, list/clone/delete and compaction need an explicit
-  compatibility design. No existing user session was probed or migrated.
+  compatibility design. The text getter has non-live fixture coverage; native
+  transcript fidelity and a separate reader's load/close interaction with an
+  active session remain unverified. No existing user session was probed or migrated.
 - **Other inputs and lifecycle — unresolved:** image inputs/inspection,
   embedded resources, structured output, steering, elicitation, helpers,
   concurrent sessions and crash/disconnect recovery require separate evidence.
@@ -129,6 +161,12 @@ exact thought/context events and fixture ACP error passthrough. Bare fixture
 auth errors also pass through core classification into the existing sign-in
 decision; these tests do not establish new native error semantics. Its usage
 fixture deliberately differs from the prompt token totals.
+
+The transcript fixtures exercise the actual SDK child process and existing
+host adapter RPC dispatch, including legacy/native routing with the same ID,
+text/message boundaries, unrelated update exclusion, partial replay followed
+by RPC failure, cleanup failure and existing collector timeout/overflow paths.
+They do not exercise a real remote mux or establish native transcript fidelity.
 
 The live checks used disposable owned conversations and HTTP MCP fixtures;
 production/staging deployments and existing session data were not changed.

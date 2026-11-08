@@ -5,8 +5,39 @@ import os from "node:os";
 import path from "node:path";
 import { asLocalAdapter, invokeAdapterRpc, SESSION_HISTORY_CHUNK_BYTES, type SessionHistoryChunk } from "@seam/adapters";
 import { dispatchBridgeRpc } from "../packages/bridge/src/rpc.js";
+import { fileURLToPath } from "node:url";
+import { makeAgyAcpProfile } from "../packages/adapters/src/profiles/agy-acp.js";
 
 describe("remoteSessionManager", () => {
+  it("routes a native replay reader and legacy manager separately for the same session ID", async () => {
+    const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "seam-native-transcript-rpc-"));
+    const requests = path.join(cwd, "requests.jsonl");
+    const native = makeAgyAcpProfile({ defaultModel: "fixture-flash", cliPath: process.execPath,
+      acpArgs: [fileURLToPath(new URL("./fixtures/agy-acp-server.mjs", import.meta.url))], cwd,
+      environment: { ...process.env, AGY_ACP_TEST_TRANSCRIPT: "1", AGY_ACP_TEST_REQUESTS: requests } });
+    const legacyRead = vi.fn(async () => "legacy manager transcript");
+    const legacy = asLocalAdapter({ id: "agy", displayName: "Legacy fixture", defaultModel: "fixture-high",
+      spawn: () => { throw new Error("legacy transcript uses its manager"); },
+      sessionManager: { listSessions: async () => [], getTranscript: legacyRead,
+        cloneSession: async () => {}, deleteSession: async () => {} } });
+    const rpc = vi.fn(async (_location, method, params, agentId) => dispatchBridgeRpc(method, params, agentId, {
+      adapters: new Map([["agy", legacy], ["agy-acp", native]]), workspaceRoot: cwd, cwd,
+    }));
+    try {
+      const nativeManager = remoteSessionManager({ rpc } as any, "own-host", "agy-acp");
+      const legacyManager = remoteSessionManager({ rpc } as any, "own-host", "agy");
+      await expect(nativeManager.getTranscript(cwd, "same-id")).resolves.toBe(
+        "### User\nQuestion 🧪\nline\n\n### Assistant\nAnswer αβ\n\n### Assistant\nSeparate assistant\n\n### User\nNext\n\n### Assistant\nDone");
+      expect(legacyRead).not.toHaveBeenCalled();
+      await expect(legacyManager.getTranscript(cwd, "same-id")).resolves.toBe("legacy manager transcript");
+      expect(legacyRead).toHaveBeenCalledExactlyOnceWith(cwd, "same-id");
+      expect(rpc.mock.calls.map(row => row[3])).toEqual(["agy-acp", "agy"]);
+      expect(native.sessionManager).toBeUndefined();
+      expect(fs.readFileSync(requests, "utf8").trim().split("\n").map(row => JSON.parse(row).method))
+        .toEqual(["initialize", "session/load", "session/close"]);
+    } finally { fs.rmSync(cwd, { recursive: true, force: true }); }
+  });
+
   it.each(["local", "remote-host"])("reassembles %s's multi-chunk history without splitting Unicode", async location => {
     const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "seam-history-chunks-"));
     const history = path.join(cwd, "history.jsonl");

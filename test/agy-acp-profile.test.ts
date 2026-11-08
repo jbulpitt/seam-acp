@@ -5,7 +5,7 @@ import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
 import { normalizeCatalogCandidate } from "../packages/adapters/src/catalog-evidence.js";
 import { readErrorClassification } from "../packages/adapters/src/error-classification.js";
-import { makeAgyAcpProfile, AGY_ACP_ARGS } from "../packages/adapters/src/profiles/agy-acp.js";
+import { makeAgyAcpProfile, readAgyAcpTranscript, AGY_ACP_ARGS } from "../packages/adapters/src/profiles/agy-acp.js";
 import { makeAgyProfile } from "../packages/adapters/src/profiles/agy.js";
 import { controllerMetadataAdapter } from "../packages/core/src/agents/controller-metadata.js";
 import { AgentRuntime, type AgentEvent } from "../packages/core/src/agents/agent-runtime.js";
@@ -21,13 +21,13 @@ const fixture = fileURLToPath(new URL("./fixtures/agy-acp-server.mjs", import.me
 const dirs: string[] = [];
 const logger = { child() { return this; }, debug() {}, info() {}, warn() {}, error() {} } as unknown as Logger;
 afterEach(async () => { for (const dir of dirs.splice(0)) await rm(dir, { recursive: true, force: true }); });
-async function setup(newSessionError?: { code: number; message: string; data: Record<string, unknown> }) {
+async function setup(newSessionError?: { code: number; message: string; data: Record<string, unknown> }, environment = {}) {
   const dir = await mkdtemp(path.join(os.tmpdir(), "seam-agy-acp-test-")); dirs.push(dir);
   const requests = path.join(dir, "requests.jsonl");
   const profile = makeAgyAcpProfile({
     defaultModel: "fixture-deep", cliPath: process.execPath, acpArgs: [fixture], cwd: dir,
     environment: { ...process.env, AGY_ACP_TEST_REQUESTS: requests,
-      ...(newSessionError ? { AGY_ACP_TEST_NEW_ERROR: JSON.stringify(newSessionError) } : {}) },
+      ...(newSessionError ? { AGY_ACP_TEST_NEW_ERROR: JSON.stringify(newSessionError) } : {}), ...environment },
   });
   return { dir, requests, profile };
 }
@@ -177,5 +177,86 @@ describe("native AGY ACP integration", () => {
       { sessionId: "own-fixture-session", configId: "model", value: "fixture-deep" },
       { sessionId: "own-fixture-session", configId: "thought_level", value: "max" },
     ]);
+  });
+});
+
+describe("native ACP text transcript reader", () => {
+  const expected = "### User\nQuestion 🧪\nline\n\n### Assistant\nAnswer αβ\n\n### Assistant\nSeparate assistant\n\n### User\nNext\n\n### Assistant\nDone";
+  async function reader(environment: Record<string, string> = {}) {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "seam-agy-transcript-")); dirs.push(dir);
+    const requests = path.join(dir, "requests.jsonl"), lifecycle = path.join(dir, "lifecycle.jsonl");
+    const env = { ...process.env, AGY_ACP_TEST_TRANSCRIPT: "1", AGY_ACP_TEST_REQUESTS: requests,
+      AGY_ACP_TEST_LIFECYCLE: lifecycle, ...environment };
+    const launch = { cliPath: process.execPath, args: [fixture], cwd: dir, env, sessionId: "own-transcript" };
+    const profile = makeAgyAcpProfile({ defaultModel: "fixture-flash", cliPath: launch.cliPath,
+      acpArgs: launch.args, cwd: "/unused-default", environment: env });
+    return { dir, requests, lifecycle, launch, profile };
+  }
+  async function records(file: string) {
+    return (await readFile(file, "utf8")).trim().split("\n").map(line => JSON.parse(line));
+  }
+  async function closed(file: string, graceful = true) {
+    const events = await records(file);
+    if (graceful) expect(events.map(row => row.event)).toEqual(["start", "close", "eof", "exit"]);
+    const first = events[0];
+    expect(first.event).toBe("start");
+    if (process.platform === "linux") {
+      const actual = await readFile(`/proc/${first.pid}/stat`, "utf8").catch(() => "");
+      if (actual) {
+        const fields = actual.slice(actual.lastIndexOf(")") + 2).trim().split(/\s+/);
+        expect(fields[19] !== first.start || ["Z", "X"].includes(fields[0]!)).toBe(true);
+      }
+    }
+  }
+
+  it("returns exact matching-SID text/chunk/message boundaries through the adapter override, then closes and reaps", async () => {
+    const r = await reader();
+    expect(await r.profile.getTranscript(r.dir, r.launch.sessionId)).toBe(expected);
+    expect(r.profile.sessionManager).toBeUndefined();
+    const calls = await records(r.requests);
+    expect(calls.map(row => row.method)).toEqual(["initialize", "session/load", "session/close"]);
+    expect(calls[0].params).toEqual({ protocolVersion: 1, clientInfo: { name: "seam-acp", version: "0.1.0" }, clientCapabilities: {} });
+    expect(calls[1].params).toEqual({ sessionId: r.launch.sessionId, cwd: r.dir, mcpServers: [] });
+    await closed(r.lifecycle);
+  });
+
+  it("preserves a load error after partial replay and its separate close error", async () => {
+    const native = { code: -32603, message: "Fixture load failed", data: { status: 503, fixture: "load-cause" } };
+    const cleanup = { code: -32603, message: "Fixture close failed", data: { fixture: "close-cause" } };
+    const r = await reader({ AGY_ACP_TEST_LOAD_ERROR: JSON.stringify(native), AGY_ACP_TEST_CLOSE_ERROR: JSON.stringify(cleanup) });
+    const error = await r.profile.getTranscript(r.dir, r.launch.sessionId).catch(error => error);
+    expect(error).toMatchObject(native);
+    expect(error).toBeInstanceOf(AggregateError);
+    expect(error.errors).toEqual([expect.objectContaining(native), expect.objectContaining(cleanup)]);
+    expect(readErrorClassification(error)).toMatchObject({ agentId: "agy-acp", errorKind: "overloaded" });
+    await closed(r.lifecycle);
+  });
+
+  it("does not return replayed text as success when supported close fails", async () => {
+    const native = { code: -32603, message: "Fixture close failed", data: { fixture: "close-cause" } };
+    const r = await reader({ AGY_ACP_TEST_CLOSE_ERROR: JSON.stringify(native) });
+    await expect(r.profile.getTranscript(r.dir, r.launch.sessionId)).rejects.toMatchObject(native);
+    await closed(r.lifecycle);
+  });
+
+  it("retains an initialization RPC error and ends the transport without attempting load/close", async () => {
+    const native = { code: -32000, message: "Authentication required", data: { fixture: "init-cause" } };
+    const r = await reader({ AGY_ACP_TEST_INIT_ERROR: JSON.stringify(native) });
+    const error = await r.profile.getTranscript(r.dir, r.launch.sessionId).catch(error => error);
+    expect(error).toMatchObject(native);
+    expect(readErrorClassification(error)).toMatchObject({ agentId: "agy-acp", errorKind: "auth_required" });
+    expect((await records(r.requests)).map(row => row.method)).toEqual(["initialize"]);
+    expect((await records(r.lifecycle)).map(row => row.event)).toEqual(["start", "eof", "exit"]);
+  });
+
+  it.each([
+    { environment: { AGY_ACP_TEST_LOAD_HANG: "1" }, code: "timeout" },
+    { environment: { AGY_ACP_TEST_LOAD_HANG: "1", AGY_ACP_TEST_LOAD_OVERFLOW: "1" }, code: "output_overflow" },
+  ])("retains the existing $code lifecycle failure and reaps after partial replay", async ({ environment, code }) => {
+    const r = await reader(environment);
+    const error = await readAgyAcpTranscript({ ...r.launch, timeoutMs: 1000 }).catch(error => error);
+    expect(error).toMatchObject({ code });
+    expect(readErrorClassification(error)).toMatchObject({ agentId: "agy-acp" });
+    await closed(r.lifecycle, code !== "output_overflow");
   });
 });

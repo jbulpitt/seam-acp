@@ -3,6 +3,7 @@ import { Readable, Writable } from "node:stream";
 import {
   ClientSideConnection,
   PROTOCOL_VERSION,
+  RequestError,
   ndJsonStream,
   type Client,
   type SessionConfigOption,
@@ -45,6 +46,93 @@ function select(options: SessionConfigOption[], id: string) {
 
 function choices(option: ReturnType<typeof select>): SessionConfigSelectOption[] {
   return option?.options.flatMap((entry) => "options" in entry ? entry.options : [entry]) ?? [];
+}
+
+/** Read text replay without exposing it as a live turn or a full session manager. */
+export async function readAgyAcpTranscript(opts: AgyAcpLaunch & {
+  sessionId: string;
+  signal?: AbortSignal;
+  timeoutMs?: number;
+}): Promise<string> {
+  const turns: Array<{ role: string; messageId?: string | null; text: string }> = [];
+  let operationError: { error: unknown } | undefined;
+  const cleanupErrors: unknown[] = [];
+  try {
+    await runBoundedProbe({
+      executable: opts.cliPath, args: opts.args, cwd: opts.cwd, env: opts.env,
+      signal: opts.signal, timeoutMs: opts.timeoutMs, processGroup: true,
+      spawnOverride: () => spawn(opts.cliPath, [...opts.args], {
+        cwd: opts.cwd, env: opts.env, stdio: ["pipe", "pipe", "pipe"], detached: true,
+      }),
+      label: "Antigravity native ACP transcript",
+      run: async (handle) => {
+        let replaying = false, loadAttempted = false, canClose = false;
+        const connection = new ClientSideConnection(() => ({
+          async sessionUpdate({ sessionId, update }) {
+            if (!replaying || sessionId !== opts.sessionId ||
+              (update.sessionUpdate !== "user_message_chunk" && update.sessionUpdate !== "agent_message_chunk") ||
+              update.content.type !== "text") return;
+            const role = update.sessionUpdate === "user_message_chunk" ? "User" : "Assistant";
+            const previous = turns.at(-1);
+            if (!previous || previous.role !== role || (update.messageId && previous.messageId !== update.messageId)) {
+              turns.push({ role, messageId: update.messageId, text: update.content.text });
+            } else previous.text += update.content.text;
+          },
+          async requestPermission() { return { outcome: { outcome: "cancelled" as const } }; },
+        } satisfies Client), ndJsonStream(
+          Writable.toWeb(handle.stdin) as WritableStream<Uint8Array>,
+          Readable.toWeb(handle.stdout) as ReadableStream<Uint8Array>,
+        ));
+        // The shared collector drains close steps but does not report their errors.
+        handle.onClose(async (signal) => {
+          if (!loadAttempted || !canClose) return;
+          try { await agyWait(connection.closeSession({ sessionId: opts.sessionId }), signal); }
+          catch (error) { cleanupErrors.push(error); }
+        }, "session");
+        handle.onClose(async (signal) => {
+          try { handle.stdin.end(); await agyWait(connection.closed, signal); }
+          catch (error) { cleanupErrors.push(error); }
+        }, "connection");
+        try {
+          const init = await agyWait(connection.initialize({
+            protocolVersion: PROTOCOL_VERSION,
+            clientInfo: { name: "seam-acp", version: "0.1.0" }, clientCapabilities: {},
+          }), handle.signal);
+          canClose = init.agentCapabilities?.sessionCapabilities?.close != null;
+          if (!init.agentCapabilities?.loadSession) throw RequestError.methodNotFound("session/load");
+          replaying = true;
+          loadAttempted = true;
+          await agyWait(connection.loadSession({ sessionId: opts.sessionId, cwd: opts.cwd, mcpServers: [] }), handle.signal);
+        } catch (error) {
+          // Preserve the RPC error until after the collector has reaped its child.
+          operationError = { error };
+        } finally { replaying = false; }
+      },
+    });
+  } catch (error) {
+    // Lifecycle failures, including not_reaped, must not become a successful read.
+    if (error instanceof Error && (operationError || cleanupErrors.length)) {
+      error.cause = new AggregateError([
+        ...(operationError ? [operationError.error] : []), ...cleanupErrors,
+      ], "Transcript operation and cleanup outcomes");
+    }
+    classifyAndAttach(error, classifyAgyError(error, "agy-acp"));
+    throw error;
+  }
+  if (operationError || cleanupErrors.length) {
+    const original = operationError ? operationError.error : cleanupErrors[0];
+    let error = original;
+    if (operationError && cleanupErrors.length) {
+      error = Object.assign(new AggregateError([original, ...cleanupErrors],
+        original instanceof Error ? original.message : String(original), { cause: original }), {
+        code: (original as { code?: unknown })?.code,
+        data: (original as { data?: unknown })?.data,
+      });
+    }
+    classifyAndAttach(error, classifyAgyError(error, "agy-acp"));
+    throw error;
+  }
+  return turns.map(turn => `### ${turn.role}\n${turn.text}`).join("\n\n");
 }
 
 /** Metadata only: inspect each model's own selector; never send a prompt. */
@@ -139,7 +227,7 @@ export function makeAgyAcpProfile(opts: {
   const environment = () => ({ ...(opts.environment ?? process.env) });
   const credentialProfile = opts.credentialProfile ?? "antigravity-oauth:default";
   const scope = { provider: "google-antigravity", backend: AGY_ACP_BACKEND, credentialProfile };
-  return asLocalAdapter({
+  const profile = asLocalAdapter({
     id: "agy-acp",
     brand: "antigravity",
     displayName: "Antigravity",
@@ -184,4 +272,8 @@ export function makeAgyAcpProfile(opts: {
       });
     },
   });
+  profile.getTranscript = (sessionCwd, sessionId) => readAgyAcpTranscript({
+    cliPath, args, cwd: sessionCwd, env: environment(), sessionId,
+  });
+  return profile;
 }

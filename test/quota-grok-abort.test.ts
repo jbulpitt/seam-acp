@@ -11,9 +11,13 @@
  * caller believes it has a bound it does not have. So these tests assert the
  * work stops, not that the wait stops — the child has to actually die.
  */
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { createAgentQuotaSources } from "./quota-source-fixture.js";
 import fs from "node:fs";
+import { performance } from "node:perf_hooks";
+import { setTimeout as realTimeout, clearTimeout as realClearTimeout } from "node:timers";
+import { setTimeout as delay } from "node:timers/promises";
+import { readProcessIdentity, terminateProcessGroup, type ProcessIdentity } from "@seam/adapters/process-group";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -63,7 +67,7 @@ function stageHangingGrok(): { cliPath: string; signalLog: string; methodLog: st
 
 /** The pid the fixture recorded when it received `initialize`. */
 async function spawnedPid(methodLog: string, timeoutMs = 4_000): Promise<number> {
-  const deadline = Date.now() + timeoutMs;
+  const deadline = performance.now() + timeoutMs;
   for (;;) {
     if (fs.existsSync(methodLog)) {
       const lines = fs.readFileSync(methodLog, "utf8").trim().split("\n").filter(Boolean);
@@ -71,8 +75,33 @@ async function spawnedPid(methodLog: string, timeoutMs = 4_000): Promise<number>
         .find((entry) => entry.method === "initialize");
       if (row) return row.pid;
     }
-    if (Date.now() >= deadline) throw new Error("fixture never recorded an initialize");
-    await new Promise((resolve) => setTimeout(resolve, 25));
+    if (performance.now() >= deadline) throw new Error("fixture never recorded an initialize");
+    await delay(25);
+  }
+}
+
+async function finishRefresh(poller: AgentQuotaPoller, owned: ProcessIdentity | undefined, failed: boolean): Promise<void> {
+  vi.useRealTimers();
+  const errors: unknown[] = [];
+  // Cleanup follows the assertions, including a failed retirement assertion.
+  try {
+    poller.stop();
+    if (owned && !await terminateProcessGroup(owned)) throw new Error("Grok fixture group did not retire");
+  } catch (error) { errors.push(error); }
+  let timer: ReturnType<typeof realTimeout> | undefined;
+  try {
+    await Promise.race([
+      poller.drain(),
+      new Promise<never>((_resolve, reject) => {
+        timer = realTimeout(() => reject(new Error("Grok fixture work did not drain")), 4_000);
+      }),
+    ]);
+  } catch (error) { errors.push(error); }
+  finally { if (timer) realClearTimeout(timer); }
+  if (errors.length) {
+    const error = new AggregateError(errors, "Grok fixture cleanup failed");
+    if (failed) console.error(error);
+    else throw error;
   }
 }
 
@@ -100,18 +129,32 @@ describe("#349 an aborted Grok quota refresh cancels the work", () => {
       staleRetentionMs: 0,
     });
 
-    const refresh = poller.refreshAll(true);
-    const pid = await spawnedPid(methodLog);
-    expect(alive(pid)).toBe(true);
+    let owned: ProcessIdentity | undefined;
+    let failed = false;
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    try {
+      const refresh = poller.refreshAll(true);
+      const pid = await spawnedPid(methodLog);
+      owned = readProcessIdentity(pid);
+      expect(owned).toMatchObject({ pid, pgid: pid });
+      expect(alive(pid)).toBe(true);
 
-    const result = await refresh;
-    expect(result.sources[0]).toMatchObject({ agentId: "grok", outcome: "timed_out" });
+      await vi.advanceTimersByTimeAsync(300);
+      const result = await refresh;
+      vi.useRealTimers();
+      expect(result.sources[0]).toMatchObject({ agentId: "grok", outcome: "timed_out" });
 
-    // THE assertion. Reverting the fix leaves this process running for the
-    // remaining ~29.7s of its own `initialize` bound, long after the poller
-    // reported the refusal — the caller stopped, the work did not.
-    await expect.poll(() => alive(pid), { timeout: 4_000, interval: 25 }).toBe(false);
-    expect(fs.readFileSync(signalLog, "utf8")).toContain("SIGTERM");
+      // THE assertion. Reverting the fix leaves this process running for the
+      // remaining ~29.7s of its own `initialize` bound, long after the poller
+      // reported the refusal — the caller stopped, the work did not.
+      await expect.poll(() => alive(pid), { timeout: 4_000, interval: 25 }).toBe(false);
+      expect(fs.readFileSync(signalLog, "utf8")).toContain("SIGTERM");
+    } catch (error) {
+      failed = true;
+      throw error;
+    } finally {
+      await finishRefresh(poller, owned, failed);
+    }
   }, 20_000);
 
   it("refuses only Grok: every other source still reports in the same refresh", async () => {
@@ -137,23 +180,38 @@ describe("#349 an aborted Grok quota refresh cancels the work", () => {
       staleRetentionMs: 0,
     });
 
-    const refresh = poller.refreshAll(true);
-    const pid = await spawnedPid(methodLog);
-    const result = await refresh;
-    await expect.poll(() => alive(pid), { timeout: 4_000, interval: 25 }).toBe(false);
+    let owned: ProcessIdentity | undefined;
+    let failed = false;
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    try {
+      const refresh = poller.refreshAll(true);
+      const pid = await spawnedPid(methodLog);
+      owned = readProcessIdentity(pid);
+      expect(owned).toMatchObject({ pid, pgid: pid });
+      expect(alive(pid)).toBe(true);
+      await vi.advanceTimersByTimeAsync(300);
+      const result = await refresh;
+      vi.useRealTimers();
+      await expect.poll(() => alive(pid), { timeout: 4_000, interval: 25 }).toBe(false);
 
-    const byAgent = new Map(result.sources.map((row) => [row.agentId, row]));
-    expect(byAgent.get("grok")).toMatchObject({ outcome: "timed_out" });
-    // Claude ran, completed, and is readable from the registry — the poller
-    // itself is intact and a second agent's answer was not collateral.
-    expect(healthyCalls).toBe(1);
-    expect(byAgent.get("claude")).toMatchObject({ outcome: "refreshed" });
-    expect(registry.get("claude")?.ok).toBe(true);
+      const byAgent = new Map(result.sources.map((row) => [row.agentId, row]));
+      expect(byAgent.get("grok")).toMatchObject({ outcome: "timed_out" });
+      // Claude ran, completed, and is readable from the registry — the poller
+      // itself is intact and a second agent's answer was not collateral.
+      expect(healthyCalls).toBe(1);
+      expect(byAgent.get("claude")).toMatchObject({ outcome: "refreshed" });
+      expect(registry.get("claude")?.ok).toBe(true);
 
-    // And Grok remains a usable agent: the refusal carries a quota row that
-    // says it cannot be told, not an exception that removes the source.
-    expect(byAgent.get("grok")?.quota.ok).toBe(false);
-    expect(registry.get("grok")?.agentId).toBe("grok");
+      // And Grok remains a usable agent: the refusal carries a quota row that
+      // says it cannot be told, not an exception that removes the source.
+      expect(byAgent.get("grok")?.quota.ok).toBe(false);
+      expect(registry.get("grok")?.agentId).toBe("grok");
+    } catch (error) {
+      failed = true;
+      throw error;
+    } finally {
+      await finishRefresh(poller, owned, failed);
+    }
   }, 20_000);
 
   it("does not spawn at all for a refresh that was already abandoned", async () => {

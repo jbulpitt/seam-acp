@@ -258,7 +258,7 @@ describe("#573 seam-sessiond control-plane restart", () => {
 
   it("reports a child that dies while unattached as a dead retained entry", async () => {
     const { socketPath, client } = await harness();
-    await client.spawn({
+    const { pid } = await client.spawn({
       slot: 3,
       executable: process.execPath,
       args: ["-e", 'setTimeout(() => { process.stdout.write("last\\n"); process.exit(7); }, 80)'],
@@ -266,16 +266,28 @@ describe("#573 seam-sessiond control-plane restart", () => {
       env: { PATH: process.env.PATH ?? "" },
     });
     client.close();
-    await delay(180);
+    await waitFor(() => {
+      if (readSessiondProcessIdentity(pid, true)) return undefined;
+      try { process.kill(pid, 0); }
+      catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "ESRCH") return true;
+        throw error;
+      }
+      return undefined;
+    });
 
     const replacement = await SessiondClient.connect(socketPath);
     clients.push(replacement);
+    const replay = await waitForAsync(async () => {
+      const output = await replacement.replayOutput({ slot: 3, afterSeq: 0 });
+      return output.frames.some((frame) => frame.stream === "exit") ? output : undefined;
+    });
+    expect(replay.frames.find((frame) => frame.stream === "exit")).toMatchObject({ code: 7, signal: null });
     const listed = await replacement.listSlots();
     expect(listed.slots).toEqual([3]);
     expect(listed.health).toEqual([
       expect.objectContaining({ slot: 3, alive: false, attached: true, exitCode: 7 }),
     ]);
-    const replay = await replacement.replayOutput({ slot: 3, afterSeq: 0 });
     expect(replay.frames.map((frame) => frame.stream)).toEqual(["stdout", "exit"]);
     expect(Buffer.from(replay.frames[0]!.dataBase64!, "base64").toString()).toBe("last\n");
   });

@@ -6,9 +6,16 @@ import { afterEach, describe, expect, it } from "vitest";
 import { normalizeCatalogCandidate } from "../packages/adapters/src/catalog-evidence.js";
 import { readErrorClassification } from "../packages/adapters/src/error-classification.js";
 import { makeAgyAcpProfile, AGY_ACP_ARGS } from "../packages/adapters/src/profiles/agy-acp.js";
+import { makeAgyProfile } from "../packages/adapters/src/profiles/agy.js";
+import { controllerMetadataAdapter } from "../packages/core/src/agents/controller-metadata.js";
 import { AgentRuntime, type AgentEvent } from "../packages/core/src/agents/agent-runtime.js";
+import { ModelCatalogService } from "../packages/core/src/core/model-catalog/service.js";
+import { ModelCatalogStore } from "../packages/core/src/core/model-catalog/store.js";
 import { negotiateReauth } from "../packages/core/src/core/reauth-negotiation.js";
+import { SessionRouter } from "../packages/core/src/core/session-router.js";
+import { SessionStore } from "../packages/core/src/core/session-store.js";
 import type { Logger } from "../packages/core/src/lib/logger.js";
+import { createOrdinaryAgyFixture } from "./helpers/agy-runtime-fixture.js";
 
 const fixture = fileURLToPath(new URL("./fixtures/agy-acp-server.mjs", import.meta.url));
 const dirs: string[] = [];
@@ -28,16 +35,23 @@ async function setup(newSessionError?: { code: number; message: string; data: Re
 describe("native AGY ACP integration", () => {
   it("defaults to process-per-session arguments and a separate catalog backend", () => {
     expect(AGY_ACP_ARGS).toEqual(["acp", "--process-per-session"]);
-    expect(makeAgyAcpProfile({ defaultModel: "configured-model" }).catalog.scope().backend).toBe("agy-acp-stdio-v1");
+    const profile = makeAgyAcpProfile({ defaultModel: "configured-model" });
+    expect(profile).toMatchObject({ id: "agy-acp", brand: "antigravity" });
+    expect(profile.catalog.scope()).toMatchObject({ provider: "google-antigravity", backend: "agy-acp-stdio-v1" });
   });
 
-  it.each([
+  const wireErrors = [
     { code: -32000, message: "Authentication required", data: { fixture: "auth" }, kind: "auth_required", action: "park" },
     { code: -32603, message: "Fixture upstream unavailable", data: { status: 503, fixture: "server" }, kind: "overloaded", action: "inconclusive" },
     { code: -32603, message: "The Antigravity process serving this session exited unexpectedly", data: { fixture: "worker" }, kind: "unclassified", action: "inconclusive" },
-  ])("routes $kind from a bare ACP error through core without losing its cause", async ({ kind, action, ...wireError }) => {
+  ];
+  it.each(wireErrors.flatMap(error => ["local", "controller"].map(owner => ({ ...error, owner }))))(
+    "routes $kind from a bare ACP error through $owner core without losing its cause", async ({ kind, action, owner, ...wireError }) => {
     const { profile, dir } = await setup(wireError);
-    const runtime = new AgentRuntime({ profile, logger, spawnFn: () => profile.spawn() });
+    const client = owner === "controller"
+      ? controllerMetadataAdapter({ id: profile.id, catalog: profile.catalog })
+      : profile;
+    const runtime = new AgentRuntime({ profile: client, logger, spawnFn: () => profile.spawn() });
     try {
       await runtime.start();
       const error = await runtime.newSession({ cwd: dir }).then(
@@ -45,7 +59,7 @@ describe("native AGY ACP integration", () => {
         error => error,
       );
       expect(error).toMatchObject({ code: wireError.code, message: wireError.message, data: wireError.data });
-      expect(readErrorClassification(error)).toMatchObject({ agentId: "agy", errorKind: kind });
+      expect(readErrorClassification(error)).toMatchObject({ agentId: "agy-acp", errorKind: kind });
       expect(negotiateReauth({ ...readErrorClassification(error), message: error.message }).action).toBe(action);
     } finally { await runtime.dispose(); }
   });
@@ -54,11 +68,68 @@ describe("native AGY ACP integration", () => {
     const profile = makeAgyAcpProfile({ defaultModel: "fixture-flash" });
     const cause = new Error("Fixture cause");
     const error = Object.assign(new Error("Authentication required", { cause }), {
-      data: { agentId: "agy", errorKind: "rate_limit", fixture: "preserved" },
+      data: { agentId: "agy-acp", errorKind: "rate_limit", fixture: "preserved" },
     });
-    expect(profile.classifyError!(error)).toMatchObject({ agentId: "agy", errorKind: "rate_limit" });
+    expect(profile.classifyError!(error)).toMatchObject({ agentId: "agy-acp", errorKind: "rate_limit" });
     expect(error.cause).toBe(cause);
-    expect(error.data).toMatchObject({ agentId: "agy", errorKind: "rate_limit", fixture: "preserved" });
+    expect(error.data).toMatchObject({ agentId: "agy-acp", errorKind: "rate_limit", fixture: "preserved" });
+  });
+
+  it("keeps legacy and ACP catalog, retained-session and invalidation ownership separate", async () => {
+    const { profile: native, dir } = await setup();
+    const fixture = createOrdinaryAgyFixture({
+      cwd: dir, environment: { FAKE_AGY_MODELS: "fixture-flash-high\tFixture Flash (High)\n" },
+    });
+    const legacy = makeAgyProfile({ runtime: fixture.runtime, dataDir: dir, defaultModel: "fixture-flash-high" });
+    const store = new SessionStore(":memory:");
+    const catalogStore = new ModelCatalogStore(":memory:");
+    const bindings = [{ agentId: "agy", location: "local" }, { agentId: "agy-acp", location: "local" }];
+    const catalog = new ModelCatalogService({
+      store: catalogStore, logger, bindings: () => bindings,
+      scope: binding => router.getProfile(binding.agentId)!.catalog.scope(),
+      fetch: binding => router.getProfile(binding.agentId)!.catalog.fetch(),
+    });
+    const router = new SessionRouter({ logger, store, profiles: [legacy, native], modelCatalog: catalog,
+      defaultAgentId: "agy", defaultModel: "fixture-flash-high" });
+    try {
+      expect(router.getProfile("agy")).toBe(legacy);
+      expect(router.getProfile("agy-acp")).toBe(native);
+      expect(router.getProfile("agy")!.effort?.mechanism).toBe("modelBaked");
+      expect(router.getProfile("agy")!.sessionManager).toBe(legacy.sessionManager);
+      expect(legacy.sessionManager).toBeDefined();
+      expect(router.getProfile("agy-acp")!.sessionManager).toBeUndefined();
+      expect(router.getProfile("agy-acp")!.effort).toMatchObject({ mechanism: "configOption", configId: "thought_level" });
+      for (const binding of bindings) expect((await catalog.refresh(binding)).result).toBe("published");
+      expect(catalog.models(bindings[0]!).map(row => row.id)).toEqual(["fixture-flash-high"]);
+      expect(catalog.models(bindings[1]!).map(row => row.id)).toEqual(["fixture-flash", "fixture-deep", "fixture-fixed"]);
+      expect(catalog.lookup(bindings[0]!).snapshot!.scopeKey).not.toBe(catalog.lookup(bindings[1]!).snapshot!.scopeKey);
+      expect(catalog.lookup(bindings[0]!).snapshot!.candidate.scope.backend).toBe("agy-native-language-server-v1");
+      expect(catalog.lookup(bindings[1]!).snapshot!.candidate.scope.backend).toBe("agy-acp-stdio-v1");
+      for (const client of [legacy, controllerMetadataAdapter({ id: legacy.id, catalog: legacy.catalog })]) {
+        const error = Object.assign(new Error("Authentication required"), { code: -32000, data: { fixture: "legacy" } });
+        expect(client.classifyError!(error)).toMatchObject({ agentId: "agy", errorKind: "auth_required" });
+        expect(error).toMatchObject({ code: -32000, message: "Authentication required", data: { fixture: "legacy" } });
+      }
+
+      const now = new Date().toISOString();
+      const records = bindings.map(({ agentId }) => ({ id: `discord:${agentId}`, platform: "discord",
+        channelRef: agentId, parentRef: null, agentId, acpSessionId: "same-acp-id", repoPath: dir,
+        configJson: "{}", createdUtc: now, updatedUtc: now }));
+      for (const record of records) store.upsert(record);
+      for (const record of records) {
+        const slot = { slot: 1, alive: true, pid: 99, lastStdoutMsAgo: 0, lastStdinMsAgo: 0,
+          session: { agentId: record.agentId, acpSessionId: "same-acp-id", busy: false, updatedUtc: now } };
+        expect(router.retainedSlotSession("local", slot)?.id).toBe(record.id);
+        expect(router.retainedSlotSession("local", { ...slot,
+          session: { ...slot.session, threadId: record.agentId === "agy" ? "agy-acp" : "agy" } })).toBeNull();
+        await router.invalidate(record.id, { clearAcpSession: true,
+          bindingChange: { source: "operator-session-reset", cause: "fixture requested binding clear" } });
+      }
+      expect(store.get(records[0]!.id)!.acpSessionId).toBe("same-acp-id");
+      expect(store.get(records[1]!.id)!.acpSessionId).toBe("");
+    } finally {
+      catalog.stop(); catalogStore.close(); store.close(); fixture.cleanup();
+    }
   });
 
   it("discovers model-specific effort over real ACP, retaining unknown context instead of token estimates", async () => {

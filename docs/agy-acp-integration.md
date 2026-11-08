@@ -1,9 +1,10 @@
 # Built-in AGY ACP integration
 
 This is the native `agy acp` integration under [#1098](https://github.com/jbulpitt/seam-acp/issues/1098).
-`makeAgyAcpProfile` is exported for integration and validation. The existing
-`makeAgyProfile` registration, managed executable pins and deployed sessions
-have not switched. Switchover is a separate decision.
+`makeAgyAcpProfile` is exported as the separate, unregistered `agy-acp` identity
+for integration and validation. The existing `agy` identity still uses
+`makeAgyProfile`; its registration, managed executable pins and deployed
+sessions have not switched. Activation is a separate decision.
 
 ## Adapter path
 
@@ -21,13 +22,19 @@ into a default. Canonical model ids and `thought_level` values pass through
 without baking effort into the model id. The existing core applies them on
 new/load; no second persistence or reapplication mechanism is added.
 
-Errors use the existing AGY classifier and retain their ACP code, message and
-data for core and bridge consumers. Established authentication failures reach
-the existing sign-in routing; unknown failures remain unclassified.
+Errors use the existing AGY classifier with `agy-acp` ownership and retain
+their ACP code, message and data for core and bridge consumers. Established
+authentication failures reach the existing sign-in routing; unknown failures
+remain unclassified.
 
-The catalog has a separate `agy-acp-stdio-v1` backend scope. Context remains
-unknown when no context metadata is supplied. Per-turn token totals are not
-converted to context occupancy. Image support in the catalog describes the
+The catalog keeps the Antigravity brand and `google-antigravity` provider with
+a separate `agy-acp-stdio-v1` backend scope. Existing routing keys catalog and
+retained-session ownership by agent identity, so an `agy` binding does not
+become an `agy-acp` binding even if their ACP session ids match. Legacy `agy`
+invalidation still preserves its cascade id; `agy-acp` uses ordinary ACP
+invalidation. This adds no session-management implementation or migration.
+Context remains unknown when no context metadata is supplied. Per-turn token
+totals are not converted to context occupancy. Image support in the catalog describes the
 agent's advertised ACP transport capability; it is not a live vision result
 for every advertised model.
 

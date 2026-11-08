@@ -140,13 +140,13 @@ export function makeAgyAcpProfile(opts: {
   const credentialProfile = opts.credentialProfile ?? "antigravity-oauth:default";
   const scope = { provider: "google-antigravity", backend: AGY_ACP_BACKEND, credentialProfile };
   return asLocalAdapter({
-    id: "agy",
+    id: "agy-acp",
     brand: "antigravity",
     displayName: "Antigravity",
     defaultModel: opts.defaultModel,
     effort: { mechanism: "configOption", configId: "thought_level", levels: [] },
     classifyError(error: unknown) {
-      return classifyAndAttach(error, classifyAgyError(error));
+      return classifyAndAttach(error, classifyAgyError(error, "agy-acp"));
     },
     catalog: {
       scope: () => manifestCatalogScope(scope),

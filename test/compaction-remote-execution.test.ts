@@ -5,13 +5,16 @@ import { testSessionRouter } from "./helpers/session-fixture.js";
  * the assertion is which spawn ran. Same shape as #466.
  */
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { EventEmitter } from "node:events";
 import { PassThrough, Readable, Writable } from "node:stream";
 import { agent, methods, ndJsonStream, PROTOCOL_VERSION } from "@agentclientprotocol/sdk";
-import { classifyAgyError, type AgentProfile } from "@seam/adapters";
+import { classifyAgyError, readErrorClassification, readProcessIdentity, terminateProcessGroup,
+  type AgentProfile, type CatalogModel } from "@seam/adapters";
+import { makeAgyAcpProfile } from "../packages/adapters/src/profiles/agy-acp.js";
 import { pino } from "pino";
 import { Orchestrator } from "../packages/core/src/platforms/discord/orchestrator.js";
 import { SessionStore } from "../packages/core/src/core/session-store.js";
@@ -80,9 +83,9 @@ function setup(location = REMOTE) {
     isBridgeReady: vi.fn(() => true), onBridgeReady: vi.fn(() => () => {}),
     mcpServersForBridgeSpawn: vi.fn(() => remoteSeam),
     rpc: vi.fn(async () => ({})) };
-  const make = () => {
+  const make = (catalog = fixtureModelCatalog([profile])) => {
     const orch = new Orchestrator({ logger: silent, store, router: router as any, adapter: {} as any,
-      renderer: discordRenderer, modelCatalog: fixtureModelCatalog([profile]),
+      renderer: discordRenderer, modelCatalog: catalog,
       config: { DATA_DIR: cwd, REPOS_ROOT: cwd, TURN_TIMEOUT_SECONDS: 15,
         REPO_EMOJIS: new Map(), channelPresets: new Map(), threadPresets: new Map(),
         bridgePresets: new Map([[REMOTE, {}]]) } as any });
@@ -90,6 +93,68 @@ function setup(location = REMOTE) {
     return orch;
   };
   return { cwd, store, calls, localSpawn, remoteSpawn, localDelete, profile, record, manager, router, mux, hub, make, remoteSeam, location };
+}
+
+
+function nativeSeedSetup(location: string, newSessionError?: { code: number; message: string; data: Record<string, unknown> }) {
+  const h = setup(location);
+  const requests = path.join(h.cwd, "native-seed-requests.jsonl");
+  const promptStates = path.join(h.cwd, "native-seed-state.jsonl");
+  const execution = makeAgyAcpProfile({
+    defaultModel: "fixture-flash", cliPath: process.execPath,
+    acpArgs: [fileURLToPath(new URL("./fixtures/agy-acp-server.mjs", import.meta.url))], cwd: h.cwd,
+    environment: { ...process.env, AGY_ACP_TEST_REQUESTS: requests, AGY_ACP_TEST_PROMPT_STATE: promptStates,
+      ...(newSessionError ? { AGY_ACP_TEST_NEW_ERROR: JSON.stringify(newSessionError) } : {}) },
+  });
+  // Cache-owned metadata is independent of the profile's empty effort levels.
+  const flash: CatalogModel = {
+    id: "fixture-flash", runtimeId: "fixture-flash", displayName: "Fixture Flash", aliases: [], default: false,
+    context: { native: null, maximum: null, effective: null },
+    modalities: { input: ["text"], output: ["text"] }, visionMode: "none", availability: "available",
+    lifecycle: "stable", serviceTiers: [], pricingCategory: null, compatibility: null, applicationMode: "live",
+    effort: { mechanism: "configOption", configId: "thought_level", selectionDefault: "medium",
+      choices: [{ id: "low", raw: "low" }, { id: "medium", raw: "medium" }, { id: "high", raw: "high" }] },
+    bindings: [
+      { model: "fixture-flash", effort: "low", rawModel: "fixture-flash", rawEffort: "low" },
+      { model: "fixture-flash", effort: "medium", rawModel: "fixture-flash", rawEffort: "medium" },
+      { model: "fixture-flash", effort: "high", rawModel: "fixture-flash", rawEffort: "high" },
+    ],
+  };
+  // A different catalog default must not replace the existing profile default.
+  const fixed: CatalogModel = { ...flash, id: "fixture-fixed", runtimeId: "fixture-fixed", displayName: "Fixture Fixed",
+    default: true, effort: { mechanism: "none", choices: [{ id: "default" }], selectionDefault: "default" },
+    bindings: [{ model: "fixture-fixed", effort: "default", rawModel: "fixture-fixed" }] };
+  const rows = (binding: { agentId: string; location: string }) =>
+    binding.agentId === "agy-acp" && binding.location === location ? [flash, fixed] : [];
+  const catalog = Object.assign(fixtureModelCatalog([execution]), {
+    models: rows,
+    model: (binding: { agentId: string; location: string }, id: string) =>
+      rows(binding).find(row => id === "default" ? row.default : row.id === id) ?? null,
+  });
+  const actors: Array<{ child: ReturnType<typeof execution.spawn>;
+    identity: ReturnType<typeof readProcessIdentity>; closed: Promise<void> }> = [];
+  h.remoteSpawn.mockImplementation(() => {
+    const child = execution.spawn();
+    const identity = child.pid === undefined ? undefined : readProcessIdentity(child.pid, true);
+    const closed = new Promise<void>(resolve => child.once("close", () => resolve()));
+    actors.push({ child, identity, closed });
+    return Object.assign(child, { slot: actors.length - 1 });
+  });
+  const profile = { ...execution, spawn: h.localSpawn };
+  h.store.upsert({ ...h.record, agentId: "agy-acp" });
+  const original = h.store.get(h.record.id);
+  const records = (file: string) => readFileSync(file, "utf8").trim().split("\n").map(line => JSON.parse(line));
+  const close = async () => {
+    for (const actor of actors) {
+      actor.child.stdin.end();
+      const reaped = actor.identity ? await terminateProcessGroup(actor.identity) : false;
+      await actor.closed;
+      expect(actor.identity).toBeDefined();
+      expect(reaped).toBe(true);
+      expect(readProcessIdentity(actor.identity!.pid, true)?.started).not.toBe(actor.identity!.started);
+    }
+  };
+  return { ...h, profile, original, records, requests, promptStates, close, orch: h.make(catalog) as any };
 }
 
 describe("#480 compaction execution boundary", () => {
@@ -184,4 +249,60 @@ describe("#480 compaction execution boundary", () => {
     expect(h.remoteSpawn).toHaveBeenCalled();
     expect(h.hub.rpc).toHaveBeenCalled();
   });
+
+  it.each([
+    { name: "explicit model on remote host", location: REMOTE, model: "fixture-flash" },
+    { name: "inherited profile default on local host", location: "local", model: undefined },
+  ])("applies native thought_level high before the $name seed", async ({ location, model }) => {
+    const h = nativeSeedSetup(location);
+    try {
+      const seeded = await h.orch.seedNewSession({
+        profile: h.profile, restrictionChannelId: "parent", cwd: h.cwd, location,
+        sessionId: h.record.id, ...(model === undefined ? {} : { model }),
+        effort: "high", summary: "retain the fixture context", leadIn: null,
+      });
+      expect(seeded).toBe("fixture-1");
+      const calls = h.records(h.requests);
+      const setters = calls.filter(row => row.method === "session/set_config_option");
+      expect(setters.map(row => row.params)).toEqual([
+        { sessionId: "fixture-1", configId: "thought_level", value: "high" },
+      ]);
+      expect(calls.findIndex(row => row.method === "session/set_config_option"))
+        .toBeLessThan(calls.findIndex(row => row.method === "session/prompt"));
+      expect(calls.filter(row => row.method === "session/prompt")).toHaveLength(1);
+      expect(h.records(h.promptStates)).toEqual([
+        { sessionId: "fixture-1", model: "fixture-flash", effort: "high" },
+      ]);
+      expect(h.localSpawn).not.toHaveBeenCalled();
+      expect(h.remoteSpawn).toHaveBeenCalledOnce();
+      expect(h.hub.get).toHaveBeenCalledWith(location);
+      expect(h.hub.markSessionBridge).toHaveBeenCalledWith(h.record.id, location);
+      const spawn = (h.mux.rpc.mock.calls as any[][]).find(row => row[0] === "spawn")!;
+      expect(spawn[1]).toMatchObject({ agentId: "agy-acp", cwd: h.cwd, effort: "high", mcpServers: [h.remoteSeam] });
+      expect(spawn[1].model).toBe(model);
+      expect(spawn[2]).toEqual({ agentId: "agy-acp" });
+      expect(spawn[1].mcpServers).not.toEqual(expect.arrayContaining([
+        expect.objectContaining({ name: "controllerOnly" }),
+      ]));
+      expect(h.localDelete).not.toHaveBeenCalled();
+      expect(h.store.get(h.record.id)).toEqual(h.original);
+      expect(h.profile.sessionManager).toBeUndefined();
+    } finally { await h.close(); }
+  }, 15_000);
+
+  it("preserves the native reseed session error and original binding", async () => {
+    const native = { code: -32603, message: "Fixture upstream unavailable", data: { status: 503, fixture: "seed-cause" } };
+    const h = nativeSeedSetup(REMOTE, native);
+    try {
+      const error = await h.orch.seedNewSession({
+        profile: h.profile, restrictionChannelId: "parent", cwd: h.cwd, location: REMOTE,
+        sessionId: h.record.id, model: "fixture-flash", effort: "high", summary: "unused seed",
+      }).then(() => null, (cause: unknown) => cause);
+      expect(error).toMatchObject(native);
+      expect(readErrorClassification(error)).toMatchObject({ agentId: "agy-acp", errorKind: "overloaded" });
+      expect(h.records(h.requests).some(row => row.method === "session/prompt")).toBe(false);
+      expect(h.localSpawn).not.toHaveBeenCalled();
+      expect(h.store.get(h.record.id)).toEqual(h.original);
+    } finally { await h.close(); }
+  }, 15_000);
 });

@@ -97,6 +97,8 @@ for await (const line of readline.createInterface({ input: process.stdin })) {
     } else session.effort = params.value;
     result = { configOptions: options(session) };
   } else if (method === "session/prompt") {
+    if (process.env.AGY_ACP_TEST_PROMPT_STATE) appendFileSync(process.env.AGY_ACP_TEST_PROMPT_STATE,
+      JSON.stringify({ sessionId: params.sessionId, ...sessions.get(params.sessionId) }) + "\n");
     for (const update of [
       { sessionUpdate: "agent_thought_chunk", content: { type: "text", text: "Fixture reasoning α" } },
       { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "fixture response" } },

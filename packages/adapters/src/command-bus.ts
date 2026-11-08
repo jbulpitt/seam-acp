@@ -133,6 +133,9 @@ export interface RpcReplyFrame {
   ok: boolean;
   result?: unknown;
   error?: string;
+  /** Original fields; older peers still use the string message. */
+  errorCode?: unknown;
+  errorData?: unknown;
 }
 
 export interface EventFrame {

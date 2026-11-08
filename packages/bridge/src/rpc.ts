@@ -8,6 +8,7 @@ import path from "node:path";
 import type { McpServer } from "@agentclientprotocol/sdk";
 import type { AgentAdapter } from "@seam/adapters";
 import {
+  PROTOCOL_VERSION,
   isAllowedRpcMethod,
   isHostRpcMethod,
   invokeAdapterRpc,
@@ -19,6 +20,25 @@ import {
   type RemoteRung1Policy,
   type ThreadIdentity,
 } from "@seam/adapters";
+
+export function buildBridgeRpcReply(
+  id: string,
+  outcome: { ok: true; result: unknown } | { ok: false; error: any },
+) {
+  if (outcome.ok) {
+    return { v: PROTOCOL_VERSION, type: "rpc_reply", id, ok: true, result: outcome.result };
+  }
+  const err = outcome.error;
+  return {
+    v: PROTOCOL_VERSION,
+    type: "rpc_reply",
+    id,
+    ok: false,
+    error: err?.message ?? String(err),
+    ...(err?.code !== undefined ? { errorCode: err.code } : {}),
+    ...(err?.data !== undefined ? { errorData: err.data } : {}),
+  };
+}
 
 const HOST_EXEC_DEFAULT_TIMEOUT_MS = 30_000;
 const HOST_EXEC_MAX_TIMEOUT_MS = 15 * 60_000;

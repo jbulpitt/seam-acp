@@ -4449,8 +4449,9 @@ export class Orchestrator {
           { agentId: described.agent.value, location: described.location.value },
           selectedModel
         )?.visionMode;
+        const promptCapabilities = activeRuntime.getPromptCapabilities();
         const visionRouting = resolveModelVisionRouting(
-          activeRuntime.getPromptCapabilities()?.image,
+          promptCapabilities?.image,
           visionMode
         );
         const { inline, hint } = await this.partitionAndStageAttachments(
@@ -4463,7 +4464,8 @@ export class Orchestrator {
                 effectiveCwd,
                 filename,
                 bytes
-              ).then((result) => result.path)
+              ).then((result) => result.path),
+          promptCapabilities?.embeddedContext
         );
         if (hint) promptText = promptText ? `${promptText}${hint}` : hint.trimStart();
         promptAttachments = inline.length > 0 ? withoutVoiceNotes(inline) : undefined;
@@ -13162,7 +13164,8 @@ export class Orchestrator {
     agentHasVision?: boolean,
     toolVision = false,
     stagingOwnerId?: string,
-    hostWriter?: (filename: string, bytes: Buffer) => Promise<string>
+    hostWriter?: (filename: string, bytes: Buffer) => Promise<string>,
+    embeddedContext?: boolean
   ): Promise<{ inline: MessageAttachment[]; hint: string | null }> {
     const STAGE_MAX = 100 * 1024 * 1024; // don't fill /tmp with huge files
     const inline: MessageAttachment[] = [];
@@ -13175,7 +13178,10 @@ export class Orchestrator {
     for (const a of attachments) {
       // Voice notes are transcribed into the prompt; never stage or inline audio.
       if (isVoiceNoteAttachment(a)) continue;
-      if (isInlineableForAgent(a.contentType ?? "", a.filename, agentHasVision)) {
+      if (isInlineableForAgent(a.contentType ?? "", a.filename, agentHasVision, {
+        size: a.size,
+        embeddedContext,
+      })) {
         inline.push(a);
         continue;
       }

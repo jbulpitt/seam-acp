@@ -249,23 +249,21 @@ export function isModelInlineableAttachment(mime: string, filename: string): boo
   return false;
 }
 
-/** Whether an attachment should be sent inline to a *specific* agent, given the
- *  agent's ACP-advertised image prompt capability (`promptCapabilities.image`).
- *  A standard image is only inlineable when the agent can actually decode it as
- *  an image block; when the agent advertises `image:false` (e.g. the Grok CLI's
- *  `agent stdio` bridge — grok-4.5 has vision, but its ACP layer doesn't accept
- *  image prompt blocks), an image must be staged to a file path instead, so the
- *  caller treats it as non-inlineable and stages it. Text stays inlineable
- *  regardless (delivered via embeddedContext). `undefined` vision (capability
- *  not known) preserves the legacy inline behavior. */
+/** Images follow the selected vision route; text needs embedded-context support.
+ * Leave over-limit text to the mapper's existing size rejection. */
 export function isInlineableForAgent(
   mime: string,
   filename: string,
-  agentHasVision?: boolean
+  agentHasVision?: boolean,
+  text?: { size: number; embeddedContext?: boolean }
 ): boolean {
   if (!isModelInlineableAttachment(mime, filename)) return false;
   const isImage = (mime || "").toLowerCase().startsWith("image/");
-  return !(isImage && agentHasVision === false);
+  if (isImage) return agentHasVision !== false;
+  return text !== undefined && (
+    text.size > MAX_BYTES_PER_ATTACHMENT ||
+    (text.embeddedContext === true && text.size <= MAX_INLINE_TEXT_BYTES)
+  );
 }
 
 async function downloadBase64(

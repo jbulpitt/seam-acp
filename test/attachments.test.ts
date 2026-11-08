@@ -1,4 +1,9 @@
 import { describe, it, expect, vi } from "vitest";
+import { randomUUID } from "node:crypto";
+import { promises as fs } from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { writeHostAttachment } from "../packages/bridge/src/host-files.js";
 import {
   mapAttachmentsToBlocks,
   isInlineableForAgent,
@@ -51,9 +56,10 @@ describe("isInlineableForAgent", () => {
     expect(isInlineableForAgent("image/jpeg", "IMG_1181.jpg", undefined)).toBe(true);
   });
 
-  it("keeps text inlineable regardless of vision (delivered via embeddedContext)", () => {
-    expect(isInlineableForAgent("text/plain", "notes.txt", false)).toBe(true);
-    expect(isInlineableForAgent("application/json", "data.json", false)).toBe(true);
+  it("keeps small text inline with embeddedContext regardless of vision", () => {
+    const text = { size: 10, embeddedContext: true };
+    expect(isInlineableForAgent("text/plain", "notes.txt", false, text)).toBe(true);
+    expect(isInlineableForAgent("application/json", "data.json", false, text)).toBe(true);
   });
 
   it("leaves non-inlineable binaries (PDF/HEIC) non-inlineable — always staged", () => {
@@ -142,6 +148,103 @@ describe("remote attachment staging", () => {
     } finally {
       globalThis.fetch = priorFetch;
     }
+  });
+});
+
+describe("text attachment delivery", () => {
+  function textAttachment(size: number) {
+    const tail = `OWN-ATTACHMENT-TAIL-${randomUUID()}`;
+    const bytes = Buffer.alloc(size, "x");
+    bytes.write(tail, size - Buffer.byteLength(tail));
+    const attachment = a({
+      url: `data:text/plain;base64,${bytes.toString("base64")}`,
+      filename: "notes.txt",
+      contentType: "text/plain",
+      size: bytes.length,
+    });
+    return { attachment, bytes, tail };
+  }
+
+  it.each([
+    { label: "262145-byte text", size: MAX_INLINE_TEXT_BYTES + 1, embeddedContext: true },
+    { label: "disabled embeddedContext", size: 128, embeddedContext: false },
+    { label: "missing embeddedContext", size: 128, embeddedContext: undefined },
+  ])("stages $label through the host writer before mapping", async ({ size, embeddedContext }) => {
+    const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "seam-attachment-delivery-"));
+    const { attachment, bytes, tail } = textAttachment(size);
+    let stagedPath = "";
+    const hostWriter = vi.fn(async (filename: string, content: Buffer) => {
+      const result = await writeHostAttachment({
+        requestedCwd: cwd,
+        fallbackCwd: cwd,
+        filename,
+        base64: content.toString("base64"),
+      });
+      stagedPath = result.path;
+      return stagedPath;
+    });
+    try {
+      const result = await (Orchestrator.prototype as any).partitionAndStageAttachments.call(
+        { logger: { warn: vi.fn() } },
+        [attachment], true, false, "discord:owned-attachment-test", hostWriter, embeddedContext
+      );
+      const mapped = await mapAttachmentsToBlocks(result.inline, {
+        capabilities: { image: true, embeddedContext },
+      });
+      expect(hostWriter).toHaveBeenCalledOnce();
+      expect(hostWriter.mock.calls[0]![1]).toEqual(bytes);
+      expect(await fs.readFile(stagedPath)).toEqual(bytes);
+      expect(path.dirname(stagedPath)).toBe(path.join(cwd, ".seam-attachments"));
+      expect(result.hint).toContain(`\`${stagedPath}\``);
+      expect(result.hint).toContain("saved on the agent host");
+      expect(result.hint).not.toContain("attachment://");
+      expect(result.hint).not.toContain(tail);
+      expect(attachment.filename).not.toContain(tail);
+      expect(result.inline).toEqual([]);
+      expect(mapped).toEqual({ blocks: [], rejected: [] });
+    } finally {
+      await fs.rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("embeds exactly 256 KiB of text without a host write", async () => {
+    const { attachment, bytes } = textAttachment(MAX_INLINE_TEXT_BYTES);
+    const hostWriter = vi.fn(async () => "/unused-host-path");
+    const result = await (Orchestrator.prototype as any).partitionAndStageAttachments.call(
+      { logger: { warn: vi.fn() } },
+      [attachment], true, false, "discord:owned-attachment-test", hostWriter, true
+    );
+    const mapped = await mapAttachmentsToBlocks(result.inline, {
+      capabilities: { image: true, embeddedContext: true },
+    });
+    expect(hostWriter).not.toHaveBeenCalled();
+    expect(result.hint).toBeNull();
+    expect(mapped.rejected).toEqual([]);
+    expect(mapped.blocks).toHaveLength(1);
+    expect(mapped.blocks[0]).toMatchObject({
+      type: "resource",
+      resource: { uri: "attachment://notes.txt", mimeType: "text/plain" },
+    });
+    const resource = (mapped.blocks[0] as { resource: { text: string } }).resource;
+    expect(Buffer.from(resource.text, "utf8")).toEqual(bytes);
+  });
+
+  it("preserves the mapper's existing rejection for text above 5 MiB", async () => {
+    const { attachment } = textAttachment(MAX_BYTES_PER_ATTACHMENT + 1);
+    const hostWriter = vi.fn(async () => "/unused-host-path");
+    const result = await (Orchestrator.prototype as any).partitionAndStageAttachments.call(
+      { logger: { warn: vi.fn() } },
+      [attachment], true, false, "discord:owned-attachment-test", hostWriter, false
+    );
+    const mapped = await mapAttachmentsToBlocks(result.inline, {
+      capabilities: { image: true, embeddedContext: false },
+    });
+    expect(hostWriter).not.toHaveBeenCalled();
+    expect(result.hint).toBeNull();
+    expect(mapped.blocks).toEqual([]);
+    expect(mapped.rejected).toEqual([
+      { filename: "notes.txt", reason: expect.stringMatching(/larger/) },
+    ]);
   });
 });
 

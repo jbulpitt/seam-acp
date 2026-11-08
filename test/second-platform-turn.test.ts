@@ -7,6 +7,9 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { createHash, randomUUID } from "node:crypto";
+import type { PromptCapabilities } from "@agentclientprotocol/sdk";
+import { writeHostAttachment } from "../packages/bridge/src/host-files.js";
 import { pino } from "pino";
 import { testSessionRouter } from "./helpers/session-fixture.js";
 import { Orchestrator } from "../packages/core/src/platforms/discord/orchestrator.js";
@@ -21,8 +24,9 @@ import { readdirSync, readFileSync, existsSync } from "node:fs";
 const cleanups: (() => void)[] = [];
 afterEach(() => { for (const f of cleanups.splice(0).reverse()) f(); vi.restoreAllMocks(); });
 
-function setup(platform: string, downloads?: Map<string, Buffer>) {
+function setup(platform: string, downloads?: Map<string, Buffer>, useOwnedCwd = false) {
   const dir = mkdtempSync(path.join(tmpdir(), "seam-second-platform-"));
+  const cwd = useOwnedCwd ? dir : "/synthetic";
   cleanups.push(() => rmSync(dir, { force: true, recursive: true }));
   const store = new SessionStore(path.join(dir, "test.db"));
   cleanups.push(() => store.close());
@@ -30,7 +34,8 @@ function setup(platform: string, downloads?: Map<string, Buffer>) {
   const runtime = {
     onEvent(f: typeof onEvent) { onEvent = f; }, getSessionInfo: () => ({ sessionId: "acp-1" }),
     getProcessId: () => undefined, getProviderIdentity: () => "synthetic",
-    getFastModeOutcome: () => undefined, getPromptCapabilities: () => ({ image: true }),
+    getFastModeOutcome: () => undefined,
+    getPromptCapabilities: (): PromptCapabilities => ({ image: true, embeddedContext: true }),
     prompt: vi.fn(async (_text: string, _attachments?: MessageAttachment[]) => {
       await onEvent({ kind: "agent-text", text: "SECOND_PLATFORM_REPLY" });
       return { stopReason: "end_turn" };
@@ -39,7 +44,7 @@ function setup(platform: string, downloads?: Map<string, Buffer>) {
   };
   const router = testSessionRouter({ listProfiles: () => [],
     describeConfig: () => ({ agent: { value: "codex" }, model: { value: "test" },
-      effort: { value: null }, cwd: { value: "/synthetic" }, location: { value: "local" }, fastMode: { value: false },
+      effort: { value: null }, cwd: { value: cwd }, location: { value: "local" }, fastMode: { value: false },
       role: { value: null }, disableThreadPrefix: { value: false } }),
     ensureSessionRecord: (input: { platform: string; channelRef: string; parentRef?: string }) => {
       const existing = store.getByChannel(input.platform, input.channelRef);
@@ -47,7 +52,7 @@ function setup(platform: string, downloads?: Map<string, Buffer>) {
       const now = new Date().toISOString();
       const record = { id: `${input.platform}:${input.channelRef}`, platform: input.platform,
         channelRef: input.channelRef, parentRef: input.parentRef ?? null, agentId: "codex",
-        acpSessionId: "acp-1", repoPath: "/synthetic", configJson: "{}", createdUtc: now, updatedUtc: now };
+        acpSessionId: "acp-1", repoPath: cwd, configJson: "{}", createdUtc: now, updatedUtc: now };
       store.upsert(record);
       return record;
     },
@@ -72,7 +77,7 @@ function setup(platform: string, downloads?: Map<string, Buffer>) {
       }),
     } : {}),
   };
-  const config = { DATA_DIR: dir, REPOS_ROOT: "/synthetic", TURN_TIMEOUT_SECONDS: 60,
+  const config = { DATA_DIR: dir, REPOS_ROOT: cwd, TURN_TIMEOUT_SECONDS: 60,
     DISCORD_ALLOWED_USER_IDS: new Set(["1300000000000000004"]),
     DEFAULT_MODEL: "test", REPO_EMOJIS: new Map(), channelPresets: new Map(), threadPresets: new Map() };
   const orch = new Orchestrator({ logger: pino({ level: "silent" }) as any,
@@ -342,6 +347,66 @@ describe("a second chat platform runs a normal turn", () => {
     expect(sent[0]!.url).toBe(`data:text/plain;base64,${Buffer.from("hello from chat").toString("base64")}`);
     // The admission keeps the platform reference, never the bytes.
     expect(JSON.stringify(h.store.getInbound("BBB_ccc-1"))).not.toContain("base64");
+  });
+
+  it.each([
+    { label: "disabled", capabilities: { image: true, embeddedContext: false } },
+    { label: "missing", capabilities: { image: true } },
+  ])("stages text on an ordinary turn with $label embeddedContext", async ({ label, capabilities }) => {
+    const url = "spaces/AAA/messages/STAGED/attachments/NOTE";
+    const tail = `OWN-TEXT-TAIL-${randomUUID()}`;
+    const bytes = Buffer.from(`Owned host text\r\nUTF-8: café\n${tail}\n`);
+    const h = setup("test", new Map([[url, bytes]]), true);
+    vi.spyOn(h.runtime, "getPromptCapabilities").mockReturnValue(capabilities);
+    let stagedPath = "";
+    const hostWrite = vi.fn(async (_location: string, cwd: string, filename: string, content: Uint8Array) => {
+      const result = await writeHostAttachment({
+        requestedCwd: cwd, fallbackCwd: h.dir, filename,
+        base64: Buffer.from(content).toString("base64"),
+      });
+      stagedPath = result.path;
+      return result;
+    });
+    h.orch.setBridgeHub({
+      isBridgeReady: () => true, writeAttachment: hostWrite, rpc: vi.fn(async () => null),
+    } as any);
+    const messageId = `staged_text_${label}`;
+    await h.run({ messageId, channel: { platform: "test", id: "AAA.TTT", parentId: "AAA" },
+      authorId: "42", authorName: "Tester", authorIsBot: false, text: "Read the uploaded note", raw: { synthetic: true },
+      attachments: [{ url, filename: "note.txt", contentType: "text/plain", size: bytes.length }] });
+
+    expect(hostWrite).toHaveBeenCalledOnce();
+    const [location, cwd, filename, content] = hostWrite.mock.calls[0]!;
+    expect(location).toBe("local");
+    expect(cwd).toBe(h.dir);
+    expect(filename).toMatch(/-note\.txt$/);
+    expect(Buffer.from(content)).toEqual(bytes);
+    expect(path.isAbsolute(stagedPath)).toBe(true);
+    expect(stagedPath).toBe(path.join(h.dir, ".seam-attachments", filename));
+    const written = readFileSync(stagedPath);
+    expect(written).toEqual(bytes);
+    expect(createHash("sha256").update(written).digest("hex"))
+      .toBe(createHash("sha256").update(bytes).digest("hex"));
+    expect(h.runtime.prompt).toHaveBeenCalledOnce();
+    const [promptText, inline] = h.runtime.prompt.mock.calls[0]!;
+    expect(promptText).toContain(`\`${stagedPath}\``);
+    expect(promptText).toContain("saved on the agent host");
+    expect(promptText).not.toContain("attachment://");
+    expect(promptText).not.toContain(tail);
+    expect(filename).not.toContain(tail);
+    expect(inline).toBeUndefined();
+    expect(h.adapter.downloadAttachment).toHaveBeenCalledOnce();
+    expect(h.adapter.downloadAttachment.mock.calls[0]![0].url).toBe(url);
+    expect(h.store.getInbound(messageId)).not.toBeNull();
+    expect(JSON.stringify(h.store.getInbound(messageId))).not.toContain(bytes.toString("base64"));
+    expect(h.store.turnAttempts.get(inboundAttemptId(messageId))).toMatchObject({ state: "completed" });
+    expect(h.store.getByChannel("test", "AAA.TTT"))
+      .toMatchObject({ id: "test:AAA.TTT", parentRef: "AAA", repoPath: h.dir });
+    expect(h.store.getByChannel("discord", "AAA.TTT")).toBeNull();
+    const used = channelsUsed(h.adapter);
+    expect(used.length).toBeGreaterThan(0);
+    expect(used.every(channel => channel.platform === "test" && channel.id === "AAA.TTT")).toBe(true);
+    expect(h.adapter.sendMessage.mock.calls.map(call => call[1]).join("\n")).toContain("SECOND_PLATFORM_REPLY");
   });
 
   it("reports an attachment the adapter cannot read with its real cause instead of passing it on", async () => {

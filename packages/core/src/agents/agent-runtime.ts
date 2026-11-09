@@ -842,6 +842,9 @@ export class AgentRuntime {
       };
     }) : wire;
     const app = client()
+      .onNotification(methods.client.session.update, async ({ params }) => {
+        await this.handleSessionUpdate(params.update);
+      })
       .onNotification("_claude/sdkMessage", (params: unknown) => params, async ({ params }) => {
         const evidence = this.receivingSubmission;
         if (evidence && this.profile.submissionSignals === "claude_sdk"
@@ -850,9 +853,6 @@ export class AgentRuntime {
       .onRequest(methods.client.session.requestPermission, ({ params, requestId, signal }) =>
         this.permissionPolicy(params, { requestId, signal })
       )
-      .onNotification(methods.client.session.update, async ({ params }) => {
-        await this.handleSessionUpdate(params.update);
-      })
       .onNotification("_x.ai/session/update", (params: unknown) => params, async ({ params }) => {
         await this.handleGrokSessionUpdate(params);
       })
@@ -2351,6 +2351,13 @@ export class AgentRuntime {
   }
 
   private handleSessionUpdate(update: SessionUpdate): Promise<void> {
+    // Apply live options before queued event delivery.
+    if (update.sessionUpdate === "config_option_update") {
+      const opts = (update as unknown as { configOptions?: unknown }).configOptions;
+      if (Array.isArray(opts)) {
+        this.sessionConfigOptions = opts as SessionConfigOption[];
+      }
+    }
     const evidence = this.receivingSubmission;
     if (evidence && !evidence.observedUpdateTypes.includes(update.sessionUpdate)) {
       evidence.observedUpdateTypes.push(update.sessionUpdate);
@@ -2501,9 +2508,6 @@ export class AgentRuntime {
         // Track current model if present in the new options.
         const opts = (update as unknown as { configOptions?: unknown })
           .configOptions;
-        if (Array.isArray(opts)) {
-          this.sessionConfigOptions = opts as SessionConfigOption[];
-        }
         const currentModel = extractCurrentModel(opts);
         if (currentModel && this.sessionInfo) {
           this.sessionInfo = {

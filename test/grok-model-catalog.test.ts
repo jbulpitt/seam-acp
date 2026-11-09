@@ -794,10 +794,18 @@ Available models:
     const signalLog = path.join(temporary, "signals.log");
     const fixture = path.join(process.cwd(), "test/fixtures/grok/fake-acp.mjs");
     let childPid: number | undefined;
+    let operation: ReturnType<typeof probeGrokModels> | undefined;
+    type OperationOutcome =
+      | { status: "fulfilled"; value: Awaited<ReturnType<typeof probeGrokModels>> }
+      | { status: "rejected"; error: unknown };
+    let operationReceipt: Promise<OperationOutcome> | undefined;
+    let hasPrimaryError = false;
+    let primaryError: unknown;
+    const secondaryErrors: unknown[] = [];
     try {
       writeAuth(grokHome, "models-reap-test");
       const started = Date.now();
-      const operation = probeGrokModels({
+      operation = probeGrokModels({
         cliPath: process.execPath,
         baseArgs: [fixture],
         cwd: temporary,
@@ -811,17 +819,47 @@ Available models:
         },
         timeoutMs: 200,
       });
+      operationReceipt = operation.then(
+        (value): OperationOutcome => ({ status: "fulfilled", value }),
+        (error: unknown): OperationOutcome => ({ status: "rejected", error }),
+      );
       await vi.waitFor(() => expect(fs.existsSync(logPath)).toBe(true));
       childPid = JSON.parse(fs.readFileSync(logPath, "utf8").trim()).pid;
       await expect(operation).rejects.toMatchObject({ code: "timeout" });
       expect(Date.now() - started).toBeLessThan(1_200);
       expect(fs.readFileSync(signalLog, "utf8")).toContain("SIGTERM-IGNORED");
       expect(() => process.kill(childPid!, 0)).toThrow();
+    } catch (error) {
+      hasPrimaryError = true;
+      primaryError = error;
     } finally {
+      try {
+        if (operationReceipt !== undefined) await operationReceipt;
+      } catch (error) {
+        secondaryErrors.push(error);
+      }
       if (childPid) {
         try { process.kill(childPid, "SIGKILL"); } catch {}
       }
-      fs.rmSync(temporary, { recursive: true, force: true });
+      try {
+        fs.rmSync(temporary, { recursive: true, force: true });
+      } catch (error) {
+        secondaryErrors.push(error);
+      }
+    }
+    if (hasPrimaryError) {
+      if (secondaryErrors.length > 0) {
+        throw new AggregateError(
+          [primaryError, ...secondaryErrors],
+          "Grok models test and cleanup failed",
+          { cause: primaryError },
+        );
+      }
+      throw primaryError;
+    }
+    if (secondaryErrors.length === 1) throw secondaryErrors[0];
+    if (secondaryErrors.length > 1) {
+      throw new AggregateError(secondaryErrors, "Grok models test cleanup failed");
     }
   });
 });

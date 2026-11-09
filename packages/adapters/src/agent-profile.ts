@@ -1,7 +1,7 @@
 import type { ChildProcessByStdio } from "node:child_process";
 import type { Readable as NodeReadable, Writable as NodeWritable } from "node:stream";
 import type { McpServer } from "@agentclientprotocol/sdk";
-import type { ContextUsage, ISessionManager, SessionSummary } from "./session-manager.js";
+import type { CompactionTranscript, ContextUsage, ISessionManager, SessionSummary } from "./session-manager.js";
 import type { FastModeDescriptor } from "./fast-mode.js";
 import type { AdapterCatalogCandidate, AdapterCatalogSource } from "./model-catalog.js";
 import type { AdapterErrorClassification } from "./error-classification.js";
@@ -311,6 +311,7 @@ export interface AgentAdapter {
   /** Session verbs — delegate to `sessionManager` when present. */
   listSessions(cwd: string): Promise<SessionSummary[]>;
   getTranscript(cwd: string, sessionId: string): Promise<string>;
+  getCompactionTranscript?(cwd: string, sessionId: string): Promise<CompactionTranscript>;
   cloneSession(cwd: string, oldSessionId: string, newSessionId: string): Promise<void>;
   deleteSession(cwd: string, sessionId: string): Promise<void>;
 
@@ -354,6 +355,7 @@ export type AgentProfileCore = Omit<
   | "readAttachment"
   | "listSessions"
   | "getTranscript"
+  | "getCompactionTranscript"
   | "cloneSession"
   | "deleteSession"
   | "writeAttachment"
@@ -426,6 +428,11 @@ export function asLocalAdapter(core: AgentProfileCore): AgentAdapter {
     async getTranscript(cwd: string, sessionId: string): Promise<string> {
       if (!adapter.sessionManager) return "";
       return adapter.sessionManager.getTranscript(cwd, sessionId);
+    },
+    async getCompactionTranscript(cwd: string, sessionId: string): Promise<CompactionTranscript> {
+      const manager = adapter.sessionManager;
+      if (manager?.getCompactionTranscript) return manager.getCompactionTranscript(cwd, sessionId);
+      return adapter.getTranscript(cwd, sessionId);
     },
     async cloneSession(
       cwd: string,

@@ -55,7 +55,7 @@ import {
   sweepAgyMcpHomes,
   type AgentAdapter,
 } from "@seam/adapters";
-import { dispatchBridgeRpc } from "./rpc.js";
+import { buildBridgeRpcReply, dispatchBridgeRpc } from "./rpc.js";
 import { collectHangEvidence, createProbeGate, readLiveProviderSocket } from "./hang-probe.js";
 import { createOomEvidenceRegistry } from "./oom-evidence.js";
 import { createStderrRegistry } from "./stderr-ring.js";
@@ -607,16 +607,10 @@ async function makeSlotManager(opts: {
             },
           });
           await releaseReceipt?.recordCatalogRpc(method, msg.agentId);
-          wsSend({ v: PROTOCOL_VERSION, type: "rpc_reply", id, ok: true, result });
+          wsSend(buildBridgeRpcReply(id, { ok: true, result }));
         } catch (err: any) {
           console.error(`[bridge] rpc ${method} failed:`, err?.message ?? err);
-          wsSend({
-            v: PROTOCOL_VERSION,
-            type: "rpc_reply",
-            id,
-            ok: false,
-            error: err?.message ?? String(err),
-          });
+          wsSend(buildBridgeRpcReply(id, { ok: false, error: err }));
         }
       })();
       return;

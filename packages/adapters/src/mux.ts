@@ -706,7 +706,10 @@ export function makeMux(opts: {
           pendingRpcs.delete(msg.id);
           const reply = msg as unknown as RpcReplyFrame;
           if (!reply.ok || reply.error) {
-            handler.reject(new Error(reply.error ?? "rpc failed"));
+            handler.reject(Object.assign(new Error(reply.error ?? "rpc failed"), {
+              ...(reply.errorCode !== undefined ? { code: reply.errorCode } : {}),
+              ...(reply.errorData !== undefined ? { data: reply.errorData } : {}),
+            }));
           } else {
             handler.resolve(reply.result);
           }

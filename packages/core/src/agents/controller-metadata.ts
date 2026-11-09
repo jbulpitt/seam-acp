@@ -26,7 +26,7 @@ export function controllerMetadataAdapter(
   } : profile.id === "codex" || profile.id.startsWith("codex-") ? {
     classifyError: (error: unknown) => classifyAndAttach(error, classifyCodexError(error, profile.id)),
     fastMode: metadata?.fastMode ?? profile.fastMode ?? (profile.id === "codex" ? CODEX_FAST_MODE : undefined),
-  } : profile.id === "agy" ? {
+  } : profile.id === "agy" || profile.id === "agy-acp" ? {
     classifyError: (error: unknown) => classifyAndAttach(error, classifyAgyError(error, profile.id)),
   } : profile.id.startsWith("grok") ? {
     classifyError: (error: unknown) => classifyAndAttach(error, classifyGrokError(error, profile.id)),

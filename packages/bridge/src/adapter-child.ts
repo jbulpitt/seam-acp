@@ -93,7 +93,8 @@ function start(config: AdapterChildBootstrap): void {
   child = spawned;
   registerOwnedProcessGroup(spawned);
   const permissions = new PendingPermissions(writeAgent);
-  const resumeRecord = createResumeRecorder(process.env.SEAM_SESSIOND_RESUME_FILE, config);
+  const adapter = adapters.get(config.config.agentId ?? "copilot");
+  const resumeRecord = createResumeRecorder(process.env.SEAM_SESSIOND_RESUME_FILE, config, adapter?.effort);
   clearResumeRecord = () => resumeRecord.clear();
   const recovery = createRung1Recovery({
     agentId: config.config.agentId,
@@ -164,10 +165,12 @@ function start(config: AdapterChildBootstrap): void {
   };
 
   // Resume under the original request id so the controller can settle its turn.
-  let resuming: { resume: AdapterChildResume; phase: "initialize" | "load" | "mode" } | undefined;
+  let resuming: { resume: AdapterChildResume; phase: "initialize" | "load" | "mode" | "model" | "effort" } | undefined;
   const RESUME_INITIALIZE = "seam-resume-initialize";
   const RESUME_LOAD = "seam-resume-load";
   const RESUME_MODE = "seam-resume-mode";
+  const RESUME_MODEL = "seam-resume-model";
+  const RESUME_EFFORT = "seam-resume-effort";
   const resumeOutput = (line: string): boolean => {
     if (!resuming) return false;
     let message: { id?: unknown; method?: unknown; error?: { message?: unknown } };
@@ -188,15 +191,41 @@ function start(config: AdapterChildBootstrap): void {
       return true;
     }
     if ((resuming.phase === "load" && message.id === RESUME_LOAD)
-      || (resuming.phase === "mode" && message.id === RESUME_MODE)) {
+      || (resuming.phase === "mode" && message.id === RESUME_MODE)
+      || (resuming.phase === "model" && message.id === RESUME_MODEL)
+      || (resuming.phase === "effort" && message.id === RESUME_EFFORT)) {
+      if (resuming.phase === "model" || resuming.phase === "effort") resumeRecord.observeOutput(line);
       if (message.error) {
-        exitWithRefusal(`resume after restart: ${resuming.phase === "load" ? "session/load" : "session/set_mode"} failed (${String(message.error.message ?? "error")})`);
+        if (resuming.phase === "model" || resuming.phase === "effort") {
+          publish({ v: ADAPTER_CHILD_PROTOCOL_VERSION, type: "data",
+            data: `${JSON.stringify({ ...message, id: resuming.resume.recovery.originalRequestId })}\n` });
+        }
+        const method = resuming.phase === "load" ? "session/load"
+          : resuming.phase === "mode" ? "session/set_mode" : `session/set_config_option:${resuming.phase}`;
+        exitWithRefusal(`resume after restart: ${method} failed (${String(message.error.message ?? "error")})`);
         return true;
       }
       if (resuming.phase === "load" && resuming.resume.modeId) {
         resuming.phase = "mode";
         writeAgent(`${JSON.stringify({ jsonrpc: "2.0", id: RESUME_MODE, method: "session/set_mode",
           params: { sessionId: resuming.resume.load.sessionId, modeId: resuming.resume.modeId } })}\n`);
+        return true;
+      }
+      const selections = resuming.resume.configOptions;
+      if ((resuming.phase === "load" || resuming.phase === "mode") && selections?.model) {
+        resuming.phase = "model";
+        const request = `${JSON.stringify({ jsonrpc: "2.0", id: RESUME_MODEL, method: "session/set_config_option",
+          params: { sessionId: resuming.resume.load.sessionId, ...selections.model } })}\n`;
+        resumeRecord.observeInput(request);
+        writeAgent(request);
+        return true;
+      }
+      if (resuming.phase !== "effort" && selections?.effort) {
+        resuming.phase = "effort";
+        const request = `${JSON.stringify({ jsonrpc: "2.0", id: RESUME_EFFORT, method: "session/set_config_option",
+          params: { sessionId: resuming.resume.load.sessionId, ...selections.effort } })}\n`;
+        resumeRecord.observeInput(request);
+        writeAgent(request);
         return true;
       }
       const { recovery: turn } = resuming.resume;

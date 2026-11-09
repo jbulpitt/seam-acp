@@ -1,3 +1,16 @@
+/** Text replay messages retained before readable rendering. */
+export interface TranscriptMessage {
+  role: "User" | "Assistant";
+  text: string;
+  messageId?: string | null;
+}
+
+export type CompactionTranscript = readonly TranscriptMessage[] | string;
+
+export function renderTranscriptMessages(messages: readonly TranscriptMessage[]): string {
+  return messages.map(message => `### ${message.role}\n${message.text}`).join("\n\n");
+}
+
 export const SESSION_HISTORY_CHUNK_BYTES = 1024 * 1024;
 
 export interface SessionHistoryChunk {
@@ -41,6 +54,8 @@ export interface ISessionManager {
   cloneSession(cwd: string, oldSessionId: string, newSessionId: string): Promise<void>;
   deleteSession(cwd: string, sessionId: string): Promise<void>;
   getTranscript(cwd: string, sessionId: string): Promise<string>;
+  /** Atomic replay when available; legacy readers retain their readable string. */
+  getCompactionTranscript?(cwd: string, sessionId: string): Promise<CompactionTranscript>;
   repairSession?(cwd: string, sessionId: string): Promise<void>;
   /** Optional: absolute path to the session's raw on-disk history (e.g. the
    *  Claude JSONL), if this backend stores one. Premium compaction reads this

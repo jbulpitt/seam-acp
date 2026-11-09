@@ -15,6 +15,7 @@ import { SessiondClient, SessiondClientError } from "../packages/bridge/src/sess
 import { readSessiondProcessIdentity, SessiondServer } from "../packages/bridge/src/sessiond-server.js";
 import { SupervisedSlots } from "../packages/bridge/src/supervised-slots.js";
 import type { SessiondEvent, SessiondOutputFrame } from "../packages/bridge/src/sessiond-protocol.js";
+import type { SlotHolderFrame } from "../packages/bridge/src/slot-holder-protocol.js";
 
 const roots: string[] = [];
 const servers: SessiondServer[] = [];
@@ -257,7 +258,11 @@ describe("#573 seam-sessiond control-plane restart", () => {
   });
 
   it("reports a child that dies while unattached as a dead retained entry", async () => {
-    const { socketPath, client } = await harness();
+    const { socketPath, server, client } = await harness();
+    const publishSpy = vi.spyOn(
+      server as unknown as { publish(slot: number, frame: SlotHolderFrame): void },
+      "publish",
+    );
     await client.spawn({
       slot: 3,
       executable: process.execPath,
@@ -266,7 +271,11 @@ describe("#573 seam-sessiond control-plane restart", () => {
       env: { PATH: process.env.PATH ?? "" },
     });
     client.close();
-    await delay(180);
+    await waitFor(() => publishSpy.mock.calls.some(([slot, frame], index) =>
+      publishSpy.mock.contexts[index] === server &&
+      slot === 3 && frame.stream === "exit" &&
+      publishSpy.mock.results[index]?.type === "return"
+    ) ? true : undefined);
 
     const replacement = await SessiondClient.connect(socketPath);
     clients.push(replacement);

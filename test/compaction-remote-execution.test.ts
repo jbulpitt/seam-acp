@@ -726,3 +726,99 @@ describe("typed compaction no-history contract", () => {
     expect(h.store.get(h.record.id)).toEqual(original);
   });
 });
+
+
+describe("default compaction six-category pinned facts", () => {
+  it.each([
+    {
+      name: "a decision-only extraction",
+      extractionJson: '{"corrections":[],"constraints":[],"decisions":["Use lane Ω\\tas the selected route.  "],"openTodos":[],"activePaths":[],"rules":[]}',
+      olderText: "Decided: Use lane Ω\tas the selected route.  ",
+      expectedPinnedLines: ["- DECISION: Use lane Ω\tas the selected route.  "],
+      expectedPinnedCount: 1,
+    },
+    {
+      name: "five original categories with empty decisions",
+      extractionJson: '{"corrections":["Use the branch name exactly."],"constraints":["Keep the service offline."],"decisions":[],"openTodos":["Review the next patch."],"activePaths":["packages/core/example.ts"],"rules":["Record the final result."]}',
+      olderText: "Use the branch name exactly. Keep the service offline. Review the next patch. packages/core/example.ts Record the final result.",
+      expectedPinnedLines: [
+        "- CORRECTION: Use the branch name exactly.",
+        "- CONSTRAINT: Keep the service offline.",
+        "- RULE: Record the final result.",
+        "- TODO: Review the next patch.",
+        "- ACTIVE: packages/core/example.ts",
+      ],
+      expectedPinnedCount: 5,
+    },
+  ])("preserves $name through parsed pins and the default seed count", async ({ extractionJson, olderText, expectedPinnedLines, expectedPinnedCount }) => {
+    const h = setup();
+    const orch = h.make() as any;
+    const original = h.store.get(h.record.id);
+    const template = "Summarize only the supplied older conversation.";
+    const summary = "## Purpose\nControlled summary without extracted facts.";
+    const recent = "### Assistant\nRecent status only.";
+    writeFileSync(path.join(h.cwd, "compact.md"), template);
+    const selected = vi.fn(async (_cwd: string, _sid: string): Promise<readonly TranscriptMessage[]> => [
+      { role: "User", messageId: "pinned-older", text: olderText },
+      { role: "Assistant", messageId: "pinned-recent", text: "Recent status only." },
+    ]);
+    const readable = vi.fn(async () => { throw new Error("Typed history must not trigger a readable fallback"); });
+    const manager = { ...h.manager, getTranscript: readable, getCompactionTranscript: selected };
+    // Canned analysis only; the builder, JSON parser, coercion, merge and assembler stay actual.
+    const runAgent = vi.fn(async (_prompt: string, label: string, _options?: { jsonSchema?: Record<string, unknown> }) =>
+      label === "summary" ? summary : extractionJson);
+    const factory = vi.spyOn(orch, "makeCompactionRunAgent").mockReturnValue(runAgent);
+    const warn = vi.spyOn(orch.logger, "warn");
+    const bindingThread = { platform: "discord", id: "author", parentId: "parent" };
+    const built = await orch.buildDefaultCompactionSeed({
+      profile: h.profile, manager, agentId: h.profile.id, location: h.location, cwd: h.cwd,
+      sessionId: "live-session-untouched", restrictionChannelId: "parent", recentWindowTokens: 8, bindingThread,
+    });
+
+    expect(selected).toHaveBeenCalledExactlyOnceWith(h.cwd, "live-session-untouched");
+    expect(readable).not.toHaveBeenCalled();
+    expect(factory).toHaveBeenCalledExactlyOnceWith(h.profile, manager, {
+      bindingThread, model: MODEL, cwd: h.cwd, effort: "high", location: REMOTE, restrictionChannelId: "parent",
+    });
+    expect(runAgent).toHaveBeenCalledTimes(2);
+    expect(runAgent.mock.calls[0]).toEqual([`${template}\n\nConversation Transcript:\n### User\n${olderText}`, "summary"]);
+    const pinnedCall = runAgent.mock.calls[1]!;
+    expect(pinnedCall.slice(1)).toEqual(["pinned", { jsonSchema: {
+      type: "object", additionalProperties: false,
+      required: ["corrections", "constraints", "decisions", "openTodos", "activePaths", "rules"],
+      properties: {
+        corrections: { type: "array", items: { type: "string" } },
+        constraints: { type: "array", items: { type: "string" } },
+        decisions: { type: "array", items: { type: "string" } },
+        openTodos: { type: "array", items: { type: "string" } },
+        activePaths: { type: "array", items: { type: "string" } },
+        rules: { type: "array", items: { type: "string" } },
+      },
+    } }]);
+    const begin = "=== BEGIN TRANSCRIPT DATA ===\n", end = "\n\n=== END OF TRANSCRIPT ===\n";
+    expect(pinnedCall[0].split(begin)).toHaveLength(2);
+    expect(pinnedCall[0].split(begin)[1]!.split(end)).toHaveLength(2);
+    expect(pinnedCall[0].split(begin)[1]!.split(end)[0]).toBe(`### User\n${olderText}\n\n${recent}`);
+    expect(await runAgent.mock.results[1]!.value).toBe(extractionJson);
+    expect(warn).not.toHaveBeenCalled(); // A caught extraction failure is not preservation.
+    expect(built).not.toBeNull();
+    expect(built).toMatchObject({ summarizedTurns: 1, keptTurns: 1 });
+    expect(summary).not.toContain("Use lane Ω\tas the selected route.  ");
+    expect(recent).not.toContain("Use lane Ω\tas the selected route.  ");
+    expect(built.seed).toContain(`\n\n${summary}\n\n`);
+    expect(built.seed.endsWith(`--- Recent context (verbatim) ---\n${recent}`)).toBe(true);
+    expect(h.localSpawn).not.toHaveBeenCalled();
+    expect(h.remoteSpawn).not.toHaveBeenCalled();
+    expect(h.store.get(h.record.id)).toEqual(original);
+
+    const pinnedMarker = "## Pinned constraints (verbatim)";
+    const noteMarker = "\n\n## Compaction note\n";
+    expect(built.seed.split(pinnedMarker)).toHaveLength(2);
+    expect(built.seed.split(noteMarker)).toHaveLength(2);
+    // One independent comparison exposes both decision loss and a zero count on old product.
+    expect({
+      pinnedBlock: built.seed.split(pinnedMarker)[1]!.split(noteMarker)[0],
+      pinnedCount: built.pinnedCount,
+    }).toEqual({ pinnedBlock: `\n${expectedPinnedLines.join("\n")}`, pinnedCount: expectedPinnedCount });
+  });
+});

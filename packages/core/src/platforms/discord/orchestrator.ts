@@ -6409,12 +6409,12 @@ export class Orchestrator {
     }
 
     const pinnedCount =
-      pinnedFacts.corrections.length + pinnedFacts.constraints.length + pinnedFacts.rules.length +
-      pinnedFacts.openTodos.length + pinnedFacts.activePaths.length;
+      pinnedFacts.corrections.length + pinnedFacts.constraints.length + pinnedFacts.decisions.length +
+      pinnedFacts.rules.length + pinnedFacts.openTodos.length + pinnedFacts.activePaths.length;
     const dropNote =
       `## Compaction note\n` +
       `- Summarized ${olderTurns.length} older turn(s); kept the last ${recent.length} verbatim below.\n` +
-      `- Pinned ${pinnedCount} verbatim constraint(s)/correction(s)/rule(s)/path(s).\n` +
+      `- Pinned ${pinnedCount} verbatim constraint(s)/correction(s)/decision(s)/rule(s)/path(s).\n` +
       `- If something important seems missing, the full prior transcript is recoverable from the Discord thread (and the session's pre-compaction history).`;
 
     const seed = assembleNewSession({ summaryMarkdown, pinnedFacts, recentVerbatim, dropNote });

@@ -479,6 +479,7 @@ export function assembleNewSession(args: {
     "## Pinned constraints (verbatim)",
     ...args.pinnedFacts.corrections.map((c) => `- CORRECTION: ${c}`),
     ...args.pinnedFacts.constraints.map((c) => `- CONSTRAINT: ${c}`),
+    ...args.pinnedFacts.decisions.map((c) => `- DECISION: ${c}`),
     ...args.pinnedFacts.rules.map((c) => `- RULE: ${c}`),
     ...args.pinnedFacts.openTodos.map((c) => `- TODO: ${c}`),
     ...args.pinnedFacts.activePaths.map((c) => `- ACTIVE: ${c}`),

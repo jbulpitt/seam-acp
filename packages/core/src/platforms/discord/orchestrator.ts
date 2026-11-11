@@ -3925,7 +3925,6 @@ export class Orchestrator {
 
     const RETRY_MARKER = "— 🔁 retried — output above may repeat —";
     const RETRY_REGEX = /response was interrupted.*retrying/i;
-    let currentMessageId: string | undefined;
     let postedRetryNotice = false;
     // Repeated long chunks are a stronger loop signal than short tokens.
     const LOOP_THRESHOLD_SHORT = 12; // for chunks <= 40 chars
@@ -4102,18 +4101,10 @@ export class Orchestrator {
             refreshTyping();
             // Recognize retry sentinels from any agent for the notice below.
             const isRetrySentinel = RETRY_REGEX.test(event.text);
-            // Gate message-ID rollover to Copilot: other agents use distinct IDs for
-            // normal multi-message turns, which must not produce retry notices.
-            const isNewMessage =
-              described.agent.value.startsWith("copilot") &&
-              event.messageId !== undefined &&
-              currentMessageId !== undefined &&
-              event.messageId !== currentMessageId;
-            if (isRetrySentinel || isNewMessage) {
+            if (isRetrySentinel) {
               await noteRetry();
               postedRetryNotice = false; // allow future retries to notify again
             }
-            if (event.messageId) currentMessageId = event.messageId;
             // Runaway-loop check (cheap; runs before buffering).
             if (!loopAborted) {
               const trimmed = event.text.trim();

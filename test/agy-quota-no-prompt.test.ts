@@ -313,7 +313,7 @@ describe("#361 missing the window refuses one reading and nothing else", () => {
       const result = await refresh;
       // The deadline really fired — otherwise the rest proves nothing.
       expect(result.sources[0]).toMatchObject({ agentId: "agy", outcome: "timed_out" });
-      // Keep the probe's own 15s deadline frozen through the death assertion.
+      // The probe's own 15s deadline stays beyond the death assertion.
       await expect.poll(() => alive(pid), { timeout: 6_000, interval: 25 }).toBe(false);
     } finally {
       poller.stop();

@@ -633,8 +633,10 @@ export function makeCopilotProfile(opts: {
             effort: {
               mechanism: model.effortChoices.length ? "configOption" : "none",
               ...(model.effortChoices.length ? { configId: "reasoning_effort" } : {}),
-              choices: model.effortChoices.length ? model.effortChoices : ["default"],
-              selectionDefault: model.effortDefault,
+              // Default leaves Copilot's effort unchanged, rather than pinning
+              // the current ACP value through a potentially unsupported setter.
+              choices: ["default", ...model.effortChoices.filter(choice => choice !== "default")],
+              selectionDefault: "default",
             },
           })),
           adapterVersion: AGENT_ADAPTER_VERSION,

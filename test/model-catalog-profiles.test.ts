@@ -80,8 +80,8 @@ describe("production adapter catalog sources", () => {
     expect(catalog.models.find((model) => model.default)?.id).toBe("auto");
     expect(catalog.models.some((model) => model.id === "configured-only-fallback")).toBe(false);
     expect(catalog.models.find((model) => model.id === "gpt-odd")?.effort).toMatchObject({
-      selectionDefault: "astronomical",
-      choices: [{ id: "low", raw: "low" }, { id: "astronomical", raw: "astronomical" }],
+      selectionDefault: "default",
+      choices: [{ id: "default" }, { id: "low", raw: "low" }, { id: "astronomical", raw: "astronomical" }],
     });
   });
 

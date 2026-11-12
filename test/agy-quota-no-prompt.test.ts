@@ -13,7 +13,7 @@
  * +2.8s). The absence of the prompt is the thing being bought, so it is the
  * first thing asserted here.
  */
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { createAgentQuotaSources } from "./quota-source-fixture.js";
 import fs from "node:fs";
 import os from "node:os";
@@ -287,27 +287,43 @@ describe("#361 missing the window refuses one reading and nothing else", () => {
       staleRetentionMs: 0,
     });
 
-    const refresh = poller.refreshAll(true);
-    const pid = await new Promise<number>((resolve, reject) => {
-      const deadline = Date.now() + 8_000;
-      const tick = (): void => {
-        const row = invocations().find((entry) => (entry as { pid?: number }).pid);
-        const value = (row as { pid?: number } | undefined)?.pid;
-        if (value) return resolve(value);
-        if (Date.now() >= deadline) return reject(new Error("fixture never recorded a pid"));
-        setTimeout(tick, 25);
+    const realSetTimeout = setTimeout;
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    try {
+      const refresh = poller.refreshAll(true);
+      const pid = await new Promise<number>((resolve, reject) => {
+        const deadline = Date.now() + 8_000;
+        const tick = (): void => {
+          const row = invocations().find((entry) => (entry as { pid?: number }).pid);
+          const value = (row as { pid?: number } | undefined)?.pid;
+          if (value) return resolve(value);
+          if (Date.now() >= deadline) return reject(new Error("fixture never recorded a pid"));
+          realSetTimeout(tick, 25);
+        };
+        tick();
+      });
+      const alive = (value: number): boolean => {
+        try { process.kill(value, 0); return true; } catch { return false; }
       };
-      tick();
-    });
+      // Reach the real child before delivering the poller's unchanged deadline.
+      await vi.advanceTimersByTimeAsync(399);
+      expect(alive(pid)).toBe(true);
+      await vi.advanceTimersByTimeAsync(1);
 
-    const result = await refresh;
-    // The deadline really fired — otherwise the rest proves nothing.
-    expect(result.sources[0]).toMatchObject({ agentId: "agy", outcome: "timed_out" });
-    const alive = (value: number): boolean => {
-      try { process.kill(value, 0); return true; } catch { return false; }
-    };
-    // Without the signal the child lives to runBoundedProbe's own 15s bound,
-    // far past this window.
-    await expect.poll(() => alive(pid), { timeout: 6_000, interval: 25 }).toBe(false);
+      const result = await refresh;
+      // The deadline really fired — otherwise the rest proves nothing.
+      expect(result.sources[0]).toMatchObject({ agentId: "agy", outcome: "timed_out" });
+      // Keep the probe's own 15s deadline frozen through the death assertion.
+      await expect.poll(() => alive(pid), { timeout: 6_000, interval: 25 }).toBe(false);
+    } finally {
+      poller.stop();
+      try {
+        // A failing signal-wiring mutation must still release its real child.
+        await vi.advanceTimersByTimeAsync(AGY_QUOTA_PROBE_TIMEOUT_MS);
+        await poller.drain();
+      } finally {
+        vi.useRealTimers();
+      }
+    }
   }, 40_000);
 });

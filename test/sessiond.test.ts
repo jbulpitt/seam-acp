@@ -257,7 +257,7 @@ describe("#573 seam-sessiond control-plane restart", () => {
   });
 
   it("reports a child that dies while unattached as a dead retained entry", async () => {
-    const { socketPath, client } = await harness();
+    const { socketPath, statePath, client } = await harness();
     await client.spawn({
       slot: 3,
       executable: process.execPath,
@@ -266,7 +266,11 @@ describe("#573 seam-sessiond control-plane restart", () => {
       env: { PATH: process.env.PATH ?? "" },
     });
     client.close();
-    await delay(180);
+    // Keep the control client disconnected until sessiond records the exit.
+    await waitForAsync(async () => {
+      const state = JSON.parse(await fs.readFile(statePath, "utf8")) as { slots: Array<{ slot: number; status: string }> };
+      return state.slots.find((entry) => entry.slot === 3 && entry.status === "dead");
+    });
 
     const replacement = await SessiondClient.connect(socketPath);
     clients.push(replacement);

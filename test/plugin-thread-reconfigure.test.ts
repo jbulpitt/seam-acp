@@ -47,7 +47,7 @@ describe("thread reconfiguration contributions through kernel gates", () => {
     expect(Orchestrator.canEditChannelPreset(h.config, "admin", NAMING_PARENT)).toBe(true);
     expect(h.store.listConfigMutations()).toEqual([]);
   });
-  it("skips real admitted dispatch and renderer queue ownership through the installed facade", async () => {
+  it("skips real admitted dispatch ownership through the installed facade", async () => {
     const h = await fixture();
     h.store.turnAttempts.registerOwner("bulk-test");
     const spec = { id: "assigned", target: THREAD, session: "isolated" as const, prompt: "fixture" };
@@ -55,7 +55,10 @@ describe("thread reconfiguration contributions through kernel gates", () => {
     const preview = slash("preview", { scope: "all", "target-model": "new" });
     await h.orchestrator.handleSlashInteraction(preview as never);
     expect(JSON.stringify(preview.editReply.mock.calls)).toContain("busy/admitted/recovering work");
-    // A finalizer still owns the ordinary channel FIFO after its provider has gone idle.
+    expect(h.store.listConfigMutations()).toEqual([]);
+  });
+  it("skips an isolated renderer tail until its existing FIFO completes", async () => {
+    const h = await fixture();
     let release!: () => void;
     const held = new Promise<void>(done => { release = done; });
     const queued = (h.orchestrator as any).queueOnChannel(THREAD, () => held);
@@ -65,6 +68,24 @@ describe("thread reconfiguration contributions through kernel gates", () => {
       expect(JSON.stringify(tail.editReply.mock.calls)).toContain("busy/admitted/recovering work");
       expect(h.store.listConfigMutations()).toEqual([]);
     } finally { release(); await queued; }
+    const idle = slash("preview", { scope: "all", "target-model": "new" });
+    await h.orchestrator.handleSlashInteraction(idle as never);
+    expect(JSON.stringify(idle.editReply.mock.calls)).toContain("1 eligible");
+  });
+  it("keeps a durable bridge-owned retry untouched without claiming its physical liveness", async () => {
+    const h = await fixture(); const owner = "bridge-fixture";
+    h.store.turnAttempts.registerOwner(owner);
+    const spec = { id: "remote", target: THREAD, session: "isolated" as const, prompt: "fixture" };
+    h.store.turnAttempts.admit(spec); const attempt = h.store.turnAttempts.claim(spec, "fixture identity", owner);
+    h.store.turnAttempts.bind(attempt, "fixture-acp"); h.store.turnAttempts.startPrompt(attempt);
+    h.store.turnAttempts.recordRemoteRecovery(attempt, { version: 1, location: "fixture-host", slot: 1,
+      submissionId: "fixture-submission", acpSessionId: "fixture-acp", delegatedUtc: new Date().toISOString() });
+    h.store.turnAttempts.suspendBoot(owner);
+    const before = h.store.turnAttempts.get(spec.id);
+    const preview = slash("preview", { scope: "all", "target-model": "new" });
+    await h.orchestrator.handleSlashInteraction(preview as never);
+    expect(JSON.stringify(preview.editReply.mock.calls)).toContain("busy/admitted/recovering work");
+    expect(h.store.turnAttempts.get(spec.id)).toEqual(before); expect(h.store.listConfigMutations()).toEqual([]);
   });
   it("restores persistent preview pages and owner-bound Apply after plugin restart", async () => {
     const h = await fixture();

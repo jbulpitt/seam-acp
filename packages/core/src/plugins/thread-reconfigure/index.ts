@@ -35,9 +35,15 @@ export function createThreadReconfigurePlugin(ports: BulkPorts): Plugin {
   };
   const pages = (plan: SavedPlan) => {
     const rows = plan.result ?? plan.rows;
+    const unconfirmed = !plan.result && plan.applying;
     const count = (status: string) => rows.filter(r => r.status === status).length;
-    const lines = [`${plan.result ? "Result" : "Preview"} ${plan.id}: ${rows.length} matches; ${count("eligible")} eligible, ${count("changed")} changed, ${count("unchanged")} unchanged, ${count("skipped")} skipped, ${count("failed")} failed.`,
-      ...plan.notes, ...rows.map(r => `${r.before.id} · ${r.before.name} · guild ${r.before.guildId} / channel ${r.before.parentId}\n${JSON.stringify(r.before.identity)} → ${JSON.stringify(r.after ?? r.before.identity)}\nPreset: ${r.before.preset ? `${r.before.preset.name} (${r.before.preset.id}, scope ${r.before.preset.projectRef ?? "global"})` : "UNKNOWN"}\n${r.status}: ${r.reason ?? r.consequence ?? "no change"}${r.consequence === "reset" ? " — context resets" : ""}; verification ${r.verification ?? "not evaluated"}; saved ${plan.result ? r.saved === undefined ? "unknown" : r.saved : "not attempted"}; runtime ${r.runtime ?? "not applied"}${r.warnings?.length ? `\n${r.warnings.join("\n")}` : ""}`)];
+    const observation = (r: BulkRow) => {
+      if (!r.runtimeSelection) return "";
+      const fast = r.runtimeSelection.fastMode;
+      return `\nACP-selected model: ${r.runtimeSelection.model ?? "UNKNOWN"} (not API served-model verification). Fast: ${fast ? `requested ${fast.requested}; applied ${fast.applied ?? "UNKNOWN"}${fast.error ? `; ${fast.error}` : ""}` : "UNKNOWN"}`;
+    };
+    const lines = [`${unconfirmed ? "Started/unconfirmed" : plan.result ? "Result" : "Preview"} ${plan.id}: ${rows.length} matches; ${unconfirmed ? "PLANNED only — rows may have committed; saved/runtime outcomes UNKNOWN." : `${count("eligible")} eligible, ${count("changed")} changed, ${count("unchanged")} unchanged, ${count("skipped")} skipped, ${count("failed")} failed.`}`,
+      ...plan.notes, ...rows.map(r => `${r.before.id} · ${r.before.name} · guild ${r.before.guildId} / channel ${r.before.parentId}\n${unconfirmed ? "PLANNED only" : "Configuration (before → requested)"}: ${JSON.stringify(r.before.identity)} → ${JSON.stringify(r.after ?? r.before.identity)}\nPreset: ${r.before.preset ? `${r.before.preset.name} (${r.before.preset.id}, scope ${r.before.preset.projectRef ?? "global"})` : "UNKNOWN"}\n${r.status}: ${r.reason ?? r.consequence ?? "no change"}${r.consequence === "reset" ? " — context resets" : ""}; verification ${r.verification ?? "not evaluated"}; saved ${unconfirmed ? "UNKNOWN" : plan.result ? r.saved === undefined ? "unknown" : r.saved : "not attempted"}; runtime ${unconfirmed ? "UNKNOWN" : r.runtime ?? (plan.result ? "unverified" : "not applied")}${observation(r)}${r.warnings?.length ? `\n${r.warnings.join("\n")}` : ""}`)];
     const out: string[] = []; let text = "";
     for (const line of lines) {
       for (let offset = 0; offset < line.length; offset += 1700) {

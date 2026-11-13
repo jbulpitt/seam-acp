@@ -1,4 +1,5 @@
 import type { ThreadConfigurationIdentity } from "../../core/runtime-transition.js";
+import type { FastModeOutcome } from "../../core/fast-mode.js";
 export type Actor = Readonly<{ id: string; name: string }>;
 export interface BulkRequest {
   scope: "all" | "guild" | "channel";
@@ -19,6 +20,7 @@ export interface BulkSnapshot {
 }
 export interface BulkRow {
   before: BulkSnapshot;
+  /** Requested configuration; runtime observations are separate. */
   after?: ThreadConfigurationIdentity;
   consequence?: "none" | "live-apply" | "reload" | "reset";
   verification?: string;
@@ -27,6 +29,7 @@ export interface BulkRow {
   reason?: string;
   saved?: boolean;
   runtime?: "applied" | "next-acquisition" | "pending" | "unverified";
+  runtimeSelection?: { model?: string; fastMode?: FastModeOutcome };
 }
 export interface BulkPlan {
   id: string; actor: Actor; origin: string; request: BulkRequest; rows: BulkRow[]; notes: string[];

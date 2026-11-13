@@ -144,8 +144,16 @@ export class ThreadReconfiguration implements BulkPorts {
         const committed = this.deps.store.get(fresh.id)!;
         await this.deps.runtime().applySavedSelection(committed, described);
         await this.deps.runtime().publishIdentity(committed);
+        const pending = this.deps.router.hasPendingRuntimeTransition(committed.id);
+        const runtime = pending ? undefined : this.deps.router.getRuntime(committed.id);
+        const fallback = runtime?.getLastModelFallbackNotice();
+        const fastMode = runtime?.getFastModeOutcome();
         results.push({ ...prepared, status: "changed", saved: true,
-          runtime: this.deps.router.hasPendingRuntimeTransition(committed.id) ? "pending" : this.deps.router.getRuntime(committed.id) ? "applied" : "next-acquisition" });
+          warnings: [...(prepared.warnings ?? []), ...(fallback ? [fallback] : [])],
+          // A cached owner is not confirmation of the requested identity.
+          runtime: pending ? "pending" : runtime ? "unverified" : "next-acquisition",
+          ...(runtime ? { runtimeSelection: { model: runtime.getSessionInfo()?.currentModelId,
+            ...(fastMode ? { fastMode: { ...fastMode } } : {}) } } : {}) });
       } catch (error) {
         results.push({ ...row, status: "failed", saved, runtime: saved !== false ? "unverified" : undefined, reason: cause(error) });
       }

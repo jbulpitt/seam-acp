@@ -244,3 +244,39 @@ before submitting an opening prompt through the existing kernel admission path.
 The plugin receives catalog snapshots and UI operations, never a session store,
 router, native Discord interaction or agent runtime. Admission and thread naming
 remain in the kernel.
+
+## Bulk thread reconfiguration
+
+The thread-reconfigure built-in contributes `/seamadmin threads preview|page|apply`,
+`preview_thread_reconfiguration`, `thread_reconfiguration_page` and
+`apply_thread_reconfiguration`, plus persistent preview/result buttons. Slash and
+components remain available with MCP off. Configuration-admin, participant,
+managed-channel, lock and agent-channel policy stay in the controller facade.
+Existing single-thread tools retain their same-channel scope.
+
+Choose `all`, `guild` or `channel` (the latter two require `scope-id`), a
+`target-model` and optional bare `target-agent`. Agent, model, role, preset ID
+(and its project scope), and literal case-insensitive name filters intersect.
+Each thread keeps its host. Preview pages show every matched row's proposed
+identity, incidental effort/Fast changes, context consequence and skip reason.
+Apply uses that exact preview ID and rechecks each target; it never adds new
+matches. Busy/archived/detached targets are skipped, quiet active targets have no
+age cutoff, and defaults, named bundles and schedules are unchanged. Read all
+pages before Apply. Results distinguish saved changes, pending/next-acquisition
+runtime application and failures, retaining the underlying cause.
+
+Named preset selection means the last successful explicit application, not a
+subscription or a configuration-equality guess. The preset repository owns an
+additive `preset_applications` metadata table with immutable preset ID, project
+scope, name snapshot and application time. The shared apply/create boundary
+records it only after successful application; later config edits and preset
+renames/deletion do not rewrite history. Older threads remain UNKNOWN.
+
+Preview storage contains data, never configuration apply closures. Each row's
+write is prepared against the current document so applying a later row preserves
+previous changes. The existing saved-selection transition handles work arriving
+after commit. Agent changes reset context; model changes follow adapter catalog
+live/reload/fresh-session semantics. No automatic migration, rebuild, busy-thread
+job or provider validation turn is scheduled. An interrupted Apply is reported as
+started/unconfirmed; inspect its audits and prepare a new preview rather than
+claiming a recovered success.

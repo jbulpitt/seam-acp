@@ -2107,10 +2107,12 @@ export class SeamMcpServer {
     }
 
     try {
-      const invocation = { threadId: record.channelRef, parentId: record.parentRef ?? undefined, args: Object.freeze(structuredClone(args)) };
+      const pluginSpeaker = this.deps.currentSpeakerId?.(record);
+      const invocation = { threadId: record.channelRef, parentId: record.parentRef ?? undefined,
+        ...(pluginSpeaker ? { actor: Object.freeze({ id: pluginSpeaker, name: pluginSpeaker }) } : {}), args: Object.freeze(structuredClone(args)) };
       const pluginTool = this.deps.pluginTools?.get(name, invocation);
       if (pluginTool) {
-        const speaker = this.deps.currentSpeakerId?.(record);
+        const speaker = pluginSpeaker;
         if (pluginTool.access === "mutating" && speaker && isRestrictedParticipant(speaker, this.deps.configParticipantUserIds, this.deps.configAdminUserIds)) {
           return rpcResult(id, textResult(PARTICIPANT_CONFIG_REFUSAL, true));
         }

@@ -1,3 +1,5 @@
+import { ThreadReconfiguration } from "../../core/thread-reconfigure.js";
+import { createThreadReconfigurePlugin } from "../../plugins/thread-reconfigure/index.js";
 import { acknowledgeInteraction, replyToInteraction, collectAcknowledgedInteractions, awaitAcknowledgedInteraction, ignoreCollectorTimeout } from "./interaction-response.js";
 import { runAcknowledged } from "../interaction-response.js";
 import fs from "node:fs";
@@ -993,6 +995,7 @@ export class Orchestrator {
   });
   private readonly recoverySleep: (ms: number) => Promise<void>;
   private readonly fences: FenceRegistry;
+  private readonly threadReconfigureReady: Promise<void>;
 
   constructor(opts: {
     logger: Logger;
@@ -1166,6 +1169,19 @@ export class Orchestrator {
       },
     });
 
+    const threadReconfigure = new ThreadReconfiguration({ config: this.config, store: this.store, router: this.router, adapter: this.adapter,
+      plan: () => this.getConfigApplyPlan(), runtime: () => this.getRuntimeTransition(),
+      allowed: (actor, parent) => Orchestrator.canEditChannelPreset(this.config, actor.id, parent),
+      busy: ref => {
+        const queue = this.inspectChannelQueue(ref);
+        const work = this.inspectThreadWorkProgress(ref, Date.now(), queue);
+        return this.isChannelBusy(ref) || queue.state !== "idle" || queue.unsettledDispatchCount > 0
+          || work.watcherOwnedDispatchIds.length > 0 || work.queuedDispatchIds.length > 0 || work.assignedNotStartedDispatchIds.length > 0
+          || work.activeUnobservedDispatchIds.length > 0 || work.progressing;
+      },
+    });
+    this.threadReconfigureReady = this.plugins.loadBuiltins([{ id: "thread-reconfigure", load: async () => createThreadReconfigurePlugin(threadReconfigure) }]);
+
     this.actionCards = new ActionCardManager({
       store: this.store.actionCards, adapter: this.adapter, logger: this.logger,
       binding: (record, acpSessionId) => {
@@ -1242,7 +1258,7 @@ export class Orchestrator {
     });
   }
 
-  async loadPlugins(): Promise<void> { await Promise.all([this.identityEffects.ready, this.cardVisualsReady, this.scheduleUi.ready, this.configUi.ready, this.presetsUi.ready, this.sessionBrowserReady]); }
+  async loadPlugins(): Promise<void> { await Promise.all([this.identityEffects.ready, this.cardVisualsReady, this.scheduleUi.ready, this.configUi.ready, this.presetsUi.ready, this.sessionBrowserReady, this.threadReconfigureReady]); }
 
   /**
    * Bounded slash autocomplete responders (#slash-autocomplete). Registered

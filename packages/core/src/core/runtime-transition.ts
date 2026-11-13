@@ -257,6 +257,8 @@ export class RuntimeTransition {
     }
   }
 
+  async publishIdentity(record: SessionRecord): Promise<void> { await this.deps.identityCommitted?.(record.id); }
+
   /** Apply an editor's already-audited selection to the retained runtime. */
   async applySavedSelection(record: SessionRecord, before: ConfigDescription): Promise<void> {
     // D10: Save never aborts a live turn. Transition before its next acquisition.
@@ -306,7 +308,8 @@ export class RuntimeTransition {
     const locationChanged = before.location.value !== after.location.value;
     const modelChanged = before.model.value !== after.model.value;
     const effortChanged = before.effort.value !== after.effort.value;
-    if (!agentChanged && !locationChanged && !modelChanged && !effortChanged) return;
+    const fastModeChanged = before.fastMode.value !== after.fastMode.value;
+    if (!agentChanged && !locationChanged && !modelChanged && !effortChanged && !fastModeChanged) return;
 
     const binding = { agentId: after.agent.value, location: after.location.value };
     const model = this.deps.modelCatalog.model(binding, after.model.value);
@@ -316,6 +319,8 @@ export class RuntimeTransition {
       locationChanged,
       modelChanged,
       modelApplicationMode: model?.applicationMode ?? "reload",
+      fastModeChanged: fastModeNeedsFreshSession({ descriptor: this.deps.router.getProfile(after.agent.value, after.location.value)?.fastMode,
+        nextFastMode: after.fastMode.value, fastModeChanged, modelChanged, agentChanged }),
     });
     if (reset.sessionReset) {
       await this.retire(record.id, {
@@ -570,21 +575,17 @@ export class RuntimeTransition {
     }
   }
 
-  async configure(
-    caller: SessionRecord,
-    target: SessionRecord,
-    input: ConfigureThreadInput,
-    actor: MutationActor = { id: null, name: `seam-mcp:${caller.channelRef}` }
-  ): Promise<ConfigureThreadOutcome> {
+  /** Shared write-free selection calculation; never acquires a runtime. */
+  async prepareSelection(target: SessionRecord, input: ConfigureThreadInput) {
     const supplied = input.agent !== undefined || input.cwd !== undefined || input.model !== undefined || input.effort !== undefined || input.role !== undefined || input.disableThreadPrefix !== undefined || input.fastMode !== undefined;
-    if (!supplied) return { ok: false, error: "Provide at least one of agent, cwd, model, effort, role, disableThreadPrefix, or fastMode." };
+    if (!supplied) return { ok: false as const, error: "Provide at least one of agent, cwd, model, effort, role, disableThreadPrefix, or fastMode." };
 
     const before = this.deps.router.describeConfig(target);
     const previousLocation = before.location?.value ?? "local";
     const previousAgentId = before.agent.value;
     const requestedAgent = input.agent?.trim();
     if (input.agent !== undefined && !requestedAgent) {
-      return { ok: false, error: "`agent` must be a non-empty string." };
+      return { ok: false as const, error: "`agent` must be a non-empty string." };
     }
     const parsedAgent = requestedAgent ? parseAgentAtLocation(requestedAgent) : undefined;
     const nextAgentId = parsedAgent?.agentId ?? previousAgentId;
@@ -595,13 +596,13 @@ export class RuntimeTransition {
     try {
       this.deps.router.assertAgentAllowedForRecord(target, nextAgentId);
     } catch (err) {
-      return { ok: false, error: err instanceof Error ? err.message : String(err) };
+      return { ok: false as const, error: err instanceof Error ? err.message : String(err) };
     }
     const profile = this.deps.router.getProfile(nextAgentId, location);
     if (!profile) {
       const fallback = `Unknown agent "${nextAgentId}".`;
       return {
-        ok: false,
+        ok: false as const,
         error: this.deps.router.unregisteredAgentMessage?.(nextAgentId, fallback) ?? fallback,
       };
     }
@@ -615,21 +616,21 @@ export class RuntimeTransition {
     }
     const requestedModel = input.model?.trim();
     if (input.model !== undefined && !requestedModel) {
-      return { ok: false, error: "`model` must be a non-empty string." };
+      return { ok: false as const, error: "`model` must be a non-empty string." };
     }
     const inherited = this.deps.router.describeConfig(target, { inherit: true, agent: nextAgentId, location });
     const inheritSelection = agentChanged && input.model === undefined && input.effort === undefined;
     const requestedTargetModel = requestedModel ?? (agentChanged ? inherited.model.value : before.model.value);
     if (!requestedTargetModel) {
       return {
-        ok: false,
+        ok: false as const,
         error: `Model catalog for ${nextAgentId}@${location} is warming/unavailable.`,
       };
     }
 
     const requestedEffort = normalizeEffort(input.effort);
     if (input.effort !== undefined && !requestedEffort) {
-      return { ok: false, error: "`effort` must be a non-empty string or `auto`." };
+      return { ok: false as const, error: "`effort` must be a non-empty string or `auto`." };
     }
     const selection = assessModelSelection(this.deps.modelCatalog,
       { agentId: nextAgentId, location },
@@ -639,7 +640,7 @@ export class RuntimeTransition {
     // keep this registered agent usable and are passed to its provider unchanged.
     if (!selection.allowed) {
       return {
-        ok: false,
+        ok: false as const,
         error: `Model "${requestedTargetModel}" is unavailable in the cached catalog for ${nextAgentId}@${location}.`,
       };
     }
@@ -674,7 +675,7 @@ export class RuntimeTransition {
       agentId: nextAgentId,
       descriptor: profile.fastMode,
     });
-    if (!eligible.ok) return { ok: false, error: eligible.error };
+    if (!eligible.ok) return { ok: false as const, error: eligible.error };
     let nextFastMode = input.fastMode ?? before.fastMode?.value ?? false;
     if (nextFastMode && !profile.fastMode) {
       // Inherited-on + agent switched to one without Fast: force it off rather
@@ -709,7 +710,7 @@ export class RuntimeTransition {
         !staticEffortValues.includes(desiredEffort))
     ) {
       return {
-        ok: false,
+        ok: false as const,
         error:
           `Effort "${desiredEffort}" is not supported for ${nextAgentId}/${nextModel}. ` +
           `Valid values: ${staticEffortValues.length ? staticEffortValues.join(", ") : "none"}.`,
@@ -717,6 +718,35 @@ export class RuntimeTransition {
     }
 
     const beforeIdentity = identityFromDescription(before);
+    const plannedIdentity: ThreadConfigurationIdentity = {
+      agent: nextAgentId,
+      model: nextModel,
+      effort: effortTouched ? desiredEffort ?? "auto" : before.effort.value ?? "auto",
+      role: input.role === undefined ? before.role.value ?? "auto" : nextRole ?? "auto",
+      disableThreadPrefix: nextDisableThreadPrefix,
+      fastMode: nextFastMode,
+    };
+    const plannedChanges = diffIdentity(beforeIdentity, plannedIdentity);
+
+    return { ok: true as const, before, previousLocation, previousAgentId, parsedAgent, nextAgentId,
+      location, locationChanged, profile, agentChanged, cwd, inheritSelection, selection, catalogModel,
+      nextModel, modelChanged, effortMechanism, desiredEffort, nextRole, fastModeChanged, reset,
+      effortTouched, beforeIdentity, plannedIdentity, plannedChanges, warnings, nextFastMode };
+  }
+
+  async configure(
+    caller: SessionRecord,
+    target: SessionRecord,
+    input: ConfigureThreadInput,
+    actor: MutationActor = { id: null, name: `seam-mcp:${caller.channelRef}` }
+  ): Promise<ConfigureThreadOutcome> {
+    const prepared = await this.prepareSelection(target, input);
+    if (!prepared.ok) return prepared;
+    const { before, previousLocation, parsedAgent, nextAgentId, location, locationChanged, profile,
+      agentChanged, cwd, inheritSelection, selection, catalogModel, nextModel, modelChanged,
+      effortMechanism, desiredEffort, nextRole, fastModeChanged, reset, effortTouched,
+      beforeIdentity, plannedChanges, warnings } = prepared;
+    let { nextFastMode } = prepared;
     const withBinding = (outcome: ConfigureThreadSuccess): ConfigureThreadSuccess => {
       const after = this.deps.router.describeConfig(this.deps.store.get(target.id) ?? target);
       const field = (from: string, to: string) => ({ before: from, after: to, changed: from !== to });
@@ -730,15 +760,6 @@ export class RuntimeTransition {
         ...(input.cwd !== undefined ? { resetPending: outcome.resetPending ?? false } : {}),
       };
     };
-    const plannedIdentity: ThreadConfigurationIdentity = {
-      agent: nextAgentId,
-      model: nextModel,
-      effort: desiredEffort ?? "auto",
-      role: input.role === undefined ? before.role.value ?? "auto" : nextRole ?? "auto",
-      disableThreadPrefix: nextDisableThreadPrefix,
-      fastMode: nextFastMode,
-    };
-    const plannedChanges = diffIdentity(beforeIdentity, plannedIdentity);
 
     // A successful set is still useful when it is a no-op: return the complete
     // identity with explicit `(no change)` state and do not perturb the runtime.

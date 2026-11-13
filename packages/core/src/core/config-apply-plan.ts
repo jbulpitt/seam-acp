@@ -1031,6 +1031,7 @@ export class ConfigApplyPlan {
     // Drop the runtime so the next message picks up every change above.
     await this.runtime.retire(record.id);
 
+    this.settings!.store.presets.recordApplication(record.id, preset);
     await this.identityEffects.flush(record.id);
 
     const body =

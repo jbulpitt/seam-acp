@@ -555,6 +555,17 @@ export class DiscordAdapter implements ChatAdapter {
     return missed.length;
   }
 
+  async configurationThread(channel: ChannelRef) {
+    try {
+      const thread = await this.client.channels.fetch(channel.id, { force: true });
+      if (!thread?.isThread() || !thread.parentId || isObfuscatedChannel(thread)) return undefined;
+      return { name: thread.name, parentId: thread.parentId, guildId: thread.guildId };
+    } catch (error) {
+      if ((error as { code?: number }).code === 10003) return undefined;
+      throw error;
+    }
+  }
+
   async configParentChannels() {
     const parents: Array<{ id: string; name: string; guildId: string; guildName: string }> = [];
     for (const guild of this.client.guilds.cache.values()) {

@@ -115,6 +115,8 @@ export interface ChatAdapter {
   /** Resolve a bare channel id, including its thread parent. */
   resolveChannel?(channel: ChannelRef): Promise<ChannelRef>;
 
+  configurationThread?(channel: ChannelRef): Promise<{ name: string; parentId: string; guildId: string } | undefined>;
+
   /** Explicit admin cleanup inventory, never used at boot or for admission. */
   configParentChannels?(): Promise<Array<{ id: string; name: string; guildId: string; guildName: string }>>;
 

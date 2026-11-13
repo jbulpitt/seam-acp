@@ -99,6 +99,14 @@ export function defaultSessionConfig(
   return { model: defaultModel, permissionPolicy: defaultPolicy };
 }
 
+/** Last successful application, independent of later field edits. */
+export interface PresetApplication {
+  id: string;
+  projectRef: string | null;
+  name: string;
+  appliedUtc: string;
+}
+
 /**
  * A named, reusable bundle of session configuration.
  *

@@ -1,4 +1,4 @@
-import type { AgentProfile, ISessionManager, SessionSummary } from "@seam/adapters";
+import type { AgentAdapter, ISessionManager, SessionSummary } from "@seam/adapters";
 import { promises as fsp } from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -38,20 +38,20 @@ interface SessionActionServices {
   compactionModel(binding: CatalogBinding): string;
   compactionWindow(binding: CatalogBinding, model: string): number;
   launch(args: {
-    profile: AgentProfile; location: string; cwd: string; model?: string;
+    profile: AgentAdapter; location: string; cwd: string; model?: string;
     effort?: string; sessionId: string;
   }): Pick<ConstructorParameters<typeof AgentRuntime>[0], "spawnFn" | "mcpServers">;
   cleanup(args: {
-    location: string; profile: AgentProfile; manager: ISessionManager;
+    location: string; profile: AgentAdapter; manager: ISessionManager;
     cwd: string; sessionId: string; label: string;
   }): Promise<void>;
   seed(args: {
-    profile: AgentProfile; restrictionChannelId: string; cwd: string;
+    profile: AgentAdapter; restrictionChannelId: string; cwd: string;
     model?: string; effort?: string; summary: string; location: string; sessionId: string;
   }): Promise<string>;
   buildSeed(args: {
     bindingThread?: ChannelRef;
-    profile: AgentProfile; manager: ISessionManager; agentId: string; location: string;
+    profile: AgentAdapter; manager: ISessionManager; agentId: string; location: string;
     cwd: string; sessionId: string; restrictionChannelId: string;
   }): Promise<{ seed: string; keptTurns: number; summarizedTurns: number; pinnedCount: number } | null>;
   rebuild(args: {
@@ -126,7 +126,7 @@ export class SessionActions {
     record: SessionRecord;
     manager: ISessionManager;
     cwd: string;
-    profile: AgentProfile;
+    profile: AgentAdapter;
     binding: CatalogBinding;
     services: SessionActionServices;
   }) {}
@@ -297,7 +297,7 @@ export class SessionActions {
     return this.migrateTo(sessionId, this.deps.router.getProfile(targetAgentId, this.deps.binding.location)!, actor, complete, failed);
   }
 
-  private migrateTo(sessionId: string, targetProfile: AgentProfile, actor: MutationActor, complete: (newSessionId: string) => Promise<void>,
+  private migrateTo(sessionId: string, targetProfile: AgentAdapter, actor: MutationActor, complete: (newSessionId: string) => Promise<void>,
     failed?: (error: unknown) => Promise<void>): Promise<void> {
     const { record, binding, services, cwd } = this.deps;
     return this.summarize(sessionId, "migrate", cwd, async (summary) => {

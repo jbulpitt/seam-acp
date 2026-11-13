@@ -28,7 +28,7 @@ import { SessionRouter } from "../packages/core/src/core/session-router.js";
 import { SessionStore } from "../packages/core/src/core/session-store.js";
 import type { ScheduledPrompt } from "../packages/core/src/core/scheduled-prompts/types.js";
 import type { SessionRecord } from "../packages/core/src/core/types.js";
-import type { AgentProfile } from "@seam/adapters";
+import type { AgentAdapter } from "@seam/adapters";
 import type { ThreadPreset } from "../packages/core/src/config.js";
 import type { Logger } from "../packages/core/src/lib/logger.js";
 import { fixtureModelCatalog } from "./model-catalog-fixture.js";
@@ -69,7 +69,7 @@ const profiles = [
     staticModels: GROK_MODELS,
     effort: { mechanism: "spawnArgs", levels: ["low", "medium", "high"] },
   },
-] as unknown as AgentProfile[];
+] as unknown as AgentAdapter[];
 
 function schedule(over: Partial<ScheduledPrompt> = {}): ScheduledPrompt {
   return {
@@ -300,7 +300,7 @@ async function fireSchedule(
   row: ScheduledPrompt,
   over: {
     describeConfig?: SessionRouter["describeConfig"];
-    resolveProfileForChannel?: (agentId: string, channelId: string, location?: string) => AgentProfile | undefined;
+    resolveProfileForChannel?: (agentId: string, channelId: string, location?: string) => AgentAdapter | undefined;
   } = {}
 ): Promise<FireCapture> {
   const jobs: FireCapture["jobs"] = [];

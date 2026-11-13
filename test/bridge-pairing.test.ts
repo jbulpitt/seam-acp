@@ -10,7 +10,7 @@ import { PresetsFileSchema } from "../packages/core/src/config.js";
 import { hashBridgeToken, mintBridgeToken, tokenMatchesHash } from "../packages/core/src/core/bridge-pairing.js";
 import { handleBridgeSlash } from "../packages/core/src/platforms/discord/bridge.js";
 import type { Logger } from "../packages/core/src/lib/logger.js";
-import type { AgentProfile } from "@seam/adapters";
+import type { AgentAdapter } from "@seam/adapters";
 import type { SessionRecord } from "../packages/core/src/core/types.js";
 import type { ConfigDescription } from "../packages/core/src/core/session-router.js";
 
@@ -51,7 +51,7 @@ function makeService(): ConfigMutationService {
   return new ConfigMutationService({
     store,
     describeConfig,
-    profiles: new Map([["claude", { id: "claude" } as AgentProfile]]),
+    profiles: new Map([["claude", { id: "claude" } as AgentAdapter]]),
     defaultModel: "x",
     presetsFile: file,
     tierCEnabled: true,

@@ -27,7 +27,7 @@ import { QuotaRegistry } from "../packages/core/src/core/quota/quota-registry.js
 import { fetchGrokUsage } from "@seam/adapters";
 import type { AgentQuota } from "../packages/core/src/core/quota/agent-quota.js";
 import type { Logger } from "../packages/core/src/lib/logger.js";
-import type { AgentProfile } from "@seam/adapters";
+import type { AgentAdapter } from "@seam/adapters";
 
 const silent = pino({ level: "silent" }) as unknown as Logger;
 const fakeGrok = fileURLToPath(new URL("./fixtures/grok/fake-acp.mjs", import.meta.url));
@@ -99,7 +99,7 @@ function quota(agentId: string, displayName: string): AgentQuota {
 describe("#361 an aborted Ollama Cloud quota refresh cancels the work", () => {
   it("kills the ollama-usage child instead of leaving it to its own timer", async () => {
     const { cliPath, pidFile } = stageHangingOllama();
-    const profile = { id: "ollama-cloud", displayName: "Ollama Cloud" } as AgentProfile;
+    const profile = { id: "ollama-cloud", displayName: "Ollama Cloud" } as AgentAdapter;
     const [source] = createAgentQuotaSources([profile], { ollamaUsageCliPath: cliPath });
     expect(source).toBeDefined();
 
@@ -127,7 +127,7 @@ describe("#361 an aborted Ollama Cloud quota refresh cancels the work", () => {
   it("refuses only Ollama Cloud: the other sources still report in the same refresh", async () => {
     // The blast-radius claim, tested rather than asserted.
     const { cliPath, pidFile } = stageHangingOllama();
-    const profile = { id: "ollama-cloud", displayName: "Ollama Cloud" } as AgentProfile;
+    const profile = { id: "ollama-cloud", displayName: "Ollama Cloud" } as AgentAdapter;
     const [ollamaSource] = createAgentQuotaSources([profile], { ollamaUsageCliPath: cliPath });
     let healthyCalls = 0;
     const healthy: AgentQuotaSource = {
@@ -164,7 +164,7 @@ describe("#361 an aborted Ollama Cloud quota refresh cancels the work", () => {
 
   it("does not spawn at all for a refresh that was already abandoned", async () => {
     const { cliPath, pidFile } = stageHangingOllama();
-    const profile = { id: "ollama-cloud", displayName: "Ollama Cloud" } as AgentProfile;
+    const profile = { id: "ollama-cloud", displayName: "Ollama Cloud" } as AgentAdapter;
     const [source] = createAgentQuotaSources([profile], { ollamaUsageCliPath: cliPath });
     const controller = new AbortController();
     controller.abort(new Error("already abandoned"));

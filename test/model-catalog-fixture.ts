@@ -1,11 +1,11 @@
-import type { AgentProfile, CatalogEffort, CatalogModel } from "@seam/adapters";
+import type { AgentAdapter, CatalogEffort, CatalogModel } from "@seam/adapters";
 import type { CatalogBinding, ModelCatalogService } from "../packages/core/src/core/model-catalog/service.js";
 
 /** Small cache-only catalog fake for integration tests that do not open SQLite. */
-export function fixtureModelCatalog(profiles: ReadonlyArray<AgentProfile>): ModelCatalogService {
+export function fixtureModelCatalog(profiles: ReadonlyArray<AgentAdapter>): ModelCatalogService {
   const byAgent = new Map(profiles.map((profile) => [profile.id, profile]));
   const rows = (binding: CatalogBinding): CatalogModel[] => {
-    const profile = byAgent.get(binding.agentId) as (AgentProfile & {
+    const profile = byAgent.get(binding.agentId) as (AgentAdapter & {
       staticModels?: ReadonlyArray<{ modelId: string; name: string; contextLimit?: number }>;
     }) | undefined;
     if (!profile) return [];
@@ -63,7 +63,7 @@ export function fixtureModelCatalog(profiles: ReadonlyArray<AgentProfile>): Mode
       ? all.find((entry) => entry.default) ?? null
       : all.find((entry) => entry.id === id || entry.aliases.includes(id)) ?? null;
     if (exact) return exact;
-    const profile = byAgent.get(binding.agentId) as (AgentProfile & { staticModels?: unknown[] }) | undefined;
+    const profile = byAgent.get(binding.agentId) as (AgentAdapter & { staticModels?: unknown[] }) | undefined;
     if (!profile || profile.staticModels?.length) return null;
     const seed = all[0];
     if (!seed) return null;

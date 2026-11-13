@@ -10,7 +10,7 @@ import { EventEmitter } from "node:events";
 import { PassThrough, Readable, Writable } from "node:stream";
 import { agent, methods, ndJsonStream, PROTOCOL_VERSION, RequestError } from "@agentclientprotocol/sdk";
 import { pino } from "pino";
-import { classifyClaudeError, classifyCodexError, type AgentProfile } from "@seam/adapters";
+import { classifyClaudeError, classifyCodexError, type AgentAdapter } from "@seam/adapters";
 import { SessionRouter } from "../packages/core/src/core/session-router.js";
 import { SessionStore } from "../packages/core/src/core/session-store.js";
 import { Orchestrator } from "../packages/core/src/platforms/discord/orchestrator.js";
@@ -144,7 +144,7 @@ function harness(location: "local" | "bridge-a", mode: AcpMode, logger = silent)
     staticModels: [{ modelId: MODEL, name: "Opus" }],
     effort: { mechanism: "none", levels: [] },
     spawn: syntheticAcp(calls, mode),
-  } as unknown as AgentProfile;
+  } as unknown as AgentAdapter;
   const threadPresets = new Map<string, ThreadPreset>(
     location === "local" ? [] : [[THREAD, { location }]],
   );

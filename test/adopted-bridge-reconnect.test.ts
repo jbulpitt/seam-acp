@@ -5,7 +5,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { pino } from "pino";
-import { makeMux, type AgentProfile } from "@seam/adapters";
+import { makeMux, type AgentAdapter } from "@seam/adapters";
 import type { BridgeSlotHealth } from "../packages/adapters/src/mux.js";
 import { AgentRuntime } from "../packages/core/src/agents/agent-runtime.js";
 import { SessionStore } from "../packages/core/src/core/session-store.js";
@@ -161,14 +161,14 @@ async function setup(source: "inbound" | "dispatch" | "schedule" = "inbound", st
   let adoptionUnavailable = options.adoptionUnavailable ?? false;
   const router = testSessionRouter({
     getProfile: () => ({ id: "codex", displayName: "Codex", defaultModel: "test",
-      harness: "codex", provider: "openai", account: { provenance: "configured-context" } }) as AgentProfile,
+      harness: "codex", provider: "openai", account: { provenance: "configured-context" } }) as AgentAdapter,
     isBusy: () => runtime?.busy ?? false,
     getRuntime: () => runtime,
     describeConfig: () => ({ model: { value: "test" }, agent: { value: "codex" },
       location: { value: "remote" }, cwd: { value: "/synthetic" } }),
     adoptRecoveryRuntime: (_record: unknown, child: any, session: string) => {
       if (adoptionUnavailable) throw new Error("fixture bridge catalog not ready");
-      runtime = new AgentRuntime({ profile: { id: "codex" } as AgentProfile,
+      runtime = new AgentRuntime({ profile: { id: "codex" } as AgentAdapter,
         logger: pino({ level: "silent" }) as any, spawnFn: () => { throw new Error("must not spawn"); },
         ...(options.hangProbe ? { bridgeHealth: { sendCmd: mux.sendCmd }, hangSilenceMs: 20 } : {}),
       });

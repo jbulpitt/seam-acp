@@ -148,15 +148,8 @@ export type AgentClientMetadata = Pick<AgentAdapter,
 };
 
 /**
- * §4 agent-adapter contract, implemented in-process for PR1.
- *
- * SUPERSET of the pre-PR1 `AgentProfile`: every existing field and
- * `spawn(modelOverride?, effortOverride?, mcpServers?, slot?)` stay as the
- * runtime path. `slot` is per-slot cwd and env. It is not `spawn(cwd, opts)`,
- * which would move the model argument and break every existing caller.
- *
- * New methods are real (not comments) but are safe no-ops or
- * `sessionManager` delegates until PR3/PR4 call them over the bus.
+ * Agent adapter contract. `spawn(modelOverride?, effortOverride?, mcpServers?, slot?)`
+ * keeps cwd/env on `slot`, rather than `spawn(cwd, opts)`.
  */
 export interface AgentAdapter extends AgentExecutionIdentity {
   /** Stable id used in commands and DB rows ("copilot", "claude-code", …). */
@@ -355,14 +348,8 @@ export interface AgentAdapter extends AgentExecutionIdentity {
   classifyError?(error: unknown): AdapterErrorClassification;
 }
 
-/**
- * Back-compat alias. The rest of the tree (orchestrator, runtime, router)
- * keeps importing `AgentProfile`; it is the same type as `AgentAdapter`.
- */
-export type AgentProfile = AgentAdapter;
-
 /** Fields a local factory already implements; `asLocalAdapter` fills the rest. */
-export type AgentProfileCore = Omit<
+export type AgentAdapterCore = Omit<
   AgentAdapter,
   | "describe"
   | "prepare"
@@ -383,7 +370,7 @@ export type AgentProfileCore = Omit<
  * `writeAttachment` delegate to `sessionManager` when present, and the
  * remaining methods are safe no-ops.
  */
-export function asLocalAdapter(core: AgentProfileCore): AgentAdapter {
+export function asLocalAdapter(core: AgentAdapterCore): AgentAdapter {
   const adapter: AgentAdapter = {
     ...core,
     harness: core.harness ?? "unknown",

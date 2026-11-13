@@ -5,7 +5,7 @@ import path from "node:path";
 import { EventEmitter } from "node:events";
 import { PassThrough, Readable, Writable } from "node:stream";
 import { agent, methods, ndJsonStream, PROTOCOL_VERSION, RequestError } from "@agentclientprotocol/sdk";
-import type { AgentProfile } from "@seam/adapters";
+import type { AgentAdapter } from "@seam/adapters";
 import { AgentRuntime } from "../packages/core/src/agents/agent-runtime.js";
 import { newSubmissionEvidence, observeClaudeSubmission, observePromptWrites } from "../packages/core/src/agents/submission-evidence.js";
 import { SessionStore } from "../packages/core/src/core/session-store.js";
@@ -66,7 +66,7 @@ async function runtimeFixture(fault: "before" | "accepted" | "effect" | "update"
     .onNotification(methods.agent.session.cancel, () => {})
     .connect(ndJsonStream(Writable.toWeb(stdout) as WritableStream<Uint8Array>, Readable.toWeb(stdin) as ReadableStream<Uint8Array>));
   const profile = { ...(adapter === "claude" ? makeClaudeProfile({}) : { id: adapter }),
-    defaultModel: "default", spawn: () => child } as unknown as AgentProfile;
+    defaultModel: "default", spawn: () => child } as unknown as AgentAdapter;
   const runtime = new AgentRuntime({ profile, logger, spawnFn: profile.spawn.bind(profile) });
   runtime.onEvent(event => { if (event.kind === "submission-evidence") h.store.turnAttempts.recordSubmission(h.attempt, event.evidence); });
   await runtime.start(); await runtime.newSession({ cwd: tmpdir() });

@@ -14,7 +14,7 @@
  * 6.5k-line orchestrator.
  */
 
-import type { AgentProfile } from "@seam/adapters";
+import type { AgentAdapter } from "@seam/adapters";
 import type { SubmissionEvidence } from "../agents/submission-evidence.js";
 import type { McpServer } from "@agentclientprotocol/sdk";
 import type { AgentEventHandler, RemoteRecoveryDelegation } from "../agents/agent-runtime.js";
@@ -76,7 +76,7 @@ export interface InjectTurnOptions {
 
   /** Agent profile to run. Required when `target` is `null`; otherwise
    *  resolved from the target's session record. */
-  profile?: AgentProfile;
+  profile?: AgentAdapter;
   /** Owning Discord channel for a target-less isolated run. Required to enforce
    * an agent/channel restriction when the turn has no SessionRecord target. */
   restrictionChannelId?: string;
@@ -149,7 +149,7 @@ export interface InjectTurnOptions {
   spawnFn?: (
     model?: string,
     effort?: string
-  ) => ReturnType<AgentProfile["spawn"]> | Promise<ReturnType<AgentProfile["spawn"]>>;
+  ) => ReturnType<AgentAdapter["spawn"]> | Promise<ReturnType<AgentAdapter["spawn"]>>;
   /** MCP servers injected into an isolated bridge spawn (token + reachable URL). */
   mcpServers?: McpServer[];
 

@@ -5,7 +5,7 @@ import path from "node:path";
 import { pino } from "pino";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { RequestError, type SessionUpdate } from "@agentclientprotocol/sdk";
-import { classifyCopilotError, type AgentProfile } from "@seam/adapters";
+import { classifyCopilotError, type AgentAdapter } from "@seam/adapters";
 import { AgentRuntime } from "../packages/core/src/agents/agent-runtime.js";
 import { Orchestrator } from "../packages/core/src/platforms/discord/orchestrator.js";
 import { SessionStore } from "../packages/core/src/core/session-store.js";
@@ -33,7 +33,7 @@ function fixture(program: (feed: Feed, attempt: number) => Promise<void>) {
   const store = new SessionStore(path.join(dir, "fixture.db"));
   const logger = pino({ level: "silent" });
   const profile = { id: "copilot", defaultModel: "fixture-model", classifyError: classifyCopilotError,
-    spawn() { throw new Error("provider spawn forbidden"); } } as unknown as AgentProfile;
+    spawn() { throw new Error("provider spawn forbidden"); } } as unknown as AgentAdapter;
   const runtime = new AgentRuntime({ profile, logger: logger as never,
     spawnFn: () => { throw new Error("provider spawn forbidden"); } });
   cleanups.push(async () => {

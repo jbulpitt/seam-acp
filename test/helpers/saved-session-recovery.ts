@@ -5,7 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { pino } from "pino";
-import { makeMux, type AgentProfile } from "@seam/adapters";
+import { makeMux, type AgentAdapter } from "@seam/adapters";
 import { classifyCodexError } from "../../packages/adapters/src/profiles/codex.js";
 import { SessiondServer } from "../../packages/bridge/src/sessiond-server.js";
 import { SessiondClient } from "../../packages/bridge/src/sessiond-client.js";
@@ -126,7 +126,7 @@ export async function savedSessionHost(options: {
     configJson: "{}", createdUtc: now, updatedUtc: now };
   store.upsert(record);
   const profile = { id: "codex", defaultModel: "default", classifyError: classifyCodexError,
-    spawn() { throw new Error("must use bridge"); } } as unknown as AgentProfile;
+    spawn() { throw new Error("must use bridge"); } } as unknown as AgentAdapter;
   const catalog = fixtureModelCatalog([profile]);
   const routers: SessionRouter[] = [];
   const notices: Array<{ channel: unknown; text: string }> = [];

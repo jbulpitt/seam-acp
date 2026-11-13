@@ -12,7 +12,7 @@ import {
   PROTOCOL_VERSION,
   type SessionUpdate,
 } from "@agentclientprotocol/sdk";
-import type { AgentProfile } from "@seam/adapters";
+import type { AgentAdapter } from "@seam/adapters";
 import {
   codexAsyncUserInputFromUpdate,
   type AsyncUserInputQuestion,
@@ -237,7 +237,7 @@ function makeHarness(
     defaultModel: "gpt-fixture",
     effort: { mechanism: "none", levels: [] },
     spawn,
-  } as unknown as AgentProfile;
+  } as unknown as AgentAdapter;
   const store = opts.store ?? new SessionStore(path.join(dir, "state.db"));
   const catalog = fixtureModelCatalog([profile]);
   const router = new SessionRouter({

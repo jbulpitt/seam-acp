@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import { pino } from "pino";
-import type { AgentProfile } from "@seam/adapters";
+import type { AgentAdapter } from "@seam/adapters";
 import { AgentRuntime } from "../packages/core/src/agents/agent-runtime.js";
 import type { PermissionPolicyMode } from "../packages/core/src/core/types.js";
 import type { Logger } from "../packages/core/src/lib/logger.js";
@@ -17,7 +17,7 @@ function harness(initial: PermissionPolicyMode = "always", agentId = "codex") {
   };
   const observed = vi.fn();
   const runtime = new AgentRuntime({
-    profile: { id: agentId } as AgentProfile,
+    profile: { id: agentId } as AgentAdapter,
     logger: pino({ level: "silent" }) as Logger,
     permissionMode: () => policy,
     onSessionModes: observed,

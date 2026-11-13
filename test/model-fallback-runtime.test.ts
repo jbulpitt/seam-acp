@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { pino } from "pino";
-import { readErrorClassification, unclassified, type AgentProfile } from "@seam/adapters";
+import { readErrorClassification, unclassified, type AgentAdapter } from "@seam/adapters";
 import { AgentRuntime, type AgentEvent } from "../packages/core/src/agents/agent-runtime.js";
 import type { ModelFallbackPlan } from "../packages/core/src/core/model-fallback.js";
 import { SessionRouter } from "../packages/core/src/core/session-router.js";
@@ -14,7 +14,7 @@ const logger = pino({ level: "silent" });
 const profile = { id: "claude", defaultModel: "original",
   classifyError: (error: unknown) => readErrorClassification(error) ?? unclassified("claude"),
   spawn: () => { throw new Error("No provider process allowed in this test"); },
-} as unknown as AgentProfile;
+} as unknown as AgentAdapter;
 const rejection = (kind = "model_not_found") => Object.assign(new Error(`provider rejected selection: ${kind}`),
   { data: { errorKind: kind, agentId: "claude" } });
 const fallback = (): ModelFallbackPlan => ({ version: 1, agentId: "claude", location: "local",

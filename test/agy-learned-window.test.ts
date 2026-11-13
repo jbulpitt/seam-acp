@@ -6,7 +6,7 @@ import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { pino } from "pino";
 import { agyNativeCatalogScope, makeAgyProfile, manifestCatalogSource,
-  type AdapterCatalogCandidate, type AgentProfile } from "@seam/adapters";
+  type AdapterCatalogCandidate, type AgentAdapter } from "@seam/adapters";
 import { ModelCatalogService } from "../packages/core/src/core/model-catalog/service.js";
 import { ModelCatalogStore } from "../packages/core/src/core/model-catalog/store.js";
 import { SessionStore } from "../packages/core/src/core/session-store.js";
@@ -178,7 +178,7 @@ describe("durable AGY learned context windows", () => {
         SEAM_AGY_R4B_METADATA_MODE_FILE: mode, SEAM_AGY_R4B_CONTEXT_WINDOW: String(window) } });
     const native = makeAgyProfile({ runtime: fixture.runtime, dataDir: dir, defaultModel: "fixture-native-model", exposeGlobalStaging: false });
     const pids: number[] = [];
-    const profile: AgentProfile = { ...native, spawn() {
+    const profile: AgentAdapter = { ...native, spawn() {
       const child = spawn(process.execPath, [fileURLToPath(new URL("./fixtures/agy-catalog-child.mjs", import.meta.url))], {
         cwd: dir, env: { ...process.env, SEAM_TEST_DATA: dir,
           PATH: `${path.dirname(fixture.executable)}${path.delimiter}${process.env.PATH ?? ""}` },

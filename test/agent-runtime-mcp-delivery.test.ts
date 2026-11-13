@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { McpServer } from "@agentclientprotocol/sdk";
-import type { AgentProfile } from "@seam/adapters";
+import type { AgentAdapter } from "@seam/adapters";
 import { AgentRuntime } from "../packages/core/src/agents/agent-runtime.js";
 import { logger } from "../packages/core/src/lib/logger.js";
 
@@ -34,7 +34,7 @@ function runtime(mcpServersAtSpawn: boolean) {
     id: "test",
     defaultModel: "default",
     mcpServersAtSpawn,
-  } as unknown as AgentProfile;
+  } as unknown as AgentAdapter;
   const rt = new AgentRuntime({ profile, logger, mcpServers: [seamMcp], spawnFn: () => { throw new Error("unused"); } });
   const conn = new FakeConn();
   (rt as unknown as { connection: unknown }).connection = conn;

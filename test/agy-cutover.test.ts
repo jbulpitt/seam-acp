@@ -5,7 +5,7 @@ import { EventEmitter } from "node:events";
 import { PassThrough } from "node:stream";
 import { afterEach, describe, expect, it } from "vitest";
 import { pino } from "pino";
-import type { AgentProfile } from "@seam/adapters";
+import type { AgentAdapter } from "@seam/adapters";
 import { SessionRouter } from "../packages/core/src/core/session-router.js";
 import { SessionStore } from "../packages/core/src/core/session-store.js";
 import type { ModelCatalogService } from "../packages/core/src/core/model-catalog/service.js";
@@ -17,7 +17,7 @@ afterEach(() => {
   for (const dir of dirs.splice(0)) fs.rmSync(dir, { recursive: true, force: true });
 });
 
-function profile(id: string): AgentProfile {
+function profile(id: string): AgentAdapter {
   return {
     id,
     displayName: id,
@@ -28,7 +28,7 @@ function profile(id: string): AgentProfile {
         stdin: new PassThrough(), stdout: new PassThrough(), stderr: new PassThrough(), kill() {},
       });
     },
-  } as unknown as AgentProfile;
+  } as unknown as AgentAdapter;
 }
 
 describe("agy public identity cutover", () => {

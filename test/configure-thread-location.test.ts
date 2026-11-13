@@ -6,7 +6,7 @@ import os from "node:os";
 import path from "node:path";
 import { pino } from "pino";
 import { WebSocket } from "ws";
-import { PROTOCOL_VERSION, type AgentProfile } from "@seam/adapters";
+import { PROTOCOL_VERSION, type AgentAdapter } from "@seam/adapters";
 import { dispatchBridgeRpc } from "../packages/bridge/src/rpc.js";
 import { buildChannelPresetMaps, type Config } from "../packages/core/src/config.js";
 import { BridgeHub } from "../packages/core/src/core/bridge-hub.js";
@@ -58,7 +58,7 @@ vi.mock("../packages/core/src/agents/agent-runtime.js", async importOriginal => 
 const logger = pino({ level: "silent" });
 const profiles = ["claude", "codex"].map(id => ({ id, displayName: id, defaultModel: "native",
   staticModels: [{ modelId: "native", name: "Native" }], effort: { mechanism: "meta", levels: ["low", "high"] },
-})) as unknown as AgentProfile[];
+})) as unknown as AgentAdapter[];
 const channel = { platform: "discord", id: "111111111111111111", parentId: "222222222222222222" };
 const stops: Array<() => void | Promise<void>> = [];
 let dir: string;

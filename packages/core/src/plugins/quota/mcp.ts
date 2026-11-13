@@ -1,9 +1,9 @@
 import type { McpContribution } from "../mcp-registry.js";
 import type { QuotaRegistry } from "../../core/quota/quota-registry.js";
-import type { AgentProfile } from "@seam/adapters";
+import type { AgentAdapter } from "@seam/adapters";
 import type { AgentQuota } from "../../core/quota/agent-quota.js";
 
-export function quotaMcp(registry: QuotaRegistry, agents: () => readonly Pick<AgentProfile, "id" | "displayName" | "brand">[] = () => []): McpContribution[] {
+export function quotaMcp(registry: QuotaRegistry, agents: () => readonly Pick<AgentAdapter, "id" | "displayName" | "brand">[] = () => []): McpContribution[] {
   return [{
     descriptor: {
       name: "agent_quota",

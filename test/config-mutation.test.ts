@@ -9,7 +9,7 @@ import { reloadChannelPresets } from "../packages/core/src/core/config-reload.js
 import { PresetsFileSchema } from "../packages/core/src/config.js";
 import type { ChannelPreset, ThreadPreset } from "../packages/core/src/config.js";
 import type { ConfigDescription } from "../packages/core/src/core/session-router.js";
-import type { AgentProfile } from "@seam/adapters";
+import type { AgentAdapter } from "@seam/adapters";
 import type { SessionRecord } from "../packages/core/src/core/types.js";
 import type { ScheduledPrompt } from "../packages/core/src/core/scheduled-prompts/types.js";
 import type { Logger } from "../packages/core/src/lib/logger.js";
@@ -46,20 +46,20 @@ const claudeProfile = {
     "gpt-5.4", "gpt-5.6-sol", "claude-opus-4.8", "kimi-k3:cloud", "m", "same", "thread-model", "x",
   ].map((modelId) => ({ modelId, name: modelId })),
   effort: { mechanism: "meta", levels: ["low", "high"] },
-} as unknown as AgentProfile;
+} as unknown as AgentAdapter;
 const codexProfile = {
   id: "codex",
   defaultModel: "gpt-5.6-sol",
   staticModels: [{ modelId: "gpt-5.6-sol", name: "GPT-5.6 SOL" }],
   effort: { mechanism: "configOption", levels: ["low", "high"] },
-} as unknown as AgentProfile;
+} as unknown as AgentAdapter;
 const ollamaProfile = {
   id: "ollama-cloud",
   defaultModel: "kimi-k3:cloud",
   staticModels: [{ modelId: "kimi-k3:cloud", name: "Kimi K3" }],
   effort: { mechanism: "none", levels: [] },
-} as unknown as AgentProfile;
-const profiles = new Map<string, AgentProfile>([
+} as unknown as AgentAdapter;
+const profiles = new Map<string, AgentAdapter>([
   ["claude", claudeProfile], ["codex", codexProfile], ["ollama-cloud", ollamaProfile],
 ]);
 const modelCatalog = fixtureModelCatalog([...profiles.values()]);

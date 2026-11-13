@@ -13,7 +13,7 @@ import {
   type CreateElicitationRequest,
   type RequestPermissionRequest,
 } from "@agentclientprotocol/sdk";
-import type { AgentProfile } from "@seam/adapters";
+import type { AgentAdapter } from "@seam/adapters";
 import { fixtureModelCatalog } from "./model-catalog-fixture.js";
 import { localBridgeWiring } from "./local-bridge-fixture.js";
 import { CODEX_ACP_2_0_1_MODES } from "./fixtures/codex-acp-modes.js";
@@ -333,7 +333,7 @@ describe("SessionRouter permission vs elicitation wiring", () => {
       id: "codex",
       defaultModel: "gpt-test",
       spawn: () => fakeChild(),
-    } as unknown as AgentProfile;
+    } as unknown as AgentAdapter;
     router = new SessionRouter({
       logger,
       store,

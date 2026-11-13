@@ -4,7 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { pino } from "pino";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { classifyClaudeError, type AgentProfile } from "@seam/adapters";
+import { classifyClaudeError, type AgentAdapter } from "@seam/adapters";
 import { RequestError } from "@agentclientprotocol/sdk";
 import { AgentRuntime } from "../packages/core/src/agents/agent-runtime.js";
 import { Orchestrator } from "../packages/core/src/platforms/discord/orchestrator.js";
@@ -24,7 +24,7 @@ describe("#441 real orchestrator consumer with fake ACP", () => {
     const logger = pino({ level: "debug" }, { write(line: string) { lines.push(line); } });
     const profile = { id: "claude", defaultModel: "fixture-model",
       classifyError: mode === "no-classifier" ? undefined : classifyClaudeError,
-      spawn() { throw new Error("provider spawn forbidden"); } } as unknown as AgentProfile;
+      spawn() { throw new Error("provider spawn forbidden"); } } as unknown as AgentAdapter;
     const runtime = new AgentRuntime({ profile, logger: logger as never, spawnFn: () => { throw new Error("unused"); } });
     const first = new RequestError(-32603, "Internal error: Server is temporarily limiting requests · Rate limited", null);
     const second = mode === "changed-kind"

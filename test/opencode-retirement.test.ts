@@ -15,7 +15,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import { pino } from "pino";
-import type { AgentProfile } from "@seam/adapters";
+import type { AgentAdapter } from "@seam/adapters";
 import { fixtureModelCatalog } from "./model-catalog-fixture.js";
 import { localBridgeWiring } from "./local-bridge-fixture.js";
 import * as adapters from "@seam/adapters";
@@ -35,7 +35,7 @@ import type { SessionStore } from "../packages/core/src/core/session-store.js";
 const silent = pino({ level: "silent" }) as unknown as Logger;
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
-function stubProfile(id: string): AgentProfile {
+function stubProfile(id: string): AgentAdapter {
   return {
     id,
     displayName: id,
@@ -48,7 +48,7 @@ function stubProfile(id: string): AgentProfile {
         kill() {},
       });
     },
-  } as unknown as AgentProfile;
+  } as unknown as AgentAdapter;
 }
 
 function stubStore(): SessionStore {

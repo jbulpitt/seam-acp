@@ -16,7 +16,7 @@ import {
   type SessionConfigSelectOptions,
   type SessionInfo,
 } from "@agentclientprotocol/sdk";
-import { asLocalAdapter, type AgentIdentity, type AgentProfile } from "../agent-profile.js";
+import { asLocalAdapter, type AgentIdentity, type AgentAdapter } from "../agent-profile.js";
 import { AGENT_ADAPTER_VERSION } from "../agent-profile.js";
 import { manifestCatalogScope, manifestCatalogSource, readCliVersion } from "../model-catalog.js";
 import { ProbeError, redactProbeText, runBoundedProbe } from "../probe-process.js";
@@ -571,7 +571,7 @@ export function makeCopilotProfile(opts: {
   catalogProbe?: (launch: CopilotCatalogLaunch) => Promise<CopilotCatalogProbe>;
   /** Test/embedding seam; production lists through the profile's ACP process. */
   sessionList?: (launch: CopilotCatalogLaunch) => Promise<SessionInfo[]>;
-}): AgentProfile {
+}): AgentAdapter {
   const cli = opts.cliPath?.trim() || "copilot";
   const acpArgs = opts.acpArgs ? [...opts.acpArgs] : [...COPILOT_ACP_BASE_ARGS];
   const globalMcpServers = opts.mcpServers ?? [];

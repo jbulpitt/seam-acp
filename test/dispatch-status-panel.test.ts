@@ -11,7 +11,7 @@ import { discordRenderer } from "../packages/core/src/platforms/discord/renderer
 import { serializePanelText } from "../packages/core/src/platforms/renderer.js";
 import { visualConfig } from "./plugin-card-visuals-fixture.js";
 import { fixtureModelCatalog } from "./model-catalog-fixture.js";
-import type { AgentProfile } from "@seam/adapters";
+import type { AgentAdapter } from "@seam/adapters";
 import type { DispatchSpec } from "../packages/core/src/core/dispatch/types.js";
 import type { Logger } from "../packages/core/src/lib/logger.js";
 import type { SessionRecord, StructuredPanel } from "../packages/core/src/core/types.js";
@@ -304,7 +304,7 @@ function makeOrch(opts: {
   timeoutSeconds?: number;
   cfg?: Record<string, unknown>;
   storeOverrides?: Record<string, unknown>;
-  profile?: AgentProfile;
+  profile?: AgentAdapter;
 }): Orchestrator {
   const router = testSessionRouter({
     listProfiles: () => [],
@@ -642,7 +642,7 @@ describe("dispatchInjectTurn: status panel ON (default)", () => {
     const orch = makeOrch({ dataDir, rt, adapter, profile: {
       id: "claude", harness: "claude", provider: "anthropic", account: { provenance: "configured-context" },
       displayName: "Claude", defaultModel: "opus",
-    } as AgentProfile });
+    } as AgentAdapter });
 
     await orch.loadPlugins();
     const res = await orch.dispatchCanaryTurn(baseSpec());

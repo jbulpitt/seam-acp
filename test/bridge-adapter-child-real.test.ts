@@ -16,7 +16,7 @@ import { EventEmitter, once } from "node:events";
 import { createServer } from "node:http";
 import { WebSocket } from "ws";
 import { pino } from "pino";
-import { makeMux, type AgentProfile } from "@seam/adapters";
+import { makeMux, type AgentAdapter } from "@seam/adapters";
 import { AgentRuntime } from "../packages/core/src/agents/agent-runtime.js";
 import { discordRenderer } from "../packages/core/src/platforms/discord/renderer.js";
 import { BridgeHub } from "../packages/core/src/core/bridge-hub.js";
@@ -127,7 +127,7 @@ describe("#610 the local agent path, end to end", () => {
     const mux = makeMux({ id: "spawn-failure-host" } as never);
     mux.attach(ws as never);
     const runtime = new AgentRuntime({
-      profile: { id: "grok" } as AgentProfile,
+      profile: { id: "grok" } as AgentAdapter,
       logger: pino({ level: "silent" }) as unknown as Logger,
       spawnFn: () => {
         const child = mux.spawn();

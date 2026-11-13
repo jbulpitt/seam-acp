@@ -25,7 +25,7 @@ import {
 import { QuotaRegistry } from "../packages/core/src/core/quota/quota-registry.js";
 import type { AgentQuota } from "../packages/core/src/core/quota/agent-quota.js";
 import type { Logger } from "../packages/core/src/lib/logger.js";
-import type { AgentProfile } from "@seam/adapters";
+import type { AgentAdapter } from "@seam/adapters";
 
 const silent = pino({ level: "silent" }) as unknown as Logger;
 const fakeGrok = fileURLToPath(new URL("./fixtures/grok/fake-acp.mjs", import.meta.url));
@@ -88,7 +88,7 @@ function quota(agentId: string, displayName: string): AgentQuota {
 describe("#349 an aborted Grok quota refresh cancels the work", () => {
   it("kills the spawned grok process instead of leaving it running", async () => {
     const { cliPath, signalLog, methodLog } = stageHangingGrok();
-    const profile = { id: "grok", displayName: "Grok" } as AgentProfile;
+    const profile = { id: "grok", displayName: "Grok" } as AgentAdapter;
     const [source] = createAgentQuotaSources([profile], { grokCliPath: cliPath });
     expect(source).toBeDefined();
 
@@ -119,7 +119,7 @@ describe("#349 an aborted Grok quota refresh cancels the work", () => {
     // unavailable must degrade to "we cannot currently tell you Grok's quota"
     // and nothing else — not the poller, not the other agents.
     const { cliPath, methodLog } = stageHangingGrok();
-    const grokProfile = { id: "grok", displayName: "Grok" } as AgentProfile;
+    const grokProfile = { id: "grok", displayName: "Grok" } as AgentAdapter;
     const [grokSource] = createAgentQuotaSources([grokProfile], { grokCliPath: cliPath });
     let healthyCalls = 0;
     const healthy: AgentQuotaSource = {
@@ -158,7 +158,7 @@ describe("#349 an aborted Grok quota refresh cancels the work", () => {
 
   it("does not spawn at all for a refresh that was already abandoned", async () => {
     const { cliPath, methodLog } = stageHangingGrok();
-    const profile = { id: "grok", displayName: "Grok" } as AgentProfile;
+    const profile = { id: "grok", displayName: "Grok" } as AgentAdapter;
     const [source] = createAgentQuotaSources([profile], { grokCliPath: cliPath });
     const controller = new AbortController();
     controller.abort(new Error("already abandoned"));

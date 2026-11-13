@@ -4,7 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { pino } from "pino";
 import { afterEach, describe, expect, it } from "vitest";
-import { catalogScopeFingerprint, type AgentProfile, type AdapterCatalogCandidate } from "@seam/adapters";
+import { catalogScopeFingerprint, type AgentAdapter, type AdapterCatalogCandidate } from "@seam/adapters";
 import { ModelHideList, modelPatternMatches } from "../packages/core/src/core/model-catalog/hide-list.js";
 import { ModelCatalogService } from "../packages/core/src/core/model-catalog/service.js";
 import { ModelCatalogStore } from "../packages/core/src/core/model-catalog/store.js";
@@ -38,7 +38,7 @@ async function catalog(ids: string[], list = hideList()) {
   const binding = { agentId: "copilot", location: "local" };
   const fixture = fixtureModelCatalog([{ id: binding.agentId, defaultModel: ids[0],
     staticModels: ids.map((modelId) => ({ modelId, name: modelId })),
-  } as unknown as AgentProfile]);
+  } as unknown as AgentAdapter]);
   const candidate: AdapterCatalogCandidate = {
     schemaVersion: 1, scope: { fingerprint: catalogScopeFingerprint({ provider: "test" }), provider: "test" },
     models: [...fixture.models(binding)], source: "test", adapterVersion: 1, fetchedAt: new Date().toISOString(),

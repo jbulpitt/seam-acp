@@ -11,7 +11,7 @@
  * silently substitute. Adjacent to #468, which asks the same question from
  * the other end of the wire (does this bridge hold the adapter?).
  */
-import type { AgentProfile } from "@seam/adapters";
+import type { AgentAdapter } from "@seam/adapters";
 import type { BridgeHostConfig } from "../config.js";
 
 export const LOCAL_LOCATION = "local";
@@ -117,7 +117,7 @@ export interface AgentLocationChoice {
  *  is omitted rather than shown disabled — offering a choice that spawn will
  *  refuse is how the picker becomes decoration. */
 export function listAgentLocationChoices(opts: {
-  profiles: ReadonlyArray<Pick<AgentProfile, "id" | "displayName">>;
+  profiles: ReadonlyArray<Pick<AgentAdapter, "id" | "displayName">>;
   hosts: ReadonlyArray<HostInfo>;
   /** bridgeId → installed agent ids. Omitted/empty for a remote host ⇒ no
    *  remote rows for that host (do not invent VPS agents on a Mac). */

@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import { EventEmitter } from "node:events";
 import { pino } from "pino";
-import { makeMux, type AgentProfile } from "@seam/adapters";
+import { makeMux, type AgentAdapter } from "@seam/adapters";
 import { AgentRuntime, type AgentEvent } from "../packages/core/src/agents/agent-runtime.js";
 
 const flush = async () => {
@@ -36,7 +36,7 @@ function setup(afterSeq = 0) {
   const permission = vi.fn(async () => ({ outcome: { outcome: "selected" as const, optionId: "allow" } }));
   const events: AgentEvent[] = [];
   const runtime = new AgentRuntime({
-    profile: { id: "fixture", classifyError: () => ({ agentId: "fixture", errorKind: "invalid_request" }) } as AgentProfile,
+    profile: { id: "fixture", classifyError: () => ({ agentId: "fixture", errorKind: "invalid_request" }) } as AgentAdapter,
     logger: pino({ level: "silent" }), permissionPolicy: permission,
     spawnFn: () => { throw new Error("adoption must not spawn"); },
   });

@@ -12,7 +12,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { WebSocket } from "ws";
 import { pino } from "pino";
 import { makeMux } from "@seam/adapters";
-import type { AgentProfile } from "@seam/adapters";
+import type { AgentAdapter } from "@seam/adapters";
 import { fixtureModelCatalog } from "./model-catalog-fixture.js";
 import { BridgeHub } from "../packages/core/src/core/bridge-hub.js";
 import { SessionRouter } from "../packages/core/src/core/session-router.js";
@@ -46,7 +46,7 @@ function seamEntry(servers: McpServer[]): {
   return entry;
 }
 
-function stubProfile(id: string, spawnCalls: unknown[]): AgentProfile {
+function stubProfile(id: string, spawnCalls: unknown[]): AgentAdapter {
   return {
     id,
     spawn(model?: string, effort?: string) {
@@ -62,7 +62,7 @@ function stubProfile(id: string, spawnCalls: unknown[]): AgentProfile {
         kill() {},
       });
     },
-  } as unknown as AgentProfile;
+  } as unknown as AgentAdapter;
 }
 
 function stubStore(): SessionStore {

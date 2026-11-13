@@ -375,7 +375,7 @@ SessionRouter  ──→   SessionStore  (sqlite via better-sqlite3)
    ↓
 AgentRuntime         (one per session; auto-resumes on restart)
    ↓
-AgentProfile         (Copilot today, Claude Code tomorrow — adds via `src/agents/profiles/`)
+AgentAdapter         (agent contract; factories in `packages/adapters/src/profiles/`)
 ```
 
 - **`src/platforms/chat-adapter.ts`** — generic chat platform interface.

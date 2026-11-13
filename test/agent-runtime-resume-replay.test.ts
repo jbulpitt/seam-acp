@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { fastProviderRetryClock } from "./helpers/provider-retry-clock.js";
 import { AgentRuntime, type AgentEvent } from "../packages/core/src/agents/agent-runtime.js";
-import type { AgentProfile } from "@seam/adapters";
+import type { AgentAdapter } from "@seam/adapters";
 import { logger } from "../packages/core/src/lib/logger.js";
 import { WATCH_FEEDBACK_INSTRUCTION, applyWatchFeedback } from "../packages/core/src/core/dispatch/types.js";
 
@@ -15,7 +15,7 @@ import { WATCH_FEEDBACK_INSTRUCTION, applyWatchFeedback } from "../packages/core
 
 // Minimal profile — the runtime only reads `id` here; all model/effort paths
 // no-op because the optional fields are absent.
-const fakeProfile = { id: "fake" } as unknown as AgentProfile;
+const fakeProfile = { id: "fake" } as unknown as AgentAdapter;
 
 type Update = Record<string, unknown>;
 

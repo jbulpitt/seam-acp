@@ -5,7 +5,7 @@ import { EventEmitter } from "node:events";
 import { PassThrough } from "node:stream";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { pino } from "pino";
-import type { AgentProfile } from "@seam/adapters";
+import type { AgentAdapter } from "@seam/adapters";
 import { buildChannelPresetMaps, loadConfig } from "../packages/core/src/config.js";
 import { SessionStore } from "../packages/core/src/core/session-store.js";
 import { SessionRouter } from "../packages/core/src/core/session-router.js";
@@ -24,7 +24,7 @@ afterEach(() => {
 });
 const env = { DISCORD_BOT_TOKEN: "fixture", DISCORD_ALLOWED_USER_IDS: "123", REPOS_ROOT: os.tmpdir(), DEFAULT_AGENT: "claude" };
 const silent = pino({ level: "silent" }) as unknown as Logger;
-const profile = { id: "claude", defaultModel: "default", spawn: vi.fn(() => { throw new Error("unexpected local spawn"); }) } as unknown as AgentProfile;
+const profile = { id: "claude", defaultModel: "default", spawn: vi.fn(() => { throw new Error("unexpected local spawn"); }) } as unknown as AgentAdapter;
 
 describe("#614 optional startup settings", () => {
   it.each([

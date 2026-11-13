@@ -11,7 +11,7 @@ import { ConfigApplyPlan, type TargetIdentityChanges } from "./config-apply-plan
 import { bindSessionLocation } from "./location-bind.js";
 import { parseAgentAtLocation, formatAgentAtLocation } from "./location.js";
 
-import type { AgentProfile } from "@seam/adapters";
+import type { AgentAdapter } from "@seam/adapters";
 import {
   detectSessionReset,
   type ConfigMutationService,
@@ -169,7 +169,7 @@ export interface ThreadSessionControlDeps {
   };
   router: {
     describeConfig(record: SessionRecord, selection?: ConfigResolution): ConfigDescription;
-    getProfile(agentId: string, location?: string): AgentProfile | undefined;
+    getProfile(agentId: string, location?: string): AgentAdapter | undefined;
     assertAgentAllowedForRecord(record: SessionRecord, agentId: string): void;
     unregisteredAgentMessage?(agentId: string, fallback: string): string;
     getOrStartRuntime(record: SessionRecord): Promise<SessionControlRuntime>;

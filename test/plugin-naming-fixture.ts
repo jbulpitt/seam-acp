@@ -6,7 +6,7 @@ import os from "node:os";
 import path from "node:path";
 import { pino } from "pino";
 import { vi } from "vitest";
-import type { AgentProfile } from "@seam/adapters";
+import type { AgentAdapter } from "@seam/adapters";
 import type { Config } from "../packages/core/src/config.js";
 import { SessionStore } from "../packages/core/src/core/session-store.js";
 import { SessionRouter } from "../packages/core/src/core/session-router.js";
@@ -38,10 +38,10 @@ export function namingRegistry() {
 }
 export function namingCommands() { return buildSlashRegistrationBody(namingRegistry()); }
 
-export async function namingFixture(options: { admins?: Set<string>; locked?: boolean; participant?: string; directory?: string; store?: SessionStore; profileCapabilities?: Record<string, Pick<AgentProfile, "effort" | "fastMode">> } = {}) {
+export async function namingFixture(options: { admins?: Set<string>; locked?: boolean; participant?: string; directory?: string; store?: SessionStore; profileCapabilities?: Record<string, Pick<AgentAdapter, "effort" | "fastMode">> } = {}) {
   const directory = options.directory ?? fs.mkdtempSync(path.join(os.tmpdir(), "seam-naming-"));
   const store = options.store ?? new SessionStore(path.join(directory, "seam.db"));
-  const profiles = ["codex", "claude"].map(id => ({ id, displayName: id, defaultModel: id === "codex" ? "gpt-6.1-sol" : "claude-sonnet-5.5", spawn: () => { throw new Error("unit test never starts an agent"); }, ...options.profileCapabilities?.[id] } satisfies Partial<AgentProfile>)) as unknown as AgentProfile[];
+  const profiles = ["codex", "claude"].map(id => ({ id, displayName: id, defaultModel: id === "codex" ? "gpt-6.1-sol" : "claude-sonnet-5.5", spawn: () => { throw new Error("unit test never starts an agent"); }, ...options.profileCapabilities?.[id] } satisfies Partial<AgentAdapter>)) as unknown as AgentAdapter[];
   const modelCatalog = fixtureModelCatalog(profiles);
   const presetsFile = path.join(directory, "channel-presets.json");
   fs.writeFileSync(presetsFile, JSON.stringify({ channels: { [NAMING_PARENT]: { role: "worker", locked: options.locked ?? false } } }));

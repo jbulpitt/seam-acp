@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import type { AgentProfile } from "@seam/adapters";
+import type { AgentAdapter } from "@seam/adapters";
 import { AgentRuntime, type AgentEvent } from "../packages/core/src/agents/agent-runtime.js";
 import { logger } from "../packages/core/src/lib/logger.js";
 import { discordRenderer } from "../packages/core/src/platforms/discord/renderer.js";
@@ -186,7 +186,7 @@ const claude084: ToolFrame[] = [
 ];
 
 async function emitted(frames: ToolFrame[]): Promise<AgentEvent[]> {
-  const profile = { id: "codex" } as unknown as AgentProfile;
+  const profile = { id: "codex" } as unknown as AgentAdapter;
   const runtime = new AgentRuntime({
     profile,
     logger,

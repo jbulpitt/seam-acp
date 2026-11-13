@@ -3,7 +3,7 @@
  * bridge spawn. `markSessionBridge` is the #84 hook — this module is
  * the only production caller besides tests.
  */
-import type { AgentProfile, ThreadIdentity } from "@seam/adapters";
+import type { AgentAdapter, ThreadIdentity } from "@seam/adapters";
 import type { McpServer } from "@agentclientprotocol/sdk";
 import type { BridgeHub } from "./bridge-hub.js";
 import { LOCAL_LOCATION, normalizeLocation } from "./location.js";
@@ -38,7 +38,7 @@ export function planIsolatedBridgeSpawn(opts: {
   spawnFn: (
     model?: string,
     effort?: string
-  ) => ReturnType<AgentProfile["spawn"]> | Promise<ReturnType<AgentProfile["spawn"]>>;
+  ) => ReturnType<AgentAdapter["spawn"]> | Promise<ReturnType<AgentAdapter["spawn"]>>;
   mcpServers: McpServer[];
 } {
   const loc = normalizeLocation(opts.location);

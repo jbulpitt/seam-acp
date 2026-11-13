@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import type { AgentProfile } from "@seam/adapters";
+import type { AgentAdapter } from "@seam/adapters";
 import { AgentRuntime } from "../packages/core/src/agents/agent-runtime.js";
 import type { Logger } from "../packages/core/src/lib/logger.js";
 
@@ -41,7 +41,7 @@ function runtimeFixture(opts: {
       updatedUtc: "2026-09-22T12:00:00.000Z",
     };
   });
-  const profile = { id: "fixture" } as unknown as AgentProfile;
+  const profile = { id: "fixture" } as unknown as AgentAdapter;
   const runtime = new AgentRuntime({ profile, logger, bridgeHealth: { sendCmd }, spawnFn: () => { throw new Error("unused"); } });
   Object.assign(runtime, {
     connection: { prompt },

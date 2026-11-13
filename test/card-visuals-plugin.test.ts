@@ -5,7 +5,7 @@ import { Writable } from "node:stream";
 import { pino } from "pino";
 import { z } from "zod";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import type { AgentProfile } from "@seam/adapters";
+import type { AgentAdapter } from "@seam/adapters";
 import type { Config } from "../packages/core/src/config.js";
 import { reloadChannelPresets } from "../packages/core/src/core/config-reload.js";
 import { SessionStore } from "../packages/core/src/core/session-store.js";
@@ -40,7 +40,7 @@ async function fixture() {
   const file = path.join(directory, "presets.json");
   fs.writeFileSync(file, JSON.stringify({ channels: { [PARENT]: { statusCardStyle: { value: "simple" }, simpleCardGif: { value: true } } }, threads: {} }));
   const store = new SessionStore(path.join(directory, "seam.db"));
-  const profile = { id: "codex", displayName: "Codex", defaultModel: "gpt-6.1-sol" } as AgentProfile;
+  const profile = { id: "codex", displayName: "Codex", defaultModel: "gpt-6.1-sol" } as AgentAdapter;
   const modelCatalog = fixtureModelCatalog([profile]);
   const config = { ...visualConfig, DATA_DIR: directory, REPOS_ROOT: directory, DEFAULT_AGENT: "codex", DEFAULT_MODEL: profile.defaultModel,
     CHANNEL_PRESETS_FILE: file, REPO_EMOJIS: new Map(), DISCORD_ALLOWED_USER_IDS: new Set([USER]), SEAM_CONFIG_MUTATION_TIER_C_ENABLED: true,

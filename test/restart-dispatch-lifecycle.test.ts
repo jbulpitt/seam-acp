@@ -18,7 +18,7 @@ import { DispatchSuspendedError } from "../packages/core/src/core/dispatch/attem
 import { executionIdentity } from "../packages/core/src/core/dispatch/execution-identity.js";
 import { attachLocalBridge, localBridgeHub } from "./local-bridge-fixture.js";
 import { AgentRuntime } from "../packages/core/src/agents/agent-runtime.js";
-import type { AgentProfile } from "@seam/adapters";
+import type { AgentAdapter } from "@seam/adapters";
 
 const cleanups: (() => void)[] = [];
 afterEach(() => { for (const f of cleanups.splice(0).reverse()) f(); vi.restoreAllMocks(); vi.useRealTimers(); });
@@ -230,7 +230,7 @@ async function adoptedCard() {
   const child = Object.assign(new EventEmitter(), { stdin: new PassThrough(), stdout: new PassThrough(),
     stderr: new PassThrough(), killed: false, kill: vi.fn(() => true), detach: vi.fn() });
   h.router.adoptRecoveryRuntime.mockImplementation((_record, adoptedChild, sessionId) => {
-    const runtime = new AgentRuntime({ profile: { id: "codex" } as AgentProfile,
+    const runtime = new AgentRuntime({ profile: { id: "codex" } as AgentAdapter,
       logger: pino({ level: "silent" }) as any,
       spawnFn: () => { throw new Error("recovery must not spawn"); } });
     runtime.attachRecovery(adoptedChild, sessionId);
@@ -791,7 +791,7 @@ describe("#250 production dispatch lifecycle (synthetic transport, no providers)
         }
       });
     });
-    const profile = { id: "codex" } as AgentProfile;
+    const profile = { id: "codex" } as AgentAdapter;
     let adoptedRuntime: AgentRuntime | undefined;
     h.router.adoptRecoveryRuntime.mockImplementation((_record, adoptedChild, acpSessionId) => {
       const runtime = new AgentRuntime({

@@ -3,7 +3,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { pino } from "pino";
-import type { AgentProfile } from "@seam/adapters";
+import type { AgentAdapter } from "@seam/adapters";
 import type { Config } from "../packages/core/src/config.js";
 import { createConfigFacades } from "../packages/core/src/core/config-apply-plan.js";
 import { ConfigMutationService } from "../packages/core/src/core/config-mutation.js";
@@ -17,7 +17,7 @@ const actor = { id: "operator", name: "Operator" };
 const profiles = ["claude", "codex", "ollama-cloud"].map(id => ({
   id, defaultModel: "old", staticModels: ["old", "new"].map(modelId => ({ modelId, name: modelId })),
   effort: { mechanism: "meta", levels: ["low", "high"] },
-})) as unknown as AgentProfile[];
+})) as unknown as AgentAdapter[];
 let dir: string;
 let store: SessionStore;
 

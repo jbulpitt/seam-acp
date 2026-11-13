@@ -18,7 +18,7 @@ import { testSessionRouter, testSessionStore } from "./helpers/session-fixture.j
  * probe in `scripts/claude-fast-mode-probe.mjs`; see runbook §12.
  */
 import { describe, it, expect, vi } from "vitest";
-import type { AgentProfile } from "@seam/adapters";
+import type { AgentAdapter } from "@seam/adapters";
 import { fixtureModelCatalog } from "./model-catalog-fixture.js";
 import { CLAUDE_FAST_MODE, makeClaudeProfile } from "@seam/adapters";
 import { AgentRuntime } from "../packages/core/src/agents/agent-runtime.js";
@@ -141,10 +141,10 @@ class FastConn {
   }
 }
 
-function runtimeFor(profile: Partial<AgentProfile>) {
+function runtimeFor(profile: Partial<AgentAdapter>) {
   const { logger, warns } = makeLogger();
   const rt = new AgentRuntime({
-    profile: { id: "claude", defaultModel: "claude-opus-5", ...profile } as AgentProfile,
+    profile: { id: "claude", defaultModel: "claude-opus-5", ...profile } as AgentAdapter,
     logger,
     spawnFn: () => { throw new Error("unused"); },
   });
@@ -154,7 +154,7 @@ function runtimeFor(profile: Partial<AgentProfile>) {
   return { rt, conn, warns };
 }
 
-const CLAUDE_PROFILE: Partial<AgentProfile> = { fastMode: CLAUDE_FAST_MODE };
+const CLAUDE_PROFILE: Partial<AgentAdapter> = { fastMode: CLAUDE_FAST_MODE };
 
 describe("#37 contract 1 — default/off never requests Fast", () => {
   it("issues NO set_config_option when Fast is not requested on a Fast-capable session", async () => {
@@ -841,7 +841,7 @@ function ctrlHarness(opts: {
     { id: "claude", models: ["claude-opus-5", "claude-sonnet-5"], fast: true },
     { id: "codex", models: ["gpt-old", "gpt-new"], fast: false },
   ];
-  const byId = new Map<string, AgentProfile>(
+  const byId = new Map<string, AgentAdapter>(
     agents.map((a) => [
       a.id,
       {
@@ -850,7 +850,7 @@ function ctrlHarness(opts: {
         staticModels: a.models.map((modelId) => ({ modelId, name: modelId })),
         effort: { mechanism: "meta", levels: ["low", "high"] },
         ...(a.fast ? { fastMode: CLAUDE_FAST_MODE } : {}),
-      } as AgentProfile,
+      } as AgentAdapter,
     ])
   );
   const target = record();
@@ -1142,7 +1142,7 @@ function saveHarness(opts: {
     modelCatalog: fixtureModelCatalog([{
       id: "claude", defaultModel: "claude-opus-5",
       effort: { mechanism: "meta", levels: ["low", "medium", "high"] },
-    } as unknown as AgentProfile]),
+    } as unknown as AgentAdapter]),
     router: testSessionRouter({
       invalidate: async (id: string, o: unknown) => {
         invalidated.push({ id, opts: o });

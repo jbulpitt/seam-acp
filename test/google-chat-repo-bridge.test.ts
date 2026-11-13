@@ -6,7 +6,7 @@ import os from "node:os";
 import path from "node:path";
 import { pino } from "pino";
 import { WebSocket } from "ws";
-import { PROTOCOL_VERSION, type AgentProfile } from "@seam/adapters";
+import { PROTOCOL_VERSION, type AgentAdapter } from "@seam/adapters";
 import { dispatchBridgeRpc } from "../packages/bridge/src/rpc.js";
 import { buildChannelPresetMaps, type Config } from "../packages/core/src/config.js";
 import { BridgeHub } from "../packages/core/src/core/bridge-hub.js";
@@ -20,7 +20,7 @@ import { fixtureModelCatalog } from "./model-catalog-fixture.js";
 const logger = pino({ level: "silent" });
 const profiles = [{ id: "copilot", displayName: "Copilot", defaultModel: "native",
   staticModels: [{ modelId: "native", name: "Native" }], effort: { mechanism: "none", levels: [] },
-}] as unknown as AgentProfile[];
+}] as unknown as AgentAdapter[];
 const channel = { platform: "google-chat", id: "dm.thread", parentId: "dm" };
 const cleanup: Array<() => void | Promise<void>> = [];
 let dir: string;

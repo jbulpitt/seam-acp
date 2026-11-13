@@ -3,7 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import pino from "pino";
-import { makeClaudeProfile, type AgentProfile } from "@seam/adapters";
+import { makeClaudeProfile, type AgentAdapter } from "@seam/adapters";
 import { inventoryFromAdapters, loadHostAdapterInventory } from "../packages/bridge/src/inventory.js";
 import { SessionRouter } from "../packages/core/src/core/session-router.js";
 import { agentLocationPickerChoices } from "../packages/core/src/platforms/discord/location.js";
@@ -26,7 +26,7 @@ function load(overrides: NodeJS.ProcessEnv = {}) {
   return loadHostAdapterInventory("copilot", { env: { ...env, ...overrides }, exists: bin => bin === cli });
 }
 
-async function spawnFacts(profile: AgentProfile, model?: string) {
+async function spawnFacts(profile: AgentAdapter, model?: string) {
   const child = profile.spawn(model);
   const output: Buffer[] = [];
   child.stdout.on("data", chunk => output.push(Buffer.from(chunk)));

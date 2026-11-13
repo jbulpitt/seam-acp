@@ -19,7 +19,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
 import { pino } from "pino";
-import type { AgentProfile } from "@seam/adapters";
+import type { AgentAdapter } from "@seam/adapters";
 import { fixtureModelCatalog } from "./model-catalog-fixture.js";
 import { SessionRouter } from "../packages/core/src/core/session-router.js";
 import {
@@ -65,7 +65,7 @@ const FHR_COPILOT_THREADS = [
 ] as const;
 const LOCAL_COPILOT_THREAD = "1516911271272779776";
 
-function stubProfile(id: string, spawnCalls: unknown[] = []): AgentProfile {
+function stubProfile(id: string, spawnCalls: unknown[] = []): AgentAdapter {
   return {
     id,
     displayName: id,
@@ -80,7 +80,7 @@ function stubProfile(id: string, spawnCalls: unknown[] = []): AgentProfile {
         kill() {},
       });
     },
-  } as unknown as AgentProfile;
+  } as unknown as AgentAdapter;
 }
 
 function stubStore(): SessionStore {

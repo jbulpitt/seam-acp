@@ -52,7 +52,7 @@ import {
   resolveError,
   unclassified,
   isRemoteRecoverySnapshot,
-  type AgentProfile,
+  type AgentAdapter,
   type AdapterErrorClassification,
   type CatalogEffort,
   type RemoteExitEvidence,
@@ -439,7 +439,7 @@ function bridgeCloseCode(error: unknown): number | undefined {
 }
 
 export class AgentRuntime {
-  private readonly profile: AgentProfile;
+  private readonly profile: AgentAdapter;
   private readonly logger: Logger;
   private readonly permissionPolicy: PermissionPolicy;
   private readonly permissionMode?: () => PermissionPolicyMode;
@@ -459,7 +459,7 @@ export class AgentRuntime {
   private readonly spawnFn: (
     model?: string,
     effort?: string
-  ) => ReturnType<AgentProfile["spawn"]> | Promise<ReturnType<AgentProfile["spawn"]>>;
+  ) => ReturnType<AgentAdapter["spawn"]> | Promise<ReturnType<AgentAdapter["spawn"]>>;
   private readonly catalogEffort?: CatalogEffort;
   private readonly bridgeHealth?: Partial<BridgeHealthSource>;
   private readonly modelFallbacks?: (model: string, used?: number, effort?: string) => ModelFallbackPlan;
@@ -476,7 +476,7 @@ export class AgentRuntime {
   private readonly hangSilenceMs: number;
   private readonly claudeCredentialFacts?: () => ClaudeCredentialFacts | undefined;
 
-  private child?: ReturnType<AgentProfile["spawn"]>;
+  private child?: ReturnType<AgentAdapter["spawn"]>;
   private connection?: ClientSideConnection;
   private transportConnection?: ClientConnection;
   private sessionId?: string;
@@ -613,7 +613,7 @@ export class AgentRuntime {
   private recoveryAbort?: AbortController;
 
   constructor(opts: {
-    profile: AgentProfile;
+    profile: AgentAdapter;
     logger: Logger;
     permissionPolicy?: PermissionPolicy;
     permissionMode?: () => PermissionPolicyMode;
@@ -639,7 +639,7 @@ export class AgentRuntime {
     spawnFn: (
       model?: string,
       effort?: string
-    ) => ReturnType<AgentProfile["spawn"]> | Promise<ReturnType<AgentProfile["spawn"]>>;
+    ) => ReturnType<AgentAdapter["spawn"]> | Promise<ReturnType<AgentAdapter["spawn"]>>;
     /** Test/embedding override. Production uses SESSION_LOAD_TIMEOUT_MS. */
     loadSessionTimeoutMs?: number;
     /** Test override. Production waits HANG_SILENCE_MS before probing. */
@@ -692,7 +692,7 @@ export class AgentRuntime {
   }
 
   /** Reattach the application side while the bridge retains prompt ownership. */
-  attachRecovery(child: ReturnType<AgentProfile["spawn"]>, sessionId: string,
+  attachRecovery(child: ReturnType<AgentAdapter["spawn"]>, sessionId: string,
     modes?: Pick<SessionInfo, "availableModes" | "currentModeId">, lastActivityAtMs?: number,
     retained?: { busy: boolean }, promptCapabilities?: PromptCapabilities): void {
     if (this.connection || this.child) throw new Error("runtime is already attached");
@@ -737,7 +737,7 @@ export class AgentRuntime {
   }
 
   private processExitError(
-    child: ReturnType<AgentProfile["spawn"]>,
+    child: ReturnType<AgentAdapter["spawn"]>,
     code: number | null,
     signal: NodeJS.Signals | null,
     phase: "before initialize" | "mid-turn",
@@ -790,7 +790,7 @@ export class AgentRuntime {
   }
 
   private connectClient(
-    child: ReturnType<AgentProfile["spawn"]>,
+    child: ReturnType<AgentAdapter["spawn"]>,
     observeWrites: boolean,
     adopted = false,
   ): ClientSideConnection {

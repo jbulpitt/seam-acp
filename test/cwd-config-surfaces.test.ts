@@ -12,7 +12,7 @@ import { discordRenderer } from "../packages/core/src/platforms/discord/renderer
 import { SessionRouter } from "../packages/core/src/core/session-router.js";
 import { SessionStore } from "../packages/core/src/core/session-store.js";
 import type { Logger } from "../packages/core/src/lib/logger.js";
-import type { AgentProfile } from "@seam/adapters";
+import type { AgentAdapter } from "@seam/adapters";
 import { fixtureModelCatalog } from "./model-catalog-fixture.js";
 import { localBridgeHub, localBridgeWiring } from "./local-bridge-fixture.js";
 import type { ChannelPreset, ThreadPreset } from "../packages/core/src/config.js";
@@ -26,7 +26,7 @@ let dir: string;
 
 const profiles = [
   { id: "copilot", effort: { mechanism: "none", levels: [] } },
-] as unknown as AgentProfile[];
+] as unknown as AgentAdapter[];
 
 function slashI(over: {
   channelId?: string;
@@ -459,7 +459,7 @@ describe("#207 orchestrator live-turn spawn + status card", () => {
         effort: { mechanism: "none", levels: [] },
         spawn: fakeAcpSpawn(sessionNews, sessionLoads),
       },
-    ] as unknown as AgentProfile[];
+    ] as unknown as AgentAdapter[];
 
     const presetsFile = path.join(dir, "channel-presets.json");
     fs.writeFileSync(presetsFile, JSON.stringify({ channels: {}, threads: {} }));

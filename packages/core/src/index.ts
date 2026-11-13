@@ -115,7 +115,7 @@ import { ModelIntelligenceManager } from "./core/model-intelligence/manager.js";
 import { ModelCatalogService, ModelCatalogStore } from "./core/model-catalog/index.js";
 import { ModelHideList } from "./core/model-catalog/hide-list.js";
 import { visibleModelMetadata, visibleModelRankings, visibleModelValueRows } from "./core/model-catalog/listings.js";
-import type { AdapterCatalogCandidate, AgentProfile } from "@seam/adapters";
+import type { AdapterCatalogCandidate, AgentAdapter } from "@seam/adapters";
 import { ModelValueRankingsCard } from "./core/model-value/rankings-card.js";
 import { createAdapterMessageReaders } from "./core/message-reader.js";
 import { GoogleChatHistoryReader } from "./core/messages/google-chat-history.js";
@@ -344,7 +344,7 @@ async function main(): Promise<void> {
       isAgentLocationDenied(agentId, location, config.AGENT_LOCATION_DENY) ? "is withheld by AGENT_LOCATION_DENY" : null,
     scope: async ({ agentId, location }) => {
       if (!bridgeHub) throw new Error("bridge hub is not ready");
-      return await bridgeHub.rpc(location, "describeModelCatalog", {}, agentId) as ReturnType<AgentProfile["catalog"]["scope"]>;
+      return await bridgeHub.rpc(location, "describeModelCatalog", {}, agentId) as ReturnType<AgentAdapter["catalog"]["scope"]>;
     },
     fetch: async ({ agentId, location }): Promise<AdapterCatalogCandidate> => {
       if (!bridgeHub) throw new Error("bridge hub is not ready");

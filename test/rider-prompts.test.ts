@@ -5,7 +5,7 @@ import path from "node:path";
 import { EventEmitter } from "node:events";
 import { PassThrough, Readable, Writable } from "node:stream";
 import { agent, methods, ndJsonStream, PROTOCOL_VERSION } from "@agentclientprotocol/sdk";
-import type { AgentProfile } from "@seam/adapters";
+import type { AgentAdapter } from "@seam/adapters";
 import { pino } from "pino";
 import { Orchestrator } from "../packages/core/src/platforms/discord/orchestrator.js";
 import { SessionRouter } from "../packages/core/src/core/session-router.js";
@@ -68,7 +68,7 @@ function setup(parentRef: string | null = PARENT) {
   };
   const profile = { id: "rider-fixture", displayName: "Rider fixture", defaultModel: MODEL,
     spawn: vi.fn(() => { throw new Error("must use the synthetic bridge"); }),
-    sessionManager: { deleteSession: async () => {}, getTranscript: async () => "" } } as unknown as AgentProfile;
+    sessionManager: { deleteSession: async () => {}, getTranscript: async () => "" } } as unknown as AgentAdapter;
   const config = {
     DATA_DIR: cwd, REPOS_ROOT: cwd, DEFAULT_AGENT: profile.id, DEFAULT_MODEL: MODEL,
     TURN_TIMEOUT_SECONDS: 15, SEAM_DISPATCH_STATUS_PANEL: false,

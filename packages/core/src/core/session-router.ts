@@ -3,7 +3,7 @@ import { AgentRuntime, type BridgeHealthSource } from "../agents/agent-runtime.j
 import {
   UNKNOWN_AGENT_IDENTITY,
   asRemoteCatalogAdapter,
-  type AgentProfile,
+  type AgentAdapter,
   type AgentClientMetadata,
   type CatalogModelEvidence,
   type ThreadIdentity,
@@ -86,7 +86,7 @@ export interface RuntimeSpawnPlan {
   agentId: string;
   /** Exact catalog binding host; never inferred again after planning. */
   location: string;
-  profile: AgentProfile;
+  profile: AgentAdapter;
   model: string;
   /** Conservative capacity floor until this runtime observes its own usage. */
   fallbackContextTokens?: number | null;
@@ -101,7 +101,7 @@ export interface RuntimeSpawnPlan {
   spawnChild: (
     model?: string,
     effort?: string
-  ) => ReturnType<AgentProfile["spawn"]> | Promise<ReturnType<AgentProfile["spawn"]>>;
+  ) => ReturnType<AgentAdapter["spawn"]> | Promise<ReturnType<AgentAdapter["spawn"]>>;
 }
 
 export type AskUserFn = (
@@ -333,10 +333,10 @@ export const CANCEL_SIGNAL_TIMEOUT_MS = 2000;
 export class SessionRouter {
   private readonly logger: Logger;
   private readonly store: SessionStore;
-  private readonly profileById: Map<string, AgentProfile>;
+  private readonly profileById: Map<string, AgentAdapter>;
   private readonly profileIds?: (location: string) => Iterable<string>;
-  private readonly profileCatalog?: (id: string, location: string) => AgentProfile["catalog"] | undefined;
-  private readonly profileSessions?: (id: string, location: string) => AgentProfile["sessionManager"];
+  private readonly profileCatalog?: (id: string, location: string) => AgentAdapter["catalog"] | undefined;
+  private readonly profileSessions?: (id: string, location: string) => AgentAdapter["sessionManager"];
   private readonly modelCatalog: ModelCatalogService;
   private readonly profileMetadata?: (id: string, location: string) => AgentClientMetadata | undefined;
   private readonly claudeSessionOptions?: AgentClientMetadata["claudeSessionOptions"];
@@ -381,13 +381,13 @@ export class SessionRouter {
   constructor(opts: {
     logger: Logger;
     store: SessionStore;
-    profiles: AgentProfile[];
+    profiles: AgentAdapter[];
     modelCatalog: ModelCatalogService;
     profileMetadata?: (id: string, location: string) => AgentClientMetadata | undefined;
     claudeSessionOptions?: AgentClientMetadata["claudeSessionOptions"];
     profileIds?: (location: string) => Iterable<string>;
-    profileCatalog?: (id: string, location: string) => AgentProfile["catalog"] | undefined;
-    profileSessions?: (id: string, location: string) => AgentProfile["sessionManager"];
+    profileCatalog?: (id: string, location: string) => AgentAdapter["catalog"] | undefined;
+    profileSessions?: (id: string, location: string) => AgentAdapter["sessionManager"];
     modelMetadata?: Pick<ModelMetadataStore, "getAll">;
     defaultAgentId: string;
     defaultAgentDisabledReason?: string;
@@ -489,13 +489,13 @@ export class SessionRouter {
   }
 
   /** Host-advertised profiles; the registry supplies metadata, not availability. */
-  listProfiles(location = "local"): AgentProfile[] {
+  listProfiles(location = "local"): AgentAdapter[] {
     const ids = this.profileIds?.(location) ?? this.profileById.keys();
-    return [...ids].map(id => this.getProfile(id, location)).filter((p): p is AgentProfile => !!p);
+    return [...ids].map(id => this.getProfile(id, location)).filter((p): p is AgentAdapter => !!p);
   }
 
   /** Client metadata from the host and its cache-backed catalog. */
-  getProfile(id: string, location = "local"): AgentProfile | undefined {
+  getProfile(id: string, location = "local"): AgentAdapter | undefined {
     const known = this.profileById.get(id);
     const metadata = this.profileMetadata?.(id, location);
     const snapshot = this.modelCatalog.lookup({ agentId: id, location }).snapshot;
@@ -515,7 +515,7 @@ export class SessionRouter {
     agentId: string,
     channelId: string | null | undefined,
     location = "local"
-  ): AgentProfile | undefined {
+  ): AgentAdapter | undefined {
     this.assertAgentAllowedForChannel(agentId, channelId);
     return this.getProfile(agentId, location);
   }

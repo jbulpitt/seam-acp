@@ -3,7 +3,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { pino } from "pino";
-import type { AgentProfile } from "@seam/adapters";
+import type { AgentAdapter } from "@seam/adapters";
 import { PresetsFileSchema, type Config, type ThreadPreset } from "../packages/core/src/config.js";
 import { createConfigFacades } from "../packages/core/src/core/config-apply-plan.js";
 import { ConfigMutationService } from "../packages/core/src/core/config-mutation.js";
@@ -27,7 +27,7 @@ vi.mock("../packages/core/src/agents/agent-runtime.js", async importOriginal => 
     sessionId = "";
     finishPrompt?: () => void;
     rejectPrompt?: (err: Error) => void;
-    constructor(readonly options: { profile: AgentProfile }) {}
+    constructor(readonly options: { profile: AgentAdapter }) {}
     async start() {}
     getPromptCapabilities() { return undefined; }
     markActivity() { this.lastActivityAtMs = Date.now(); }
@@ -72,14 +72,14 @@ const actor = { id: "operator", name: "Operator" };
 const logger = pino({ level: "silent" });
 const closers: Array<() => Promise<void>> = [];
 afterEach(async () => { for (const close of closers.splice(0).reverse()) await close(); });
-async function fixture(count = 3, profileCapabilities: Record<string, Pick<AgentProfile, "fastMode">> = {}) {
+async function fixture(count = 3, profileCapabilities: Record<string, Pick<AgentAdapter, "fastMode">> = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "seam-bulk-"));
   const store = new SessionStore(path.join(dir, "seam.db"));
   const threadPresets = new Map<string, ThreadPreset>();
   const profiles = ["claude", "codex", "copilot"].map(id => ({ id, defaultModel: "old",
     staticModels: ["old", "new"].map(modelId => ({ modelId, name: modelId })),
     effort: { mechanism: id === "claude" ? "configOption" : "meta", configId: "effort", levels: ["low", "high"] },
-    ...profileCapabilities[id] })) as unknown as AgentProfile[];
+    ...profileCapabilities[id] })) as unknown as AgentAdapter[];
   const catalog = fixtureModelCatalog(profiles);
   const config = { REPOS_ROOT: dir, CHANNEL_PRESETS_FILE: path.join(dir, "presets.json"),
     DISCORD_ALLOWED_USER_IDS: new Set([actor.id]), channelPresets: new Map(), threadPresets } as unknown as Config;

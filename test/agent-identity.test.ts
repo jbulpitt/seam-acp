@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import { pino } from "pino";
 import { makeClaudeProfile, makeCodexProfile, makeCopilotProfile, makeGrokProfile, makeAgyProfile,
-  asRemoteCatalogAdapter, manifestCatalogScope, manifestCatalogSource, type AgentProfile } from "@seam/adapters";
+  asRemoteCatalogAdapter, manifestCatalogScope, manifestCatalogSource, type AgentAdapter } from "@seam/adapters";
 import { inventoryFromAdapters } from "../packages/bridge/src/inventory.js";
 import { SessionRouter } from "../packages/core/src/core/session-router.js";
 import { WarmSetManager } from "../packages/core/src/core/warm-set/manager.js";
@@ -13,7 +13,7 @@ import { StatusCardRegistry } from "../packages/core/src/plugins/status-card-reg
 
 const logger = pino({ level: "silent" });
 
-function controller(hostProfile: AgentProfile) {
+function controller(hostProfile: AgentAdapter) {
   const inventory = inventoryFromAdapters(new Map([[hostProfile.id, hostProfile]]), process.execPath);
   const metadata = inventory[0]!.metadata;
   return Object.assign(Object.create(SessionRouter.prototype), {

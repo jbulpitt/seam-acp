@@ -11,13 +11,13 @@ import { formatUsageAgentList, liveUsageAgentLabels, parkedAgentMessage } from "
 import { createQuotaSources } from "./sources.js";
 import { formatUsage } from "./format-usage.js";
 import { quotaMcp } from "./mcp.js";
-import type { AgentProfile } from "@seam/adapters";
+import type { AgentAdapter } from "@seam/adapters";
 
 /** Internal-tier binding snapshots and provider reads; no router or runtime access. */
 export interface QuotaPorts {
   usage: UsageProviderPort;
   bindings(): readonly Readonly<UsageBinding>[];
-  agents?(): readonly Pick<AgentProfile, "id" | "displayName" | "brand">[];
+  agents?(): readonly Pick<AgentAdapter, "id" | "displayName" | "brand">[];
   resolve(threadId: string, parentId?: string): Readonly<UsageBinding> | undefined;
   card: AgentQuotaCardTransport;
 }

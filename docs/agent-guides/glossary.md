@@ -1,9 +1,9 @@
 # Seam glossary
 
 Current meanings of names used in Seam's tools, guides and source. Several are
-overloaded; qualify the sense when it matters. This documents the glossary
-slice of [#813](https://github.com/jbulpitt/seam-acp/issues/813), not its proposed
-identity fields or symbol renames. Existing identifiers and behavior remain.
+overloaded; qualify the sense when it matters. This includes the first identity
+increment of [#813](https://github.com/jbulpitt/seam-acp/issues/813). Existing
+selectors, routing fields and dispatch behavior remain.
 
 ## Agent identity
 
@@ -24,11 +24,21 @@ identity fields or symbol renames. Existing identifiers and behavior remain.
   agent-specific behavior. A catalog's `credentialProfile` instead scopes model
   evidence to a credential context. Neither means a reusable worker preset.
 
-The present interface does not declare a unified `harness` / `provider` /
-`account` tuple. Card `brand` names the service; warm-set `AgentFamily` groups
-resource estimates. Neither is a complete identity model. Those distinctions
-exist across [agent profiles][profile], [catalog scope][catalog] and
-[warm-set families][family]; #813's proposal to unify them is future work.
+Built-in factories declare `harness`, `provider` and a host-qualified `account`
+credential context. Host inventory supplies these facts to controller proxies;
+legacy hello frames and catalog-only proxies have explicit unknown facts rather
+than borrowing the controller's same-named profile. Account provenance is
+configured context, an already observed context, or unknown; it is not a claim
+about a logged-in person or equality across hosts. Dynamic contexts are updated
+by existing catalog observations, not by rendering cards.
+
+Card brands derive from provider (with an explicit logo override); warm-set
+resource estimates derive from harness. Catalog fingerprints, backend/project/
+region/policy, source provenance and explicit sharing remain separate authority.
+Matching identity axes alone never permits sharing or grants a capability.
+See [agent profiles][profile], [catalog scope][catalog] and
+[warm-set costs][family]. Type aliases and compatibility routing names remain
+for later #813 increments.
 
 ## Hosts and routing
 

@@ -1,3 +1,5 @@
+import type { AgentHarness } from "@seam/adapters";
+
 /**
  * Holding-cost and load-cost facts for warm-set (#452).
  *
@@ -15,7 +17,7 @@
  * Load cost is independent of holding cost: large Codex transcript sets make
  * session loads expensive. High-cost loads share a tighter concurrency bound.
  */
-export type AgentFamily = "claude" | "codex" | "grok" | "copilot" | "agy" | "unknown";
+export type AgentFamily = AgentHarness;
 export type LoadCost = "low" | "high";
 
 /** Quiet-tree RSS, MiB. Null = not measured; do not invent Claude's number. */
@@ -31,22 +33,12 @@ export const HOLDING_MB: Record<AgentFamily, number | null> = {
 /** Worst measured holding cost; used only as a ceiling for already-hot unknowns. */
 export const UNKNOWN_HOT_CEILING_MB = HOLDING_MB.claude!;
 
-export function agentFamily(agentId: string): AgentFamily {
-  const id = agentId.trim().toLowerCase();
-  if (id === "claude" || id.startsWith("claude-")) return "claude";
-  if (id === "codex" || id === "ollama-cloud") return "codex";
-  if (id === "grok" || id.startsWith("grok-")) return "grok";
-  if (id === "agy" || id.startsWith("agy")) return "agy";
-  if (id === "copilot" || id.startsWith("copilot")) return "copilot";
-  return "unknown";
+export function holdingMb(harness: AgentHarness = "unknown"): number | null {
+  return HOLDING_MB[harness];
 }
 
-export function holdingMb(agentId: string): number | null {
-  return HOLDING_MB[agentFamily(agentId)];
-}
-
-export function loadCost(agentId: string): LoadCost {
-  return agentFamily(agentId) === "codex" ? "high" : "low";
+export function loadCost(harness: AgentHarness = "unknown"): LoadCost {
+  return harness === "codex" ? "high" : "low";
 }
 
 /** Default holding budget (MiB) for a host without an explicit override. */

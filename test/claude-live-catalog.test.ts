@@ -423,7 +423,7 @@ describe("#232 deferred backends do not inherit the direct catalog", () => {
   it("leaves Vertex on the validated manifest", async () => {
     const candidate = await makeClaudeProfile({
       id: "claude-vertex",
-      brand: "vertex",
+      provider: "vertex",
       cliPath: "false",
       defaultModel: "claude-opus-5",
       staticModels: [{ modelId: "claude-opus-5", name: "Opus 5" }],
@@ -443,7 +443,7 @@ describe("#232 deferred backends do not inherit the direct catalog", () => {
   it("leaves Z.ai and other compatible backends on the validated manifest", async () => {
     const candidate = await makeClaudeProfile({
       id: "zai",
-      brand: "z-ai",
+      provider: "z-ai",
       cliPath: "false",
       defaultModel: "glm-5.2",
       staticModels: [{ modelId: "glm-5.2", name: "GLM 5.2", contextLimit: 1_000_000 }],

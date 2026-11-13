@@ -120,7 +120,7 @@ describe("production adapter catalog sources", () => {
     });
     const vertex = makeClaudeProfile({
       id: "claude-vertex",
-      brand: "vertex",
+      provider: "vertex",
       cliPath: "false",
       defaultModel: "claude-opus-5",
       staticModels: [{ modelId: "claude-opus-5", name: "Opus 5" }],
@@ -132,7 +132,7 @@ describe("production adapter catalog sources", () => {
     });
     const zai = makeClaudeProfile({
       id: "zai",
-      brand: "z-ai",
+      provider: "z-ai",
       cliPath: "false",
       defaultModel: "glm-5.2",
       staticModels: [{ modelId: "glm-5.2", name: "GLM 5.2", contextLimit: 1_000_000 }],
@@ -185,6 +185,7 @@ describe("production adapter catalog sources", () => {
     });
     const ollama = makeCodexProfile({
       id: "ollama-cloud",
+      provider: "ollama-cloud",
       cliPath: "false",
       defaultModel: "qwen:cloud",
       staticModels: [{ modelId: "qwen:cloud", name: "Qwen", contextLimit: 200_000 }],

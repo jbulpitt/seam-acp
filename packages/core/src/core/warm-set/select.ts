@@ -1,3 +1,4 @@
+import type { AgentHarness } from "@seam/adapters";
 /**
  * Pure warm-set packing (#452). No I/O.
  *
@@ -16,6 +17,7 @@ import { UNKNOWN_HOT_CEILING_MB, holdingMb, loadCost } from "./footprint.js";
 export interface WarmCandidate {
   sessionId: string;
   agentId: string;
+  harness?: AgentHarness;
   updatedUtc: string;
   acpSessionId: string;
   hot: boolean;
@@ -50,7 +52,7 @@ export function selectWarmSet(opts: WarmSelectOpts): WarmDecision[] {
   const decisions = new Map<string, WarmDecision>();
   let used = 0;
 
-  const costOf = (c: WarmCandidate): number => holdingMb(c.agentId) ?? UNKNOWN_HOT_CEILING_MB;
+  const costOf = (c: WarmCandidate): number => holdingMb(c.harness) ?? UNKNOWN_HOT_CEILING_MB;
 
   for (const c of byRecency.filter((x) => x.hot)) {
     const mb = costOf(c);
@@ -69,7 +71,7 @@ export function selectWarmSet(opts: WarmSelectOpts): WarmDecision[] {
       decisions.set(c.sessionId, { sessionId: c.sessionId, action: "ignore", reason: "no ACP session to resume", footprintMb: 0 });
       continue;
     }
-    const measured = holdingMb(c.agentId);
+    const measured = holdingMb(c.harness);
     if (measured == null) {
       decisions.set(c.sessionId, { sessionId: c.sessionId, action: "ignore", reason: "holding cost unmeasured; not started", footprintMb: 0 });
       continue;
@@ -78,7 +80,7 @@ export function selectWarmSet(opts: WarmSelectOpts): WarmDecision[] {
       decisions.set(c.sessionId, { sessionId: c.sessionId, action: "ignore", reason: "load slot exhausted this tick", footprintMb: measured });
       continue;
     }
-    const high = loadCost(c.agentId) === "high";
+    const high = loadCost(c.harness) === "high";
     if (high && highLoads >= highCostSlots) {
       decisions.set(c.sessionId, { sessionId: c.sessionId, action: "ignore", reason: "high-cost load slot exhausted this tick", footprintMb: measured });
       continue;

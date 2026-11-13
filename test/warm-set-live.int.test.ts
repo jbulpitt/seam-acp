@@ -13,7 +13,7 @@ import { SessionStore } from "../packages/core/src/core/session-store.js";
 import { listSessionsForHost } from "../packages/core/src/core/host-sessions.js";
 import { buildChannelPresetMaps } from "../packages/core/src/config.js";
 import { selectWarmSet } from "../packages/core/src/core/warm-set/select.js";
-import { budgetForHost, holdingMb } from "../packages/core/src/core/warm-set/footprint.js";
+import { budgetForHost } from "../packages/core/src/core/warm-set/footprint.js";
 
 function mainCheckoutRoot(): string {
   const common = execFileSync("git", ["rev-parse", "--git-common-dir"], { encoding: "utf8" }).trim();
@@ -68,7 +68,7 @@ describe.skipIf(!hasLive)("#452 live snapshot packing", () => {
     expect(store!.countSessions()).toBe(before.count);
   });
 
-  it("packs discovered remote hosts under the generic budget without starting unmeasured agents", () => {
+  it("keeps database-only snapshots cold without host-declared harness facts", () => {
     const sessions = store!.listSessionsUncapped();
     const hosts = [...new Set([...presets.threadPresets.values()]
       .map((preset) => preset.location)
@@ -95,7 +95,8 @@ describe.skipIf(!hasLive)("#452 live snapshot packing", () => {
       const mb = loads.reduce((sum, d) => sum + d.footprintMb, 0);
       expect(mb).toBeLessThanOrEqual(budgetForHost(host));
       expect(loads.length).toBeLessThanOrEqual(2);
-      expect(loads.filter((d) => holdingMb(owned.find((o) => o.sessionId === d.sessionId)?.agentId ?? "") == null)).toHaveLength(0);
+      // A DB/preset copy has no host identity authority; do not reconstruct it from IDs.
+      expect(loads).toHaveLength(0);
       expect(fingerprint(copyDb)).toEqual(before);
     }
   });

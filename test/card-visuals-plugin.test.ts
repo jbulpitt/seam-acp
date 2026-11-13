@@ -46,7 +46,10 @@ async function fixture() {
     CHANNEL_PRESETS_FILE: file, REPO_EMOJIS: new Map(), DISCORD_ALLOWED_USER_IDS: new Set([USER]), SEAM_CONFIG_MUTATION_TIER_C_ENABLED: true,
     channelPresets: new Map(), threadPresets: new Map(), bridgePresets: new Map() } as Config;
   reloadChannelPresets(config, file, logger);
-  const router = new SessionRouter({ logger, store, profiles: [profile], modelCatalog, defaultAgentId: profile.id, defaultModel: profile.defaultModel,
+  const router = new SessionRouter({ logger, store, profiles: [profile], modelCatalog,
+    profileMetadata: () => ({ displayName: "Codex", defaultModel: profile.defaultModel, harness: "codex",
+      provider: "openai", account: { provenance: "configured-context" }, sessionManagement: null }),
+    defaultAgentId: profile.id, defaultModel: profile.defaultModel,
     channelPresets: config.channelPresets, threadPresets: config.threadPresets });
   const record = router.ensureSessionRecord({ platform: "discord", channelRef: THREAD, parentRef: PARENT, cwd: directory });
   record.acpSessionId = "retained-acp-session";
@@ -128,7 +131,7 @@ describe("card-visuals built-in", () => {
     const fetch = vi.fn(async () => ({ ok: true, status: 200, json: async () => ({ gifs: ["https://gifs.example/one.gif"] }) }));
     vi.stubGlobal("fetch", fetch);
     const h = await fixture();
-    const facts = { state: "Working" as const, agentId: "codex", model: "gpt-6.1-sol", style: "simple" as const, gifOn: true };
+    const facts = { state: "Working" as const, agentId: "codex", provider: "openai", model: "gpt-6.1-sol", style: "simple" as const, gifOn: true };
     expect(h.host.statusCards.decorate(facts).icon).toMatch(/codex.webp$/);
     expect(h.host.statusCards.decorate(facts).thumbnail).toBeUndefined();
     expect(fetch).not.toHaveBeenCalled();

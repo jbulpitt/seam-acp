@@ -1,6 +1,7 @@
 import path from "node:path";
 import { AgentRuntime, type BridgeHealthSource } from "../agents/agent-runtime.js";
 import {
+  UNKNOWN_AGENT_IDENTITY,
   asRemoteCatalogAdapter,
   type AgentProfile,
   type AgentClientMetadata,
@@ -503,7 +504,7 @@ export class SessionRouter {
     if (!known && !metadata && !cached && !catalog) return undefined;
     const profile = metadata || !known
       ? controllerMetadataAdapter(known ?? cached ?? { id, catalog: catalog! }, metadata, catalog, this.claudeSessionOptions)
-      : known;
+      : { ...known, ...UNKNOWN_AGENT_IDENTITY, brand: undefined };
     const manager = this.profileSessions?.(id, location);
     return Object.assign(profile, { sessionManager: manager ?? known?.sessionManager });
   }

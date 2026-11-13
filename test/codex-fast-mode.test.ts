@@ -39,7 +39,7 @@ function runtime(optionType: "select" | "boolean" | "missing" = "select") {
 describe("Codex Fast wire capability", () => {
   it("declares the direct Codex descriptor, not the reused Ollama profile", () => {
     expect(makeCodexProfile({ defaultModel: "default" }).fastMode).toEqual(spec);
-    expect(makeCodexProfile({ id: "ollama-cloud", defaultModel: "qwen" }).fastMode).toBeUndefined();
+    expect(makeCodexProfile({ id: "ollama-cloud", provider: "ollama-cloud", defaultModel: "qwen" }).fastMode).toBeUndefined();
   });
 
   it("derives Codex controller metadata without a Claude-only fallback", () => {

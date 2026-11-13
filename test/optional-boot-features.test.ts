@@ -136,7 +136,7 @@ describe("optional feature validation at boot", () => {
     await host.loadBuiltins([{ id: "card-visuals", load: async () => createCardVisualsPlugin({ read: () => undefined, write: () => ({ ok: true }) }) }], { "card-visuals": config });
     await host.jobs.startAfterAdmission(Promise.resolve());
     await host.jobs.drain();
-    const decoration = host.statusCards.decorate({ state: "Working", agentId: "codex", model: "test", style: "simple", gifOn: true });
+    const decoration = host.statusCards.decorate({ state: "Working", agentId: "codex", provider: "openai", model: "test", style: "simple", gifOn: true });
     expect(decoration.style).toBe("simple");
     if (bad === "gif") {
       expect(decoration.icon).toBe("https://icons.example/codex.webp");

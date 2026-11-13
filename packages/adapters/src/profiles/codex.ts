@@ -733,6 +733,8 @@ export async function readCodexModelCatalog(
  * Applied post-session-create via setSessionConfigOption in AgentRuntime.
  */
 export function makeCodexProfile(opts: {
+  /** Serving route; selectors do not determine provider identity. */
+  provider?: string;
   /** Profile id. Defaults to "codex". Must be unique across registered profiles. */
   id?: string;
   /** Display name shown in pickers. Defaults to "OpenAI Codex". */
@@ -780,14 +782,17 @@ export function makeCodexProfile(opts: {
   const credentialProfile = directCodex
     ? codexCredentialProfile(codexHome, runtime.env)
     : path.basename(path.dirname(modelsCachePath)) || ".codex";
-  const scope = manifestCatalogScope({
-    provider: opts.id === "ollama-cloud" ? "ollama-cloud" : "openai",
+  const catalogIdentity = {
+    provider: opts.provider ?? "openai",
     backend: opts.extraEnv?.OPENAI_BASE_URL,
     credentialProfile,
-  });
+  };
+  const scope = manifestCatalogScope(catalogIdentity);
   const profileId = opts.id ?? "codex";
   return asLocalAdapter({
     id: profileId,
+    harness: "codex", provider: scope.provider,
+    account: { provenance: "configured-context" },
     displayName: opts.displayName ?? "OpenAI Codex",
     defaultModel: opts.defaultModel,
     ...(directCodex ? { fastMode: CODEX_FAST_MODE } : {}),
@@ -831,9 +836,7 @@ export function makeCodexProfile(opts: {
             cache.sourceVersion,
           );
           const candidate = await manifestCatalogSource({
-            provider: "openai",
-            backend: opts.extraEnv?.OPENAI_BASE_URL,
-            credentialProfile,
+            ...catalogIdentity,
             defaultModel: live.defaultModel!,
             models: () => models,
             adapterVersion: AGENT_ADAPTER_VERSION,
@@ -849,9 +852,7 @@ export function makeCodexProfile(opts: {
           ? { models: [...opts.staticModels] }
           : await readCodexCatalogSnapshot(modelsCachePath);
         const candidate = await manifestCatalogSource({
-          provider: opts.id === "ollama-cloud" ? "ollama-cloud" : "openai",
-          backend: opts.extraEnv?.OPENAI_BASE_URL,
-          credentialProfile,
+          ...catalogIdentity,
           defaultModel: opts.defaultModel,
           models: () => snapshot.models,
           effort: {

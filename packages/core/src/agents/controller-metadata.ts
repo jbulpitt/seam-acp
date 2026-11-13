@@ -1,4 +1,4 @@
-import { asLocalAdapter, claudeSessionMetadata, CLAUDE_FAST_MODE, CODEX_FAST_MODE, type AgentProfile, type AgentClientMetadata, type AdapterCatalogSource, classifyAndAttach, classifyCodexError, classifyAgyError, classifyClaudeError, classifyCopilotError, classifyGrokError } from "@seam/adapters";
+import { asLocalAdapter, claudeSessionMetadata, CLAUDE_FAST_MODE, CODEX_FAST_MODE, UNKNOWN_AGENT_IDENTITY, type AgentProfile, type AgentClientMetadata, type AdapterCatalogSource, classifyAndAttach, classifyCodexError, classifyAgyError, classifyClaudeError, classifyCopilotError, classifyGrokError } from "@seam/adapters";
 
 /** ACP client metadata, not a controller-side launch or session-file reader. */
 export function controllerMetadataAdapter(
@@ -33,7 +33,7 @@ export function controllerMetadataAdapter(
   } : {};
   return asLocalAdapter({
     id: profile.id, displayName: metadata?.displayName ?? profile.displayName ?? profile.id, defaultModel,
-    brand: profile.brand, requestedContextTier: profile.requestedContextTier,
+    requestedContextTier: profile.requestedContextTier,
     effort: profile.effort, fastMode: profile.fastMode,
     restrictDiscordAccess: profile.restrictDiscordAccess,
     mcpServersAtSpawn: profile.mcpServersAtSpawn, submissionSignals: profile.submissionSignals,
@@ -41,6 +41,10 @@ export function controllerMetadataAdapter(
     catalog,
     ...metadata,
     ...policy,
+    harness: metadata?.harness ?? UNKNOWN_AGENT_IDENTITY.harness,
+    provider: metadata?.provider ?? UNKNOWN_AGENT_IDENTITY.provider,
+    account: metadata?.account ?? UNKNOWN_AGENT_IDENTITY.account,
+    brand: metadata?.brand,
     spawn(): never { throw new Error(`agent ${profile.id} cannot be spawned on the controller`); },
   });
 }

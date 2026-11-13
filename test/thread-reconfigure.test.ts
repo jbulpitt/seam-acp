@@ -72,13 +72,14 @@ const actor = { id: "operator", name: "Operator" };
 const logger = pino({ level: "silent" });
 const closers: Array<() => Promise<void>> = [];
 afterEach(async () => { for (const close of closers.splice(0).reverse()) await close(); });
-async function fixture(count = 3) {
+async function fixture(count = 3, profileCapabilities: Record<string, Pick<AgentProfile, "fastMode">> = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "seam-bulk-"));
   const store = new SessionStore(path.join(dir, "seam.db"));
   const threadPresets = new Map<string, ThreadPreset>();
   const profiles = ["claude", "codex", "copilot"].map(id => ({ id, defaultModel: "old",
     staticModels: ["old", "new"].map(modelId => ({ modelId, name: modelId })),
-    effort: { mechanism: id === "claude" ? "configOption" : "meta", configId: "effort", levels: ["low", "high"] } })) as unknown as AgentProfile[];
+    effort: { mechanism: id === "claude" ? "configOption" : "meta", configId: "effort", levels: ["low", "high"] },
+    ...profileCapabilities[id] })) as unknown as AgentProfile[];
   const catalog = fixtureModelCatalog(profiles);
   const config = { REPOS_ROOT: dir, CHANNEL_PRESETS_FILE: path.join(dir, "presets.json"),
     DISCORD_ALLOWED_USER_IDS: new Set([actor.id]), channelPresets: new Map(), threadPresets } as unknown as Config;
@@ -188,8 +189,9 @@ describe("bulk thread configuration production facade", () => {
     expect(acquired.getSessionInfo()?.sessionId).toBe("fresh-codex"); expect((runtime as any).disposed).toBe(true);
   });
   it("previews and preserves the catalog Fast fresh-session consequence for model-only changes", async () => {
-    const h = await fixture(1);
-    Object.assign(h.router.getProfile("claude")!, { fastMode: { configId: "fast-mode", onValue: "on", offValue: "off", applicationMode: "freshSession" } });
+    const h = await fixture(1, { claude: {
+      fastMode: { configId: "fast-mode", onValue: "on", offValue: "off", applicationMode: "freshSession" },
+    } });
     expect(h.plan.applyThreadOverlay({ threadId: "1000", parentRef: "200", changes: { fastMode: true }, actor }).ok).toBe(true);
     const p = await h.preview(); expect(p.rows[0]).toMatchObject({ consequence: "reset", after: { fastMode: true } });
     const starts = vi.spyOn(h.router, "getOrStartRuntime");

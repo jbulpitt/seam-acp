@@ -6,6 +6,7 @@ import type { PluginContext } from "./types.js";
 export interface StatusCardFacts {
   readonly state: TurnState;
   readonly agentId: string;
+  readonly provider?: string;
   readonly profileBrand?: string;
   readonly model: string;
   readonly resolvedModel?: string;

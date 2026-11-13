@@ -718,6 +718,8 @@ export function makeAgyProfile(opts: {
   );
   const profile: AgentProfile = asLocalAdapter({
     id: "agy",
+    harness: "agy", provider: catalogScope.provider,
+    account: { provenance: "configured-context" },
     displayName: "Antigravity",
     defaultModel,
     catalog: {

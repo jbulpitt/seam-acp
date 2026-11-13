@@ -52,6 +52,7 @@ describe("WarmSetManager", () => {
         get: (id: string) => (id === grok.id ? grok : null),
       } as never,
       router: {
+        getProfile: () => ({ harness: "grok" }) as never,
         hasRuntime: () => false,
         turnHealth: () => ({ busy: false, silentMs: 0, stalled: false }),
         getRuntime: () => undefined,
@@ -82,6 +83,7 @@ describe("WarmSetManager", () => {
       logger: silent,
       store: { listSessionsUncapped: () => [record({ id: "discord:g", channelRef: "g", agentId: "grok" })], get: () => null } as never,
       router: {
+        getProfile: () => ({ harness: "grok" }) as never,
         hasRuntime: () => false,
         turnHealth: () => ({ busy: false, silentMs: 0, stalled: false }),
         getRuntime: () => undefined,
@@ -106,6 +108,7 @@ describe("WarmSetManager", () => {
       logger: silent,
       store: { listSessionsUncapped: () => [grok], get: () => grok } as never,
       router: {
+        getProfile: () => ({ harness: "grok" }) as never,
         hasRuntime: () => true,
         turnHealth: () => ({ busy: false, silentMs: 5_000, stalled: false }),
         getRuntime: () => ({ markActivity: () => {}, getSlot: () => 3 }),
@@ -133,6 +136,7 @@ describe("WarmSetManager", () => {
       logger: silent,
       store: { listSessionsUncapped: () => [claude], get: () => claude } as never,
       router: {
+        getProfile: () => ({ harness: "claude" }) as never,
         hasRuntime: () => true,
         turnHealth: () => ({ busy: true, silentMs: 999_000, stalled: true }),
         getRuntime: () => ({ markActivity: () => {} }),

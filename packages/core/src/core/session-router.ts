@@ -951,6 +951,8 @@ export class SessionRouter {
     return promise;
   }
 
+  hasPendingRuntimeTransition(sessionId: string): boolean { return this.pendingRuntimeTransitions.has(sessionId); }
+
   /** Keep a busy runtime's selection until its prompt ends; apply before reuse. */
   async transitionWhenIdle(sessionId: string, apply: () => Promise<void>, opts?: { replacePending?: boolean }): Promise<void> {
     const applying = this.pendingRuntimeTransitions.get(sessionId)?.applying;

@@ -1,7 +1,15 @@
 import Database from "better-sqlite3";
-import { parseStatusCardStyle, type Preset, type PermissionPolicyMode } from "../../core/types.js";
+import { parseStatusCardStyle, type Preset, type PresetApplication, type PermissionPolicyMode } from "../../core/types.js";
 
 const SCHEMA = `
+CREATE TABLE IF NOT EXISTS preset_applications (
+  session_id TEXT PRIMARY KEY,
+  preset_id TEXT NOT NULL,
+  project_ref TEXT,
+  name TEXT NOT NULL,
+  applied_utc TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS presets (
   id            TEXT PRIMARY KEY,
   name          TEXT NOT NULL,
@@ -169,6 +177,19 @@ export class PresetRepository {
         /* column already exists */
       }
     }
+  }
+
+  /** History of the last successful explicit application, independent of config edits. */
+  recordApplication(sessionId: string, preset: Pick<Preset, "id" | "name" | "projectRef">): void {
+    this.db.prepare(`INSERT INTO preset_applications (session_id,preset_id,project_ref,name,applied_utc)
+      VALUES (?,?,?,?,?) ON CONFLICT(session_id) DO UPDATE SET preset_id=excluded.preset_id,
+      project_ref=excluded.project_ref,name=excluded.name,applied_utc=excluded.applied_utc`)
+      .run(sessionId, preset.id, preset.projectRef ?? null, preset.name, new Date().toISOString());
+  }
+
+  getApplication(sessionId: string): PresetApplication | null {
+    return this.db.prepare<[string], PresetApplication>(`SELECT preset_id AS id,project_ref AS projectRef,
+      name,applied_utc AS appliedUtc FROM preset_applications WHERE session_id=?`).get(sessionId) ?? null;
   }
 
   upsertPreset(p: Preset): void {

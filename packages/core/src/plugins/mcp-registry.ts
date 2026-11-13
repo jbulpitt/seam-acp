@@ -3,6 +3,8 @@ import type { PluginContext } from "./types.js";
 import { isInvalidArgumentError } from "../lib/invalid-argument.js";
 
 export interface McpInvocation {
+  /** Kernel-resolved current speaker; never supplied in tool arguments. */
+  actor?: Readonly<{ id: string; name: string }>;
   threadId: string;
   parentId?: string;
   args: Readonly<Record<string, unknown>>;

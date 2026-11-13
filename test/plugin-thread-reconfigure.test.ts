@@ -4,10 +4,12 @@ import { namingFixture, NAMING_PARENT } from "./plugin-naming-fixture.js";
 import { SeamMcpServer } from "../packages/core/src/core/mcp/seam-mcp-server.js";
 import { buildSlashRegistrationBody } from "../packages/core/src/platforms/discord/commands.js";
 import { Orchestrator } from "../packages/core/src/platforms/discord/orchestrator.js";
+import { ThreadReconfiguration } from "../packages/core/src/core/thread-reconfigure.js";
+import fs from "node:fs";
 
 const THREAD = "100000000000000002";
 const close: Array<() => Promise<void>> = [];
-afterEach(async () => { for (const fn of close.splice(0).reverse()) await fn(); });
+afterEach(async () => { for (const fn of close.splice(0).reverse()) await fn(); vi.restoreAllMocks(); });
 async function fixture(options: Parameters<typeof namingFixture>[0] = {}) {
   const h = await namingFixture(options); close.push(h.close); await h.create(THREAD);
   Object.assign((h.orchestrator as any).adapter, {
@@ -24,6 +26,58 @@ function slash(leaf: string, values: Record<string, string> = {}, user = "admin"
   return i;
 }
 describe("thread reconfiguration contributions through kernel gates", () => {
+  it.each([false, true])("reports started/unconfirmed through MCP and components when restored=$0, without replaying Apply", async restored => {
+    const h = await fixture({ admins: new Set(["admin"]) });
+    fs.writeFileSync(h.config.CHANNEL_PRESETS_FILE!, JSON.stringify({ channels: { [NAMING_PARENT]: { role: { value: "worker" } } } }));
+    let release!: () => void; let committed!: () => void;
+    const held = new Promise<void>(done => { release = done; });
+    const saved = new Promise<void>(done => { committed = done; });
+    let committedRows: unknown;
+    const original = ThreadReconfiguration.prototype.apply;
+    const apply = vi.spyOn(ThreadReconfiguration.prototype, "apply").mockImplementation(async function (...args) {
+      const result = await original.apply(this, args);
+      committedRows = result;
+      committed(); await held; return result;
+    });
+    const connect = async (reader: typeof h) => {
+      const server = new SeamMcpServer({ logger: pino({ level: "silent" }),
+        resolveSession: token => token === "valid" ? reader.store.getByChannel("discord", THREAD)! : undefined,
+        enqueueDispatch: async () => {}, pluginTools: reader.host.mcp, currentSpeakerId: () => "admin",
+        configAdminUserIds: new Set(["admin"]) });
+      await server.start(); close.push(() => server.stop());
+      return async (name: string, args: object) => {
+        const response = await fetch(`http://127.0.0.1:${server.port}/mcp`, { method: "POST",
+          headers: { "content-type": "application/json", "x-seam-session": "valid" },
+          body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name, arguments: args } }) });
+        return response.json() as Promise<any>;
+      };
+    };
+    const call = await connect(h);
+    const preview = await call("preview_thread_reconfiguration", { scope: "all", targetModel: "new" });
+    const id = preview.result.structuredContent.id;
+    const running = call("apply_thread_reconfiguration", { id });
+    try {
+      await saved;
+      expect(h.store.listConfigMutations(), JSON.stringify(committedRows)).toHaveLength(1);
+      const reader = restored ? await fixture({ store: h.store, directory: h.directory }) : h;
+      const page = slash("page", { id }); await reader.orchestrator.handleSlashInteraction(page as never);
+      const view = vi.fn(async () => {}); const refused = vi.fn(async () => {});
+      await reader.component({ kind: "button", customId: `seam-thread-reconfigure:next:${id}:-1`, userId: "admin", userName: "Admin",
+        channel: { platform: "discord", id: THREAD, parentId: NAMING_PARENT }, messageId: "preview",
+        updateEphemeralView: view, replyEphemeral: refused });
+      const read = restored ? await connect(reader) : call;
+      const mcp = await read("thread_reconfiguration_page", { id });
+      expect(JSON.stringify(await read("apply_thread_reconfiguration", { id }))).toContain("has started");
+      expect(apply).toHaveBeenCalledTimes(1); expect(h.store.listConfigMutations()).toHaveLength(1);
+      for (const rendered of [JSON.stringify(page.editReply.mock.calls), JSON.stringify(view.mock.calls), JSON.stringify(mcp)]) {
+        expect(rendered).toContain("Started/unconfirmed");
+        expect(rendered).toContain("PLANNED only");
+        expect(rendered).toContain("saved UNKNOWN; runtime UNKNOWN");
+        expect(rendered).not.toContain("not attempted");
+        expect(rendered).not.toContain("not applied");
+      }
+    } finally { release(); await running; }
+  });
   it("mounts without MCP, fits the actual command budget and previews/applies through the real slash handler", async () => {
     const h = await fixture();
     expect(buildSlashRegistrationBody(h.host.slash).find(c => c.name === "seamadmin")!.options!.some(o => o.name === "threads")).toBe(true);

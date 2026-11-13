@@ -4,7 +4,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import type { Readable, Writable } from "node:stream";
-import { AGENT_ADAPTER_VERSION, asLocalAdapter, type AgentProfile } from "../agent-profile.js";
+import { AGENT_ADAPTER_VERSION, asLocalAdapter, type AgentAdapter } from "../agent-profile.js";
 import {
   manifestCatalogScope,
   manifestCatalogSource,
@@ -746,7 +746,7 @@ export function makeCodexProfile(opts: {
   staticModels?: ReadonlyArray<{ modelId: string; name: string; contextLimit?: number }>;
   /** Override the effort descriptor. Defaults to configOption-based
    *  reasoning_effort (low/medium/high/xhigh/max/ultra), matching the OpenAI pattern. */
-  effort?: AgentProfile["effort"];
+  effort?: AgentAdapter["effort"];
   /** Custom environment variables to inject into the spawned process. */
   extraEnv?: Record<string, string>;
   /**
@@ -762,7 +762,7 @@ export function makeCodexProfile(opts: {
   catalogTimeoutMs?: number;
   /** Test-only cancellation hook for collector lifecycle coverage. */
   catalogAbortSignal?: AbortSignal;
-}): AgentProfile {
+}): AgentAdapter {
   const cli = opts.cliPath?.trim() || "codex-acp";
   const configuredCodexHome = nonEmptyString(opts.extraEnv?.CODEX_HOME) ??
     nonEmptyString(process.env.CODEX_HOME);

@@ -3,7 +3,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { pino } from "pino";
-import type { AgentProfile } from "@seam/adapters";
+import type { AgentAdapter } from "@seam/adapters";
 import { buildChannelPresetMaps, PresetsFileSchema, type Config } from "../packages/core/src/config.js";
 import { ConfigMutationService } from "../packages/core/src/core/config-mutation.js";
 import { createConfigFacades } from "../packages/core/src/core/config-apply-plan.js";
@@ -49,7 +49,7 @@ const logger = pino({ level: "silent" });
 const profiles = ["claude", "codex"].map(id => ({ id, displayName: id, defaultModel: `${id}-default`,
   staticModels: ["default", "reviewed"].map(kind => ({ modelId: `${id}-${kind}`, name: `${id}-${kind}` })),
   effort: { mechanism: "meta", levels: ["low", "high"] },
-})) as unknown as AgentProfile[];
+})) as unknown as AgentAdapter[];
 let dir: string;
 const cleanup: Array<() => void | Promise<void>> = [];
 beforeEach(() => { dir = fs.mkdtempSync(path.join(os.tmpdir(), "seam-gchat-overlays-")); });

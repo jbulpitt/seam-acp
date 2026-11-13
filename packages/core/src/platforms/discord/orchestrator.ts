@@ -101,7 +101,7 @@ import {
   resolveDiscordCompactionProfile,
 } from "../../core/compaction/discord-executor.js";
 import { pinnedFactsPrompt, parseJsonOutput, mergePinnedFacts, coercePinnedFacts, PINNED_FACTS_JSON_SCHEMA, assembleNewSession, type PinnedFacts } from "../../core/compaction/prompts.js";
-import type { AgentProfile } from "@seam/adapters";
+import type { AgentAdapter } from "@seam/adapters";
 import type { McpServer } from "@agentclientprotocol/sdk";
 import type { ScheduledPromptManager } from "../../core/scheduled-prompts/manager.js";
 import type { ScheduledPrompt } from "../../core/scheduled-prompts/types.js";
@@ -5361,7 +5361,7 @@ export class Orchestrator {
   }
 
   private sessionManagerFor(
-    profile: AgentProfile,
+    profile: AgentAdapter,
     agentId: string,
     location: string
   ): ISessionManager {
@@ -5996,7 +5996,7 @@ export class Orchestrator {
   }
 
   /** Resolve the agent profile bound to an inject target, if any. */
-  private profileForTarget(target: InjectTarget | null): AgentProfile | undefined {
+  private profileForTarget(target: InjectTarget | null): AgentAdapter | undefined {
     if (!target) return undefined;
     const record = isSessionRecord(target)
       ? target
@@ -6020,7 +6020,7 @@ export class Orchestrator {
    *  ~16 concurrent calls, and a shared session would accumulate context and
    *  mis-attribute interleaved text. */
   private makeCompactionRunAgent(
-    profile: AgentProfile,
+    profile: AgentAdapter,
     manager: ISessionManager,
     opts?: {
       model?: string;
@@ -6102,7 +6102,7 @@ export class Orchestrator {
    *  model choice) and the remote Mac (no effort mechanism) return undefined:
    *  there is no separate knob to set, so the runner leaves the agent's default. */
   private compactionEffortFor(
-    profile: AgentProfile,
+    profile: AgentAdapter,
     model: string,
     tier: "premium" | "cheap",
     location = LOCAL_LOCATION
@@ -6147,7 +6147,7 @@ export class Orchestrator {
    *  ranges, then fans out the pipeline. Returns the full result; the caller
    *  seeds the assembled summary into a new session. */
   private async runPremiumCompactionForSession(args: {
-    profile: AgentProfile;
+    profile: AgentAdapter;
     manager: ISessionManager;
     sessionId: string;
     cwd: string;
@@ -6216,7 +6216,7 @@ export class Orchestrator {
    *  Discord thread history. Bulk analysis is fail-closed on AGY at the exact
    *  Discord compaction model; the destination profile is not used here. */
   private async runPremiumCompactionForDiscord(args: {
-    profile: AgentProfile;
+    profile: AgentAdapter;
     manager: ISessionManager;
     sessionId: string;
     cwd: string;
@@ -6336,7 +6336,7 @@ export class Orchestrator {
    *  reader; analysis runs in throwaway runtimes. */
   private async buildDefaultCompactionSeed(args: {
     bindingThread?: ChannelRef;
-    profile: AgentProfile;
+    profile: AgentAdapter;
     manager: ISessionManager;
     agentId: string;
     location: string;
@@ -6456,7 +6456,7 @@ export class Orchestrator {
    * restart adoption (#575).
    */
   private launchForLocation(args: {
-    profile: AgentProfile;
+    profile: AgentAdapter;
     location: string;
     cwd: string;
     model?: string;
@@ -6491,7 +6491,7 @@ export class Orchestrator {
   /** Drop a throwaway analysis session on the host that created it. */
   private async deleteThrowawaySession(args: {
     location: string;
-    profile: AgentProfile;
+    profile: AgentAdapter;
     manager?: { deleteSession?(cwd: string, sessionId: string): Promise<void> };
     cwd: string;
     sessionId: string;
@@ -6510,7 +6510,7 @@ export class Orchestrator {
   }
 
   private async seedNewSession(args: {
-    profile: AgentProfile;
+    profile: AgentAdapter;
     restrictionChannelId: string;
     cwd: string;
     model?: string;
@@ -7016,7 +7016,7 @@ export class Orchestrator {
     record: SessionRecord;
     effectiveSession: "live" | "isolated";
     workerLocation: string;
-    profile?: AgentProfile;
+    profile?: AgentAdapter;
     cwd: string;
     model?: string;
     effort?: string;
@@ -7028,7 +7028,7 @@ export class Orchestrator {
     const agentId = opts.profile?.id ?? this.router.describeConfig(opts.record).agent.value;
     const binding = { agentId, location: opts.workerLocation };
     // An omitted model is deliberately resolved against the binding's current
-    // published default at fire time. AgentProfile.defaultModel is bootstrap
+    // published default at fire time. AgentAdapter.defaultModel is bootstrap
     // input to adapter discovery, not a second runtime selection authority.
     // #339 rule 15: a cold catalog must not refuse the dispatch. `default` is
     // resolvable with no catalog at all, and the provider applies its own.
@@ -11760,7 +11760,7 @@ export class Orchestrator {
       model: string;
       effort?: string;
       cwd: string;
-      profile?: AgentProfile;
+      profile?: AgentAdapter;
       isolated: boolean;
       cachedUsage?: SessionConfigState["lastContextUsage"];
     },
@@ -12234,7 +12234,7 @@ export class Orchestrator {
     | {
         ok: true;
         agentId: string;
-        profile: AgentProfile;
+        profile: AgentAdapter;
         location: string;
         model: string;
         effort: string | null;
@@ -12245,7 +12245,7 @@ export class Orchestrator {
     const agentId = described.agent.value;
     // #308: protects scheduled fires before their isolated job is announced;
     // deleting it lets a scheduled prompt bypass the shared agent resolver.
-    let profile: AgentProfile | undefined;
+    let profile: AgentAdapter | undefined;
     try {
       profile = this.router.resolveProfileForChannel(
         agentId,
@@ -12818,7 +12818,7 @@ export class Orchestrator {
    *  text, forward any files the agent produced to the thread, then tear down
    *  and delete the temp session (so it doesn't clutter `/seam sessions`). */
   private async runIsolatedScheduledJob(args: {
-    profile: AgentProfile;
+    profile: AgentAdapter;
     record: SessionRecord;
     cwd: string;
     model?: string;
@@ -17738,7 +17738,7 @@ export class Orchestrator {
     });
   }
 
-  private makeSessionActions(record: SessionRecord, profile: AgentProfile, manager: ISessionManager,
+  private makeSessionActions(record: SessionRecord, profile: AgentAdapter, manager: ISessionManager,
     binding: CatalogBinding, cwd: string): SessionActions {
     return new SessionActions({
       record, manager, cwd, profile, binding, store: this.store, router: this.router, logger: this.logger,

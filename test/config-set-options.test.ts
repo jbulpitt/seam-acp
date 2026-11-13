@@ -6,7 +6,7 @@ import { PassThrough } from "node:stream";
 import { EventEmitter } from "node:events";
 import { pino } from "pino";
 import { MessageFlags } from "discord.js";
-import type { AgentProfile } from "@seam/adapters";
+import type { AgentAdapter } from "@seam/adapters";
 import type { ChannelPreset, ThreadPreset } from "../packages/core/src/config.js";
 import { Orchestrator } from "../packages/core/src/platforms/discord/orchestrator.js";
 import { AgentRuntime } from "../packages/core/src/agents/agent-runtime.js";
@@ -51,7 +51,7 @@ const profiles = [
     ],
     effort: { mechanism: "configOption", levels: ["low", "high"] },
   },
-] as unknown as AgentProfile[];
+] as unknown as AgentAdapter[];
 
 function interaction(
   strings: Record<string, string | null>,

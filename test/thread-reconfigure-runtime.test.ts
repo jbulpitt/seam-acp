@@ -3,7 +3,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { pino } from "pino";
-import { readErrorClassification, unclassified, type AgentProfile } from "@seam/adapters";
+import { readErrorClassification, unclassified, type AgentAdapter } from "@seam/adapters";
 import { AgentRuntime } from "../packages/core/src/agents/agent-runtime.js";
 import { PresetsFileSchema, type Config, type ThreadPreset } from "../packages/core/src/config.js";
 import { createConfigFacades } from "../packages/core/src/core/config-apply-plan.js";
@@ -34,7 +34,7 @@ async function fixture(options: { fallback?: boolean; fastMode?: boolean; echo?:
     fastMode: { configId: "fast", onValue: "on", offValue: "off", applicationMode: "live" },
     classifyError: (error: unknown) => readErrorClassification(error) ?? unclassified("claude"),
     spawn: () => { throw new Error("No provider process allowed"); },
-  } as unknown as AgentProfile;
+  } as unknown as AgentAdapter;
   let switching = false;
   const conn = {
     newSession: vi.fn(async () => ({ sessionId: "fixture-session", configOptions: [fast("off")] })),

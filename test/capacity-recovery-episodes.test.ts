@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { RequestError } from "@agentclientprotocol/sdk";
 import { classifyCodexError, readErrorClassification, PROVIDER_RETRY_WINDOW_MS,
-  remoteRung1KindBackoff, isRemoteRung1Policy, type AgentProfile, type AdapterErrorKind } from "@seam/adapters";
+  remoteRung1KindBackoff, isRemoteRung1Policy, type AgentAdapter, type AdapterErrorKind } from "@seam/adapters";
 import { createRung1Recovery } from "../packages/bridge/src/rung1-recovery.js";
 import { DEFAULT_REMOTE_RUNG1_POLICY } from "../packages/core/src/core/remote-spawn.js";
 import { AgentRuntime } from "../packages/core/src/agents/agent-runtime.js";
@@ -68,7 +68,7 @@ describe("#988 productive continuations get a new failure episode", () => {
 
   it("resets the controller prompt owner on productive continuation, too", async () => {
     vi.useFakeTimers();
-    const runtime = new AgentRuntime({ profile: { id: "codex", classifyError: classifyCodexError } as AgentProfile,
+    const runtime = new AgentRuntime({ profile: { id: "codex", classifyError: classifyCodexError } as AgentAdapter,
       logger, spawnFn: () => { throw new Error("unused"); } });
     const requests: any[] = [];
     const prompt = vi.fn(async request => {

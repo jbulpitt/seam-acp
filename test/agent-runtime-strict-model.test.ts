@@ -1,10 +1,10 @@
 import { describe, it, expect } from "vitest";
 import { RequestError } from "@agentclientprotocol/sdk";
 import { AgentRuntime } from "../packages/core/src/agents/agent-runtime.js";
-import { classifyCodexError, type AgentProfile } from "@seam/adapters";
+import { classifyCodexError, type AgentAdapter } from "@seam/adapters";
 import type { Logger } from "../packages/core/src/lib/logger.js";
 
-const fakeProfile = { id: "claude" } as unknown as AgentProfile;
+const fakeProfile = { id: "claude" } as unknown as AgentAdapter;
 
 type WarnCall = { obj: unknown; msg: string };
 

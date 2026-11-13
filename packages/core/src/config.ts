@@ -952,7 +952,7 @@ const PresetValuesSchema = z.object({
   cwd: PresetFieldSchema(z.string().min(1)).optional(),
   // Reasoning effort, e.g. "low"/"medium"/"high"/"xhigh"/"max". Silently
   // ignored at apply time for agents whose profile doesn't support effort
-  // (AgentProfile.effort is "none"/unset, or doesn't offer this level).
+  // (AgentAdapter.effort is "none"/unset, or doesn't offer this level).
   effort: PresetFieldSchema(z.string().min(1)).optional(),
   // Extra harness-preamble bullet injected into every turn (see
   // withHarnessPreamble). Channel and thread riders both apply, stacked.

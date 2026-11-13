@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createUsageProviderPort } from "../packages/core/src/core/quota/usage-provider.js";
 import * as adapters from "@seam/adapters";
-import type { AgentProfile, AgyLaunchRuntime } from "@seam/adapters";
+import type { AgentAdapter, AgyLaunchRuntime } from "@seam/adapters";
 
 vi.mock("@seam/adapters", async importOriginal => ({
   ...await importOriginal<typeof import("@seam/adapters")>(),
@@ -9,7 +9,7 @@ vi.mock("@seam/adapters", async importOriginal => ({
   fetchGrokUsage: vi.fn(), fetchGrokUsageFromConnection: vi.fn(), fetchOllamaCloudUsage: vi.fn(),
 }));
 afterEach(() => vi.resetAllMocks());
-const profiles = ["agy", "claude-work", "codex", "copilot-work", "grok", "ollama-cloud", "gemini"].map(id => ({ id, displayName: id, configDir: `/private/${id}` } as AgentProfile));
+const profiles = ["agy", "claude-work", "codex", "copilot-work", "grok", "ollama-cloud", "gemini"].map(id => ({ id, displayName: id, configDir: `/private/${id}` } as AgentAdapter));
 
 describe("internal usage-provider port", () => {
   it("passes the verified agy runtime and signal intact; never exposes launch or credentials in binding facts", async () => {

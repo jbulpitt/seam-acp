@@ -10,7 +10,7 @@ import {
   ndJsonStream,
   type Client,
 } from "@agentclientprotocol/sdk";
-import { AGENT_ADAPTER_VERSION, asLocalAdapter, type AgentProfile } from "../agent-profile.js";
+import { AGENT_ADAPTER_VERSION, asLocalAdapter, type AgentAdapter } from "../agent-profile.js";
 import {
   catalogScopeFingerprint,
   manifestCatalogSource,
@@ -655,12 +655,12 @@ export function makeGrokProfile(opts: {
   /** Test/embedding seam for semantic credential identity. */
   authIdentityProbe?: () => GrokAuthIdentity;
   /** Override the effort descriptor. Defaults to spawnArgs + the CLI levels. */
-  effort?: AgentProfile["effort"];
+  effort?: AgentAdapter["effort"];
   /** Custom environment variables to inject into the spawned process. */
   extraEnv?: Record<string, string | undefined>;
   /** Complete inherited environment; production defaults to process.env. */
   baseEnv?: NodeJS.ProcessEnv;
-}): AgentProfile {
+}): AgentAdapter {
   const cli = opts.cliPath?.trim() || "grok";
   const baseArgs = [...(opts.baseArgs ?? [])];
   const runtimeCwd = opts.cwd ?? process.cwd();

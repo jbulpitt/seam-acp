@@ -3,7 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { pino } from "pino";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import type { AgentProfile } from "@seam/adapters";
+import type { AgentAdapter } from "@seam/adapters";
 import { loadConfig } from "../packages/core/src/config.js";
 import { watchChannelPresets } from "../packages/core/src/core/config-reload.js";
 import { type ConfigSetRequest } from "../packages/core/src/core/config-apply-plan.js";
@@ -61,7 +61,7 @@ const actor = { id: "123", name: "Operator" };
 const channel = { platform: "discord", id: "111111111111111111", parentId: "222222222222222222" };
 const profiles = ["claude", "codex"].map(id => ({ id, displayName: id, defaultModel: "old",
   staticModels: [{ modelId: "old", name: "Old" }, { modelId: "new", name: "New" }], effort: { mechanism: "meta", levels: ["low", "high"] },
-})) as unknown as AgentProfile[];
+})) as unknown as AgentAdapter[];
 const cleanups: Array<() => void | Promise<void>> = [];
 afterEach(async () => { for (const stop of cleanups.splice(0).reverse()) await stop(); vi.restoreAllMocks(); });
 

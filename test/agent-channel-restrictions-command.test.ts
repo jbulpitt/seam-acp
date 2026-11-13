@@ -4,7 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { pino } from "pino";
 import { MessageFlags } from "discord.js";
-import type { AgentProfile } from "@seam/adapters";
+import type { AgentAdapter } from "@seam/adapters";
 import { Orchestrator } from "../packages/core/src/platforms/discord/orchestrator.js";
 import { SessionRouter } from "../packages/core/src/core/session-router.js";
 import { SessionStore } from "../packages/core/src/core/session-store.js";
@@ -23,7 +23,7 @@ const copilot = {
   defaultModel: "gpt-5.4",
   staticModels: [{ modelId: "gpt-5.4", name: "GPT-5.4" }],
   effort: { mechanism: "none", levels: [] },
-} as unknown as AgentProfile;
+} as unknown as AgentAdapter;
 
 function orch(adminIds = new Set([ADMIN])) {
   const router = new SessionRouter({

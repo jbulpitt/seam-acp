@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { makeCodexProfile, type AgentProfile } from "@seam/adapters";
+import { makeCodexProfile, type AgentAdapter } from "@seam/adapters";
 import { pino } from "pino";
 import { AgentRuntime } from "../packages/core/src/agents/agent-runtime.js";
 import { controllerMetadataAdapter } from "../packages/core/src/agents/controller-metadata.js";
@@ -30,7 +30,7 @@ function runtime(optionType: "select" | "boolean" | "missing" = "select") {
       return { configOptions: options() };
     }),
   };
-  const rt = new AgentRuntime({ profile: { id: "codex", defaultModel: "gpt-fast", fastMode: spec } as unknown as AgentProfile,
+  const rt = new AgentRuntime({ profile: { id: "codex", defaultModel: "gpt-fast", fastMode: spec } as unknown as AgentAdapter,
     logger: pino({ level: "silent" }), spawnFn: () => { throw new Error("not used"); } });
   Object.assign(rt, { connection, promptCapabilities: {} });
   return { rt, connection };
@@ -140,7 +140,7 @@ describe("Codex configure_thread Fast", () => {
     const store = testSessionStore({});
     store.upsert(target);
     const profile = { id: "codex", defaultModel: "gpt-fast", fastMode: spec, staticModels: [{ modelId: "gpt-fast", name: "Fast-capable" }],
-      effort: { mechanism: "none", levels: [] } } as unknown as AgentProfile;
+      effort: { mechanism: "none", levels: [] } } as unknown as AgentAdapter;
     const router = testSessionRouter({
       describeConfig: () => ({ sessionId: target.id, channelRef: target.channelRef, parentRef: target.parentRef,
         agent: { value: "codex", source: "session config" }, model: { value: "gpt-fast", source: "session config" },

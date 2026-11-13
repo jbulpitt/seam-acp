@@ -2,7 +2,7 @@
  * Flattened host-prefixed agent picker (D10). Lives next to bridge.ts /
  * debug.ts so orchestrator.ts stays a thin switch.
  */
-import type { AgentProfile } from "@seam/adapters";
+import type { AgentAdapter } from "@seam/adapters";
 import type { BridgeHostConfig, Config } from "../../config.js";
 import { resolveThreadLocation } from "../../config.js";
 import {
@@ -25,7 +25,7 @@ export interface PickerHostInput {
 }
 
 export function agentLocationPickerChoices(
-  profiles: ReadonlyArray<Pick<AgentProfile, "id" | "displayName">>,
+  profiles: ReadonlyArray<Pick<AgentAdapter, "id" | "displayName">>,
   hosts: PickerHostInput
 ): AgentLocationChoice[] {
   return listAgentLocationChoices({

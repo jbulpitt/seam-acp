@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import type { AgentProfile } from "@seam/adapters";
+import type { AgentAdapter } from "@seam/adapters";
 import {
   detectSessionReset,
   type SessionConfigChanges,
@@ -34,7 +34,7 @@ function record(over: Partial<SessionRecord> = {}): SessionRecord {
   };
 }
 
-function profile(id: string, defaultModel: string, models: string[]): AgentProfile {
+function profile(id: string, defaultModel: string, models: string[]): AgentAdapter {
   return {
     id,
     defaultModel,
@@ -42,7 +42,7 @@ function profile(id: string, defaultModel: string, models: string[]): AgentProfi
     effort: id === "claude"
       ? { mechanism: "meta", levels: ["low", "high"] }
       : { mechanism: "configOption", configId: "reasoning_effort", levels: ["low", "high"] },
-  } as AgentProfile;
+  } as AgentAdapter;
 }
 
 function makeRuntime(
@@ -73,7 +73,7 @@ function harness(opts: {
   location?: string;
   target?: SessionRecord;
   efforts?: string[];
-  profiles?: AgentProfile[];
+  profiles?: AgentAdapter[];
   failFreshStart?: boolean;
   restrictionError?: string;
 } = {}) {
@@ -141,7 +141,7 @@ function harness(opts: {
         const selected = byProfile.get(current.agentId)!;
         const runtime = makeRuntime(
           sessionId,
-          (selected as AgentProfile & { staticModels?: Array<{ modelId: string }> }).staticModels
+          (selected as AgentAdapter & { staticModels?: Array<{ modelId: string }> }).staticModels
             ?.map((entry) => entry.modelId) ?? [],
           opts.efforts ?? ["low", "high"]
         );

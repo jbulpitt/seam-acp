@@ -5,7 +5,7 @@ import path from "node:path";
 import { EventEmitter } from "node:events";
 import { PassThrough, Readable, Writable } from "node:stream";
 import { agent, methods, ndJsonStream, PROTOCOL_VERSION } from "@agentclientprotocol/sdk";
-import type { AgentProfile } from "@seam/adapters";
+import type { AgentAdapter } from "@seam/adapters";
 import { pino } from "pino";
 import { buildChannelPresetMaps, type Config } from "../packages/core/src/config.js";
 import { SessionRouter } from "../packages/core/src/core/session-router.js";
@@ -74,7 +74,7 @@ function setup(presets: Record<string, unknown> = {}) {
   };
   const profile = { id: "codex", displayName: "Codex fixture", defaultModel: model,
     spawn: vi.fn(() => { throw new Error("must use the bound bridge"); }),
-    sessionManager: { deleteSession: async () => {}, getTranscript: async () => "" } } as unknown as AgentProfile;
+    sessionManager: { deleteSession: async () => {}, getTranscript: async () => "" } } as unknown as AgentAdapter;
   const modelCatalog = fixtureModelCatalog([profile]);
   const wiring = localBridgeWiring(spawn);
   wiring.bindSessionLocation = (id, location) => { bindings.set(id, location); };

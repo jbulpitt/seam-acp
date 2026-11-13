@@ -3,7 +3,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { pino } from "pino";
-import type { AgentProfile } from "@seam/adapters";
+import type { AgentAdapter } from "@seam/adapters";
 import { PresetsFileSchema, threadPresetKey, type Config, type ThreadPreset } from "../packages/core/src/config.js";
 import { createConfigFacades } from "../packages/core/src/core/config-apply-plan.js";
 import { ConfigMutationService } from "../packages/core/src/core/config-mutation.js";
@@ -26,7 +26,7 @@ vi.mock("../packages/core/src/agents/agent-runtime.js", async importOriginal => 
     effortOverride?: string;
     cwd = "";
     finishPrompt?: () => void;
-    constructor(readonly options: { profile: AgentProfile }) {}
+    constructor(readonly options: { profile: AgentAdapter }) {}
     async start() {}
     getPromptCapabilities() { return undefined; }
     markActivity() { this.lastActivityAtMs = Date.now(); }
@@ -61,7 +61,7 @@ const root = "/execution/projects";
 const oldCwd = `${root}/old`;
 const nextCwd = `${root}/other repo`;
 const profile = { id: "codex", defaultModel: "native", staticModels: [{ modelId: "native", name: "Native" }],
-  effort: { mechanism: "configOption", configId: "effort", levels: ["low", "high", "provider-special"] } } as unknown as AgentProfile;
+  effort: { mechanism: "configOption", configId: "effort", levels: ["low", "high", "provider-special"] } } as unknown as AgentAdapter;
 let dir: string;
 let store: SessionStore;
 let router: SessionRouter;

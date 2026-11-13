@@ -63,7 +63,7 @@ import {
   type SetSessionModeRequest,
   type SetSessionModeResponse,
 } from "@agentclientprotocol/sdk";
-import { AGENT_ADAPTER_VERSION, asLocalAdapter, type AgentProfile } from "../agent-profile.js";
+import { AGENT_ADAPTER_VERSION, asLocalAdapter, type AgentAdapter } from "../agent-profile.js";
 import {
   classifyAndAttach,
   classifyWith,
@@ -701,7 +701,7 @@ export function makeAgyProfile(opts: {
   /** Override only the file read once when a session has no persisted model.
    *  Production uses AGY's normal global settings; fixtures use an isolated file. */
   initialSettingsFile?: string;
-}): AgentProfile {
+}): AgentAdapter {
   const runtime = opts.runtime;
   const defaultModel = opts.defaultModel ?? "antigravity";
   const catalogScope = agyNativeCatalogScope({
@@ -716,7 +716,7 @@ export function makeAgyProfile(opts: {
     mappingFile,
     mappingFile === LEGACY_MAPPING_FILE ? undefined : LEGACY_MAPPING_FILE,
   );
-  const profile: AgentProfile = asLocalAdapter({
+  const profile: AgentAdapter = asLocalAdapter({
     id: "agy",
     harness: "agy", provider: catalogScope.provider,
     account: { provenance: "configured-context" },
@@ -1041,7 +1041,7 @@ type FakeProc = ChildProcessByStdio<Writable, Readable, Readable>;
 
 function makeFakeAgyProcess(
   runtime: AgyLaunchRuntime,
-  catalog: AgentProfile["catalog"],
+  catalog: AgentAdapter["catalog"],
   sessionStore: AgySessionStore,
   defaultModel: string,
   printTimeoutSeconds?: number,
@@ -1384,7 +1384,7 @@ class AgyAgent implements Agent {
 
   constructor(
     private readonly runtime: AgyLaunchRuntime,
-    private readonly catalog: AgentProfile["catalog"],
+    private readonly catalog: AgentAdapter["catalog"],
     private readonly sessionStore: AgySessionStore,
     private readonly defaultModel: string,
     private readonly printTimeoutSeconds?: number,

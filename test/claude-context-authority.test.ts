@@ -6,7 +6,7 @@ import { PassThrough, Readable, Writable } from "node:stream";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { agent, methods, ndJsonStream, PROTOCOL_VERSION } from "@agentclientprotocol/sdk";
 import { pino } from "pino";
-import { CLAUDE_VERIFIED_OVERLAY, makeClaudeProfile, manifestCatalogSource, mergeClaudeCatalogModels, type AgentProfile } from "@seam/adapters";
+import { CLAUDE_VERIFIED_OVERLAY, makeClaudeProfile, manifestCatalogSource, mergeClaudeCatalogModels, type AgentAdapter } from "@seam/adapters";
 import { AgentRuntime, type AgentEventHandler } from "../packages/core/src/agents/agent-runtime.js";
 import { controllerMetadataAdapter } from "../packages/core/src/agents/controller-metadata.js";
 import { loadConfig } from "../packages/core/src/config.js";
@@ -168,7 +168,7 @@ describe("Claude native compaction owns the launch", () => {
     expect(config).not.toHaveProperty("CLAUDE_COMPACTION_TOKEN_THRESHOLD");
     const profile = controllerMetadataAdapter(makeClaudeProfile({ defaultModel: "default" }), undefined, undefined,
       { thinkingDisplay: "summarized" });
-    const runtime = new AgentRuntime({ profile: profile as AgentProfile, logger: pino({ level: "silent" }),
+    const runtime = new AgentRuntime({ profile: profile as AgentAdapter, logger: pino({ level: "silent" }),
       spawnFn: () => child as never });
     await runtime.start();
     await runtime.newSession({ cwd: dir, effort: "high" });

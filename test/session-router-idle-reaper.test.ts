@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { pino } from "pino";
-import type { AgentProfile } from "@seam/adapters";
+import type { AgentAdapter } from "@seam/adapters";
 import type { Logger } from "../packages/core/src/lib/logger.js";
 import type { SessionRecord, SessionConfigState } from "../packages/core/src/core/types.js";
 import { SessionStore } from "../packages/core/src/core/session-store.js";
@@ -84,7 +84,7 @@ const profile = {
   spawn: () => {
     throw new Error("mock AgentRuntime must not spawn a real child");
   },
-} as unknown as AgentProfile;
+} as unknown as AgentAdapter;
 
 function makeRecord(): SessionRecord {
   return {

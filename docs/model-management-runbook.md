@@ -754,7 +754,7 @@ session that already has history:
   **Thread-only** — a channel-level `fastMode` is rejected by
   `ChannelPresetSchema` so a channel pin can never bill every sibling thread.
 - Resolution: `describeConfig().fastMode` (`ResolvedSetting<boolean>`).
-- Eligibility: `AgentProfile.fastMode` (Claude only, and only for
+- Eligibility: `AgentAdapter.fastMode` (Claude only, and only for
   direct-Anthropic backends — a Claude harness pointed at Ollama/Z.ai via
   `ANTHROPIC_BASE_URL` declares none).
 - Policy: `packages/core/src/core/fast-mode.ts`; wire constants:

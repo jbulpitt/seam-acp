@@ -12,7 +12,7 @@ import { ChoiceResultHub } from "../packages/core/src/core/choice/result.js";
 import { AgentRuntime } from "../packages/core/src/agents/agent-runtime.js";
 import { planIsolatedBridgeSpawn } from "../packages/core/src/core/location-bind.js";
 import { DEFAULT_REMOTE_RUNG1_POLICY } from "../packages/core/src/core/remote-spawn.js";
-import type { AgentProfile } from "@seam/adapters";
+import type { AgentAdapter } from "@seam/adapters";
 import type { DispatchSpec } from "../packages/core/src/core/dispatch/types.js";
 
 let dir: string;
@@ -133,7 +133,7 @@ describe("ingest interrupted-dispatch recovery", () => {
       markSessionBridge: vi.fn(), mcpServersForBridgeSpawn: vi.fn() };
     const plan = planIsolatedBridgeSpawn({ hub: orch.bridgeHub, sessionId: `dispatch:${spec.id}`,
       location, agentId: "codex", cwd: dir, model: "recorded-model" });
-    const runtime = new AgentRuntime({ profile: { id: "codex" } as AgentProfile,
+    const runtime = new AgentRuntime({ profile: { id: "codex" } as AgentAdapter,
       logger: orch.logger, bridgeHealth: mux, spawnFn: plan.spawnFn });
     let started!: () => void;
     const prompted = new Promise<void>(resolve => { started = resolve; });

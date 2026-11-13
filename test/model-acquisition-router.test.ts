@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { pino } from "pino";
-import { readErrorClassification, unclassified, type AgentProfile } from "@seam/adapters";
+import { readErrorClassification, unclassified, type AgentAdapter } from "@seam/adapters";
 import { AgentRuntime, type AgentEvent } from "../packages/core/src/agents/agent-runtime.js";
 import { SessionRouter, type SeamMcpWiring } from "../packages/core/src/core/session-router.js";
 import { SessionStore } from "../packages/core/src/core/session-store.js";
@@ -28,7 +28,7 @@ function setup(location: string, existing = true, failAt: "spawn" | "selection" 
     staticModels: ["original", "sibling"].map(modelId => ({ modelId, name: modelId, contextLimit: 1_000_000 })),
     classifyError: (error: unknown) => readErrorClassification(error) ?? unclassified("claude"),
     spawn: (model: string) => { localSpawns(model); if (model === "original" && failAt === "spawn") throw rejection(); return {}; },
-  } as unknown as AgentProfile;
+  } as unknown as AgentAdapter;
   const mux = { spawn: () => ({ slot: 3, kill: vi.fn() }), releaseStdin: vi.fn(),
     rpc: async (_method: string, args: any) => { remoteSpawns(args.model); if (args.model === "original" && failAt === "spawn") throw rejection(); return { ok: true }; },
   };

@@ -16,7 +16,7 @@ import type { Logger } from "../packages/core/src/lib/logger.js";
 import { SessionStore } from "../packages/core/src/core/session-store.js";
 import { SessionRouter } from "../packages/core/src/core/session-router.js";
 import { catalogEffortChoices } from "../packages/core/src/platforms/discord/orchestrator.js";
-import type { AgentProfile } from "@seam/adapters";
+import type { AgentAdapter } from "@seam/adapters";
 import { localBridgeWiring } from "./local-bridge-fixture.js";
 const logger = pino({ level: "silent" }) as unknown as Logger;
 const dirs: string[] = [];
@@ -308,7 +308,7 @@ describe("ModelCatalogService", () => {
       defaultModel: "nebula",
       catalog: { fetch: async () => candidate() },
       effort: { mechanism: "configOption", configId: "cognition.mode/v9", levels: ["swift", "deliberate"] },
-    } as unknown as AgentProfile;
+    } as unknown as AgentAdapter;
     const router = new SessionRouter({
       logger,
       store: sessions,

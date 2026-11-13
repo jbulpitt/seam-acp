@@ -1,6 +1,6 @@
 import type { ChildProcessByStdio } from "node:child_process";
 import type { Readable, Writable } from "node:stream";
-import type { AgentProfile } from "@seam/adapters";
+import type { AgentAdapter } from "@seam/adapters";
 import type { SeamMcpWiring } from "../packages/core/src/core/session-router.js";
 import type { MuxSpawnedProcess } from "../packages/core/src/core/remote-spawn.js";
 import type { BridgeHub } from "../packages/core/src/core/bridge-hub.js";
@@ -39,7 +39,7 @@ type SpawnedChild = ChildProcessByStdio<Writable, Readable, Readable>;
 
 /** In-process mux/RPC fixture, without the WebSocket or sessiond transport. */
 export function localBridgeWiring(
-  spawn: ((params: RemoteSlotSpawnParams) => SpawnedChild) | AgentProfile | readonly AgentProfile[] = () => {
+  spawn: ((params: RemoteSlotSpawnParams) => SpawnedChild) | AgentAdapter | readonly AgentAdapter[] = () => {
     throw new Error("synthetic local bridge spawn was not configured");
   },
 ): SeamMcpWiring {
@@ -100,7 +100,7 @@ export function localBridgeWiring(
 
 /** Minimal BridgeHub-shaped view for command/orchestrator unit tests. */
 export function localBridgeHub(
-  profiles: readonly AgentProfile[],
+  profiles: readonly AgentAdapter[],
   workspaceRoot: string,
   wiring = localBridgeWiring(profiles),
 ): BridgeHub {
@@ -152,7 +152,7 @@ export function localBridgeHub(
 
 export function attachLocalBridge<T extends Orchestrator>(
   orchestrator: T,
-  profiles: readonly AgentProfile[],
+  profiles: readonly AgentAdapter[],
   workspaceRoot: string,
 ): T {
   orchestrator.setBridgeHub(localBridgeHub(profiles, workspaceRoot));

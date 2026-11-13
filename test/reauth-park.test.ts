@@ -9,7 +9,7 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { RequestError } from "@agentclientprotocol/sdk";
-import { classifyClaudeError, type AgentProfile } from "@seam/adapters";
+import { classifyClaudeError, type AgentAdapter } from "@seam/adapters";
 import { AgentRuntime } from "../packages/core/src/agents/agent-runtime.js";
 import { Orchestrator } from "../packages/core/src/platforms/discord/orchestrator.js";
 import { SessionStore } from "../packages/core/src/core/session-store.js";
@@ -44,7 +44,7 @@ function harness(facts: () => { refreshTokenExpiresAt: number | null } | undefin
   const profile = {
     id: "claude", defaultModel: "fixture-model", classifyError: classifyClaudeError,
     spawn() { throw new Error("provider spawn forbidden"); },
-  } as unknown as AgentProfile;
+  } as unknown as AgentAdapter;
   const logger = pino({ level: "silent" });
   const runtime = new AgentRuntime({
     profile, logger: logger as never,

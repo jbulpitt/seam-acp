@@ -1,16 +1,16 @@
-import { asLocalAdapter, claudeSessionMetadata, CLAUDE_FAST_MODE, CODEX_FAST_MODE, UNKNOWN_AGENT_IDENTITY, type AgentProfile, type AgentClientMetadata, type AdapterCatalogSource, classifyAndAttach, classifyCodexError, classifyAgyError, classifyClaudeError, classifyCopilotError, classifyGrokError } from "@seam/adapters";
+import { asLocalAdapter, claudeSessionMetadata, CLAUDE_FAST_MODE, CODEX_FAST_MODE, UNKNOWN_AGENT_IDENTITY, type AgentAdapter, type AgentClientMetadata, type AdapterCatalogSource, classifyAndAttach, classifyCodexError, classifyAgyError, classifyClaudeError, classifyCopilotError, classifyGrokError } from "@seam/adapters";
 
 /** ACP client metadata, not a controller-side launch or session-file reader. */
 export function controllerMetadataAdapter(
-  profile: Pick<AgentProfile, "id" | "catalog"> & Partial<AgentProfile>,
+  profile: Pick<AgentAdapter, "id" | "catalog"> & Partial<AgentAdapter>,
   metadata?: AgentClientMetadata,
   catalog: AdapterCatalogSource = profile.catalog,
   claudeSessionOptions?: AgentClientMetadata["claudeSessionOptions"],
-): AgentProfile {
+): AgentAdapter {
   const claude = profile.id === "claude" || profile.id.startsWith("claude-") || !!metadata?.claudeSessionOptions;
   const copilot = profile.id.startsWith("copilot");
   const defaultModel = metadata?.defaultModel ?? profile.defaultModel ?? "default";
-  const policy: Partial<AgentProfile> = claude ? {
+  const policy: Partial<AgentAdapter> = claude ? {
     classifyError: (error: unknown) => classifyAndAttach(error, classifyClaudeError(error, profile.id)),
     effort: { mechanism: "meta", levels: ["low", "medium", "high", "xhigh", "max"] },
     fastMode: metadata?.fastMode ?? profile.fastMode ?? (profile.id === "claude" ? CLAUDE_FAST_MODE : undefined),

@@ -3,7 +3,7 @@ import { pino } from "pino";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import type { AgentProfile } from "@seam/adapters";
+import type { AgentAdapter } from "@seam/adapters";
 import { PresetsFileSchema, type Config } from "../packages/core/src/config.js";
 import type { BridgeHub } from "../packages/core/src/core/bridge-hub.js";
 import { createConfigFacades } from "../packages/core/src/core/config-apply-plan.js";
@@ -24,7 +24,7 @@ function fixture(reportedRoot: string | null = remoteRoot) {
   const presetsFile = path.join(dir, "presets.json"); fs.writeFileSync(presetsFile, '{}');
   const logger = pino({ level: "silent" });
   const profile = { id: "agy", defaultModel: "gemini-3.8-flash-medium",
-    staticModels: [{ modelId: "gemini-3.8-flash-medium" }], effort: { mechanism: "none", levels: [] } } as unknown as AgentProfile;
+    staticModels: [{ modelId: "gemini-3.8-flash-medium" }], effort: { mechanism: "none", levels: [] } } as unknown as AgentAdapter;
   const modelCatalog = fixtureModelCatalog([profile]);
   const config = { REPOS_ROOT: "/home/ubuntu/Projects", DEFAULT_AGENT: "agy", GOOGLE_CHAT_DEFAULT_CWD: "/home/ubuntu/Projects",
     channelPresets: new Map(), threadPresets: new Map(), bridgePresets: new Map() } as unknown as Config;

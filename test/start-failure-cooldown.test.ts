@@ -8,7 +8,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { pino } from "pino";
-import type { AgentProfile } from "@seam/adapters";
+import type { AgentAdapter } from "@seam/adapters";
 import { SessionRouter } from "../packages/core/src/core/session-router.js";
 import { SessionStore } from "../packages/core/src/core/session-store.js";
 import type { Logger } from "../packages/core/src/lib/logger.js";
@@ -22,7 +22,7 @@ const profile = {
   defaultModel: "gemini-3.8-flash-high",
   staticModels: [{ modelId: "gemini-3.8-flash-high", name: "Gemini" }],
   effort: { mechanism: "none", levels: [] },
-} as unknown as AgentProfile;
+} as unknown as AgentAdapter;
 
 let dir: string;
 let store: SessionStore;

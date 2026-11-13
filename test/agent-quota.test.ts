@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { parseAgyQuotaSummary } from "../packages/adapters/src/profiles/agy.js";
 import { parseOllamaCloudUsage } from "../packages/adapters/src/profiles/ollama-cloud.js";
-import type { AgentProfile } from "../packages/adapters/src/agent-profile.js";
+import type { AgentAdapter } from "../packages/adapters/src/agent-profile.js";
 import {
   mapAgyQuota,
   mapClaudeQuota,
@@ -246,7 +246,7 @@ describe("agent quota normalization", () => {
     const profile = {
       id: "ollama-cloud",
       displayName: "Ollama Cloud",
-    } as AgentProfile;
+    } as AgentAdapter;
     const [source] = createAgentQuotaSources([profile], {
       ollamaUsageCliPath: "/definitely/missing/ollama-usage",
     });

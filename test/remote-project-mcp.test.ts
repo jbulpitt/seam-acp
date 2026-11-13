@@ -5,7 +5,7 @@ import { EventEmitter } from "node:events";
 import { PassThrough, Readable, Writable } from "node:stream";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { pino } from "pino";
-import type { AgentAdapter, AgentProfile } from "@seam/adapters";
+import type { AgentAdapter } from "@seam/adapters";
 import {
   agent,
   methods,
@@ -129,7 +129,7 @@ describe("remote project MCP ownership (#417)", () => {
       displayName: "Codex",
       defaultModel: "default",
       mcpServersAtSpawn: false,
-    } as AgentProfile;
+    } as AgentAdapter;
     const runtime = new AgentRuntime({
       profile,
       logger: silent,

@@ -34,7 +34,7 @@ import {
   QUOTA_SOURCE_TIMEOUT_MS,
 } from "../packages/core/src/core/quota/quota-registry.js";
 import type { AgentQuota } from "../packages/core/src/core/quota/agent-quota.js";
-import type { AgentProfile } from "@seam/adapters";
+import type { AgentAdapter } from "@seam/adapters";
 import type { Logger } from "../packages/core/src/lib/logger.js";
 import { createOrdinaryAgyFixture } from "./helpers/agy-runtime-fixture.js";
 import { quotaMcp } from "../packages/core/src/plugins/quota/mcp.js";
@@ -90,7 +90,7 @@ function agyFixture(extraEnv: Record<string, string> = {}): {
  */
 function agySource(runtime: Parameters<typeof fetchAgyUserStatus>[0]): AgentQuotaSource {
   const [source] = createAgentQuotaSources(
-    [{ id: "agy", displayName: "Antigravity" } as AgentProfile],
+    [{ id: "agy", displayName: "Antigravity" } as AgentAdapter],
     { agyRuntime: runtime as never }
   );
   if (!source) throw new Error("createAgentQuotaSources did not build an agy source");

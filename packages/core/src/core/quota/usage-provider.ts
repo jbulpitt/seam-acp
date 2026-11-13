@@ -1,7 +1,7 @@
 import {
   fetchAgyUserStatus, fetchClaudeUsage, fetchCodexUsage, fetchCopilotUsage,
   fetchGrokUsage, fetchGrokUsageFromConnection, fetchOllamaCloudUsage,
-  type AgentProfile, type AgyLaunchRuntime,
+  type AgentAdapter, type AgyLaunchRuntime,
 } from "@seam/adapters";
 import type { TurnBinding } from "../../plugins/turn-activity-registry.js";
 import { isOllamaCloudAgentId } from "../parked-agents.js";
@@ -22,8 +22,8 @@ export interface UsageProviderPort {
   readUsage(binding: Readonly<TurnBinding>, signal?: AbortSignal): Promise<ProviderUsage>;
 }
 
-export type QuotaProfile = Pick<AgentProfile, "id" | "displayName"> &
-  Pick<Partial<AgentProfile>, "configDir" | "runtime" | "accountUsage" | "brand">;
+export type QuotaProfile = Pick<AgentAdapter, "id" | "displayName"> &
+  Pick<Partial<AgentAdapter>, "configDir" | "runtime" | "accountUsage" | "brand">;
 
 /** Internal tier: account readers and live quota connections, never turn launchers. */
 export function createUsageProviderPort(options: {

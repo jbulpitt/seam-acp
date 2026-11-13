@@ -3,7 +3,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { pino } from "pino";
-import type { AgentProfile } from "@seam/adapters";
+import type { AgentAdapter } from "@seam/adapters";
 import { PresetsFileSchema, type Config, type ThreadPreset } from "../packages/core/src/config.js";
 import { createConfigFacades } from "../packages/core/src/core/config-apply-plan.js";
 import { ConfigMutationService } from "../packages/core/src/core/config-mutation.js";
@@ -26,7 +26,7 @@ vi.mock("../packages/core/src/agents/agent-runtime.js", async importOriginal => 
     sessionId = "";
     finishPrompt?: () => void;
     rejectPrompt?: (err: Error) => void;
-    constructor(readonly options: { profile: AgentProfile }) {}
+    constructor(readonly options: { profile: AgentAdapter }) {}
     async start() {}
     getPromptCapabilities() { return undefined; }
     markActivity() { this.lastActivityAtMs = Date.now(); }
@@ -72,7 +72,7 @@ const profiles = ["claude", "codex", "ollama-cloud", "copilot", "agy"].map(id =>
     ? { mechanism: "configOption", configId: "effort", levels: ["low", "high"] }
     : { mechanism: "meta", levels: ["low", "high"] },
   ...(id === "codex" ? { fastMode: { configId: "fast-mode", onValue: "on", offValue: "off", applicationMode: "live" } } : {}),
-})) as unknown as AgentProfile[];
+})) as unknown as AgentAdapter[];
 let dir: string;
 let store: SessionStore;
 

@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { pino } from "pino";
-import type { AgentProfile, BridgeSlotHealth } from "@seam/adapters";
+import type { AgentAdapter, BridgeSlotHealth } from "@seam/adapters";
 import { SessionStore } from "../packages/core/src/core/session-store.js";
 import { SessionRouter } from "../packages/core/src/core/session-router.js";
 import { executionIdentity } from "../packages/core/src/core/dispatch/execution-identity.js";
@@ -14,7 +14,7 @@ function setup() {
   const record = { id: "discord:owner", platform: "discord", channelRef: "owner", parentRef: null,
     agentId: "codex", acpSessionId: "saved-acp", repoPath: "/repo", configJson: "{}", createdUtc: now, updatedUtc: now };
   store.upsert(record);
-  const profile = { id: "codex", defaultModel: "default" } as AgentProfile;
+  const profile = { id: "codex", defaultModel: "default" } as AgentAdapter;
   const router = new SessionRouter({ logger: pino({ level: "silent" }), store,
     profiles: [profile], modelCatalog: fixtureModelCatalog([profile]), defaultAgentId: "codex", defaultModel: "default",
     threadPresets: new Map([["owner", { location: "remote" }]]) });

@@ -1,5 +1,5 @@
 import { pino } from "pino";
-import { catalogScopeFingerprint, type AgentProfile } from "@seam/adapters";
+import { catalogScopeFingerprint, type AgentAdapter } from "@seam/adapters";
 import { ModelCatalogService } from "../packages/core/src/core/model-catalog/service.js";
 import { ModelCatalogStore } from "../packages/core/src/core/model-catalog/store.js";
 import { fixtureModelCatalog } from "./model-catalog-fixture.js";
@@ -20,7 +20,7 @@ export async function passthroughCatalog(warm: boolean, location = "macos-a") {
   const store = new ModelCatalogStore(":memory:");
   const models = fixtureModelCatalog([{ id: "claude", defaultModel: "known",
     staticModels: ["known", "retired", "unavailable"].map(modelId => ({ modelId, name: modelId })),
-  } as unknown as AgentProfile]).models(binding).map(model => ({ ...model,
+  } as unknown as AgentAdapter]).models(binding).map(model => ({ ...model,
     ...(model.id === "known" ? { aliases: ["Known-Alias"] } : {}),
     ...(model.id === "retired" ? { lifecycle: "retired" as const } : {}),
     ...(model.id === "unavailable" ? { availability: "unavailable" as const } : {}),

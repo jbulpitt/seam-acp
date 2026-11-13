@@ -19,9 +19,9 @@ selectors, routing fields and dispatch behavior remain.
 - **Account:** the credential context under which requests run. This is separate
   from the Discord author, execution host and model. Some profiles locate it
   through a separate `configDir`.
-- **Agent profile:** the current `AgentAdapter` configuration/behavior contract;
-  `AgentProfile` is its type alias. It supplies identity, spawning, catalog and
-  agent-specific behavior. A catalog's `credentialProfile` instead scopes model
+- **Agent profile:** the configuration/behavior contract named `AgentAdapter`
+  in TypeScript. It supplies identity, spawning, catalog and agent-specific
+  behavior. A catalog's `credentialProfile` instead scopes model
   evidence to a credential context. Neither means a reusable worker preset.
 
 Built-in factories declare `harness`, `provider` and a host-qualified `account`
@@ -37,8 +37,8 @@ resource estimates derive from harness. Catalog fingerprints, backend/project/
 region/policy, source provenance and explicit sharing remain separate authority.
 Matching identity axes alone never permits sharing or grants a capability.
 See [agent profiles][profile], [catalog scope][catalog] and
-[warm-set costs][family]. Type aliases and compatibility routing names remain
-for later #813 increments.
+[warm-set costs][family]. Compatibility routing names remain for later #813
+increments.
 
 ## Hosts and routing
 

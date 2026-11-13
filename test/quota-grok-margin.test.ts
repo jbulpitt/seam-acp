@@ -19,7 +19,7 @@ import {
 } from "../packages/core/src/core/quota/quota-poller.js";
 import { QuotaRegistry } from "../packages/core/src/core/quota/quota-registry.js";
 import type { Logger } from "../packages/core/src/lib/logger.js";
-import type { AgentProfile } from "@seam/adapters";
+import type { AgentAdapter } from "@seam/adapters";
 
 const silent = pino({ level: "silent" }) as unknown as Logger;
 const fakeGrok = fileURLToPath(new URL("./fixtures/grok/fake-acp.mjs", import.meta.url));
@@ -43,7 +43,7 @@ function stageHealthyGrok(): string {
 
 describe("#349 a healthy Grok refresh is unaffected by the abort wiring", () => {
   it("finishes the cold-path round trip well inside the per-source deadline", async () => {
-    const profile = { id: "grok", displayName: "Grok" } as AgentProfile;
+    const profile = { id: "grok", displayName: "Grok" } as AgentAdapter;
     const [source] = createAgentQuotaSources([profile], { grokCliPath: stageHealthyGrok() });
     const poller = new AgentQuotaPoller({
       logger: silent,

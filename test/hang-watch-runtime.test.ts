@@ -7,7 +7,7 @@
  * nothing.
  */
 import { describe, expect, it, vi } from "vitest";
-import { readErrorClassification, type AgentProfile } from "@seam/adapters";
+import { readErrorClassification, type AgentAdapter } from "@seam/adapters";
 import { AgentRuntime } from "../packages/core/src/agents/agent-runtime.js";
 import type { Logger } from "../packages/core/src/lib/logger.js";
 
@@ -19,7 +19,7 @@ function runtime(opts: {
   onDead?: () => void;
 }) {
   const logger = { warn: vi.fn(), info: vi.fn(), error: vi.fn(), debug: vi.fn(), child() { return this; } };
-  const profile = { id: "grok", spawn: () => { throw new Error("unused"); } } as unknown as AgentProfile;
+  const profile = { id: "grok", spawn: () => { throw new Error("unused"); } } as unknown as AgentAdapter;
   const rt = new AgentRuntime({
     profile,
     logger: logger as unknown as Logger,

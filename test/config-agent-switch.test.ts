@@ -8,7 +8,7 @@ import { Orchestrator } from "../packages/core/src/platforms/discord/orchestrato
 import { SessionRouter } from "../packages/core/src/core/session-router.js";
 import { SessionStore } from "../packages/core/src/core/session-store.js";
 import type { Logger } from "../packages/core/src/lib/logger.js";
-import type { AgentProfile } from "@seam/adapters";
+import type { AgentAdapter } from "@seam/adapters";
 import type { ChannelPreset, ThreadPreset } from "../packages/core/src/config.js";
 import type { SessionConfigState, SessionRecord } from "../packages/core/src/core/types.js";
 import { fixtureModelCatalog } from "./model-catalog-fixture.js";
@@ -50,7 +50,7 @@ const profiles = [
     staticModels: [{ modelId: "grok-4.6", name: "Grok 4.6" }],
     effort: { mechanism: "none", levels: [] },
   },
-] as unknown as AgentProfile[];
+] as unknown as AgentAdapter[];
 
 function slashI(over: {
   channelId?: string;

@@ -3,7 +3,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { pino } from "pino";
-import type { AgentProfile } from "@seam/adapters";
+import type { AgentAdapter } from "@seam/adapters";
 import type { Config } from "../packages/core/src/config.js";
 import { SessionRouter } from "../packages/core/src/core/session-router.js";
 import { SessionStore } from "../packages/core/src/core/session-store.js";
@@ -27,7 +27,7 @@ const profiles = ["claude", "codex"].map(id => ({
   id, defaultModel: `${id}-default`,
   staticModels: ["default", "channel", "explicit"].map(kind => ({ modelId: `${id}-${kind}`, name: `${id}-${kind}` })),
   effort: { mechanism: "meta", levels: ["low", "high"] },
-})) as unknown as AgentProfile[];
+})) as unknown as AgentAdapter[];
 let dir: string;
 let store: SessionStore;
 beforeEach(() => {

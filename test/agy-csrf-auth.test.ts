@@ -13,7 +13,7 @@ import {
   makeAgyProfile,
   runBoundedProbe,
   subscribeToAgyStream,
-  type AgentProfile,
+  type AgentAdapter,
 } from "@seam/adapters";
 import { AgentRuntime } from "../packages/core/src/agents/agent-runtime.js";
 import { ModelCatalogService } from "../packages/core/src/core/model-catalog/service.js";
@@ -53,7 +53,7 @@ function subject(extraEnv: Record<string, string> = {}): {
   root: string;
   log: string;
   managed: OrdinaryAgyFixture;
-  profile: AgentProfile;
+  profile: AgentAdapter;
 } {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "seam-agy-csrf-"));
   const log = path.join(root, "invocations.ndjson");

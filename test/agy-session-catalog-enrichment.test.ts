@@ -8,7 +8,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { pino } from "pino";
 import { describe, expect, it } from "vitest";
-import { AGY_ASSUMED_CONTEXT_WINDOW, makeAgyProfile, type AgentProfile } from "@seam/adapters";
+import { AGY_ASSUMED_CONTEXT_WINDOW, makeAgyProfile, type AgentAdapter } from "@seam/adapters";
 import { SessionRouter } from "../packages/core/src/core/session-router.js";
 import { SessionStore } from "../packages/core/src/core/session-store.js";
 import { ModelCatalogService } from "../packages/core/src/core/model-catalog/service.js";
@@ -76,7 +76,7 @@ describe.sequential("#346 real-session catalog enrichment", () => {
     const sessionStore = new SessionStore(db);
     const localBinding = { agentId: "agy", location: "local" };
     const peerBinding = { agentId: "agy", location: "other-host" };
-    const profiles = new Map<string, AgentProfile>([
+    const profiles = new Map<string, AgentAdapter>([
       ["local", local.profile],
       ["other-host", peer.profile],
     ]);

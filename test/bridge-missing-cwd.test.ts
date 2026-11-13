@@ -11,7 +11,7 @@ import path from "node:path";
 import { PassThrough, Readable, Writable } from "node:stream";
 import { describe, expect, it, vi } from "vitest";
 import { agent, methods, ndJsonStream, PROTOCOL_VERSION } from "@agentclientprotocol/sdk";
-import type { AgentProfile } from "@seam/adapters";
+import type { AgentAdapter } from "@seam/adapters";
 import { dispatchBridgeRpc, type SlotSpawnConfig } from "../packages/bridge/src/rpc.js";
 import { AgentRuntime, type AgentEvent } from "../packages/core/src/agents/agent-runtime.js";
 import { rewriteSessionInput } from "../packages/bridge/src/mcp-injection.js";
@@ -139,7 +139,7 @@ describe("a directory missing on this host", () => {
       id: "claude",
       displayName: "Claude",
       defaultModel: "default",
-    } as AgentProfile;
+    } as AgentAdapter;
     const logger = {
       child() { return this; }, debug() {}, info() {}, warn() {}, error() {},
     } as never;

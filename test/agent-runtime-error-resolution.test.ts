@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { RequestError } from "@agentclientprotocol/sdk";
-import { classifyAgyError, classifyClaudeError, classifyCodexError, readErrorClassification, resolveError, type AgentProfile } from "@seam/adapters";
+import { classifyAgyError, classifyClaudeError, classifyCodexError, readErrorClassification, resolveError, type AgentAdapter } from "@seam/adapters";
 import { AgentRuntime } from "../packages/core/src/agents/agent-runtime.js";
 import { ReauthParked } from "../packages/core/src/core/reauth-negotiation.js";
 import type { ClaudeCredentialFacts } from "../packages/core/src/core/claude-oauth-contention.js";
@@ -12,11 +12,11 @@ import { fastProviderRetryClock } from "./helpers/provider-retry-clock.js";
 beforeEach(fastProviderRetryClock);
 afterEach(() => vi.restoreAllMocks());
 
-function fixture(error: unknown, classifyError?: AgentProfile["classifyError"], agentId = "claude",
+function fixture(error: unknown, classifyError?: AgentAdapter["classifyError"], agentId = "claude",
   bridgeHealth?: ConstructorParameters<typeof AgentRuntime>[0]["bridgeHealth"],
   claudeCredentialFacts?: () => ClaudeCredentialFacts | undefined) {
   const logger = { warn: vi.fn(), info: vi.fn(), error: vi.fn(), debug: vi.fn(), child() { return this; } };
-  const profile = { id: agentId, classifyError, spawn: () => { throw error; } } as unknown as AgentProfile;
+  const profile = { id: agentId, classifyError, spawn: () => { throw error; } } as unknown as AgentAdapter;
   const runtime = new AgentRuntime({ profile, logger: logger as unknown as Logger, bridgeHealth, claudeCredentialFacts, spawnFn: () => { throw error; } });
   const prompt = vi.fn().mockRejectedValue(error);
   Object.assign(runtime, { connection: { prompt, newSession: prompt, loadSession: prompt }, sessionId: "dispatch:fixture-session", promptCapabilities: {} });

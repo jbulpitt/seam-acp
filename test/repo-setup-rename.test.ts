@@ -23,7 +23,7 @@ import {
 } from "../packages/core/src/platforms/discord/config-editor.js";
 import { stripStoredThreadPrefix } from "../packages/core/src/platforms/discord/thread-namer.js";
 import type { Logger } from "../packages/core/src/lib/logger.js";
-import type { AgentProfile } from "@seam/adapters";
+import type { AgentAdapter } from "@seam/adapters";
 import type { ChannelPreset, ThreadPreset } from "../packages/core/src/config.js";
 import type { ChannelRef, StructuredPanel } from "../packages/core/src/platforms/chat-adapter.js";
 import type { Preset } from "../packages/core/src/core/types.js";
@@ -45,7 +45,7 @@ const profiles = [
     staticModels: [{ modelId: "gpt-5.4" }],
     effort: { mechanism: "none", levels: [] as string[] },
   },
-] as unknown as AgentProfile[];
+] as unknown as AgentAdapter[];
 
 let dir: string;
 let reposRoot: string;

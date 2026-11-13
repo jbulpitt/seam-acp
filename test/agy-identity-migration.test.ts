@@ -3,7 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { logger as journal } from "../packages/core/src/lib/logger.js";
-import type { AgentProfile } from "@seam/adapters";
+import type { AgentAdapter } from "@seam/adapters";
 import { SessionStore } from "../packages/core/src/core/session-store.js";
 import { planAgyIdentityMigration, readAgyHandleOwnership, rebuildMigratedAgySession } from "../packages/core/src/core/agy-identity-migration.js";
 import type { SessionRecord } from "../packages/core/src/core/types.js";
@@ -44,7 +44,7 @@ describe("owner-approved local AGY restoration", () => {
     // unknown-agent reason. Use a viable non-live plan and prove recovery opens
     // it: the refusal protects a pending context rebuild, not missing config.
     const spawn = vi.fn(() => { throw new Error("audit fixture must never spawn"); });
-    const profile = { id: "agy", displayName: "AGY fixture", defaultModel: "exact-high", spawn } as unknown as AgentProfile;
+    const profile = { id: "agy", displayName: "AGY fixture", defaultModel: "exact-high", spawn } as unknown as AgentAdapter;
     const router = new SessionRouter({ logger: pino({ level: "silent" }) as unknown as Logger,
       store, profiles: [profile], modelCatalog: fixtureModelCatalog([profile]), defaultAgentId: "agy", defaultModel: "exact-high", threadPresets: new Map(), seamMcp: localBridgeWiring(profile) });
     expect(() => router.planRuntimeSpawn(store.get("package")!)).toThrow(/requires Discord reconstruction/);
@@ -115,7 +115,7 @@ describe("owner-approved local AGY restoration", () => {
     const restarted = new SessionStore(file); stores.push(restarted);
     const pending = restarted.list().filter((record) => !restarted.hasAgyIdentityMigration(record.id));
     expect(pending).toEqual([bad]);
-    const profile = { id: "agy", defaultModel: "default" } as unknown as AgentProfile;
+    const profile = { id: "agy", defaultModel: "default" } as unknown as AgentAdapter;
     const router = new SessionRouter({ logger: pino({ level: "silent" }) as unknown as Logger, store: restarted, profiles: [profile],
       modelCatalog: fixtureModelCatalog([profile]), defaultAgentId: "agy", defaultModel: "default", agyMigrationErrors: errors, seamMcp: localBridgeWiring(profile) });
     expect(() => router.planRuntimeSpawn(bad)).toThrow("Ambiguous AGY session ownership");

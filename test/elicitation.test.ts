@@ -13,7 +13,7 @@ import {
   type ClientCapabilities,
   type CreateElicitationRequest,
 } from "@agentclientprotocol/sdk";
-import type { AgentProfile } from "@seam/adapters";
+import type { AgentAdapter } from "@seam/adapters";
 import {
   ACP_CLIENT_CAPABILITIES,
   AgentRuntime,
@@ -291,7 +291,7 @@ describe("ACP v1 elicitation validation and capability", () => {
       id: "wire",
       defaultModel: "default",
       spawn: () => child,
-    } as unknown as AgentProfile;
+    } as unknown as AgentAdapter;
     const runtime = new AgentRuntime({
       profile,
       logger,

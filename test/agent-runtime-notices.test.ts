@@ -2,7 +2,7 @@ import { testSessionRouter, testSessionStore } from "./helpers/session-fixture.j
 import { EventEmitter } from "node:events";
 import { PassThrough, Readable, Writable } from "node:stream";
 import { agent, methods, ndJsonStream, PROTOCOL_VERSION, type ClientCapabilities, type SessionUpdate, type PromptResponse } from "@agentclientprotocol/sdk";
-import { classifyCodexError, classifyClaudeError, type AgentProfile } from "@seam/adapters";
+import { classifyCodexError, classifyClaudeError, type AgentAdapter } from "@seam/adapters";
 import { pino } from "pino";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { AgentRuntime, type AgentEvent } from "../packages/core/src/agents/agent-runtime.js";
@@ -52,7 +52,7 @@ async function runtime(agentId: string, updates: SessionUpdate[], response: Prom
     logs.push(JSON.parse(String(chunk))); callback();
   } })) as unknown as Logger;
   const profile = { id: agentId, defaultModel: "default",
-    classifyError: agentId === "codex" ? classifyCodexError : agentId === "claude" ? classifyClaudeError : undefined } as unknown as AgentProfile;
+    classifyError: agentId === "codex" ? classifyCodexError : agentId === "claude" ? classifyClaudeError : undefined } as unknown as AgentAdapter;
   const rt = new AgentRuntime({ profile, logger, spawnFn: () => child as never });
   cleanups.push(async () => { await rt.dispose(); connection.close(); stdin.destroy(); stdout.destroy(); stderr.destroy(); });
   await rt.start();

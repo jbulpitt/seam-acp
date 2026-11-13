@@ -3,7 +3,7 @@ import { pino } from "pino";
 import { SessionRouter, simpleCardGifForRender, statusCardStyleForRender } from "../packages/core/src/core/session-router.js";
 import { TurnStatus } from "../packages/core/src/core/status-panel.js";
 import type { SessionStore } from "../packages/core/src/core/session-store.js";
-import type { AgentProfile } from "@seam/adapters";
+import type { AgentAdapter } from "@seam/adapters";
 import type { Logger } from "../packages/core/src/lib/logger.js";
 import type { SessionRecord, SessionConfigState } from "../packages/core/src/core/types.js";
 import type { ChannelPreset, ThreadPreset } from "../packages/core/src/config.js";
@@ -24,7 +24,7 @@ const profiles = [
     staticModels: [{ modelId: "gpt-5.4", name: "gpt-5.4" }],
     effort: { mechanism: "none", levels: [] },
   },
-] as unknown as AgentProfile[];
+] as unknown as AgentAdapter[];
 
 /** A SessionStore stub that only implements what describeConfig reads. */
 function stubStore(): SessionStore {

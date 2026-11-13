@@ -8,7 +8,7 @@ import { EventEmitter } from "node:events";
 import { PassThrough, Readable, Writable } from "node:stream";
 import { setTimeout as delay } from "node:timers/promises";
 import { agent, methods, ndJsonStream, PROTOCOL_VERSION, RequestError } from "@agentclientprotocol/sdk";
-import { BridgeUnreachableError, classifyAgyError, manifestCatalogSource, readErrorClassification, SEAM_AGY_STDOUT_FALLBACK_META, type AgentProfile } from "@seam/adapters";
+import { BridgeUnreachableError, classifyAgyError, manifestCatalogSource, readErrorClassification, SEAM_AGY_STDOUT_FALLBACK_META, type AgentAdapter } from "@seam/adapters";
 import { pino } from "pino";
 import { Orchestrator } from "../packages/core/src/platforms/discord/orchestrator.js";
 import { SessionStore } from "../packages/core/src/core/session-store.js";
@@ -85,7 +85,7 @@ function setup(location = REMOTE) {
       models: () => [MODEL, OVERRIDE_MODEL].map(modelId => ({ modelId, name: modelId })) }),
     classifyError: classifyAgyError,
     effort: { mechanism: "spawnArgs", levels: ["high"] }, spawn: localSpawn,
-    sessionManager: { deleteSession: localDelete } } as unknown as AgentProfile;
+    sessionManager: { deleteSession: localDelete } } as unknown as AgentAdapter;
   const now = new Date().toISOString();
   const record = { id: "discord:author", platform: "discord", channelRef: "author", parentRef: "parent",
     agentId: profile.id, acpSessionId: "live-session-untouched", repoPath: cwd, configJson: "{}", createdUtc: now, updatedUtc: now };

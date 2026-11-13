@@ -1,19 +1,19 @@
 /** #404/#448: actual prompt owner, journal-derived failures, no provider calls. */
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { RequestError, type SessionUpdate } from "@agentclientprotocol/sdk";
-import { classifyClaudeError, classifyCodexError, type AgentProfile } from "@seam/adapters";
+import { classifyClaudeError, classifyCodexError, type AgentAdapter } from "@seam/adapters";
 import { AgentRuntime, type AgentEvent } from "../packages/core/src/agents/agent-runtime.js";
 import { logger } from "../packages/core/src/lib/logger.js";
 import { fastProviderRetryClock } from "./helpers/provider-retry-clock.js";
 
 const CONTENTION = "Failed to refresh OAuth token: another Claude Code process is refreshing it or exited mid-refresh. This is usually transient; retry in a minute";
-const profile = { id: "claude", classifyError: classifyClaudeError } as unknown as AgentProfile;
+const profile = { id: "claude", classifyError: classifyClaudeError } as unknown as AgentAdapter;
 afterEach(() => vi.restoreAllMocks());
 
 function fixture(options: { output?: boolean; tool?: boolean; update?: SessionUpdate; failures?: number;
   sessionId?: string; error?: Error; codex?: boolean } = {}) {
   const runtime = new AgentRuntime({ profile: options.codex
-    ? { id: "codex", classifyError: classifyCodexError } as unknown as AgentProfile : profile,
+    ? { id: "codex", classifyError: classifyCodexError } as unknown as AgentAdapter : profile,
     logger, spawnFn: () => { throw new Error("unused"); } });
   const events: AgentEvent[] = [];
   runtime.onEvent(event => { events.push(event); });

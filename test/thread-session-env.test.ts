@@ -3,7 +3,7 @@ import { PassThrough } from "node:stream";
 import os from "node:os";
 import { describe, expect, it, vi } from "vitest";
 import { pino } from "pino";
-import type { AgentProfile } from "@seam/adapters";
+import type { AgentAdapter } from "@seam/adapters";
 import { SessionRouter } from "../packages/core/src/core/session-router.js";
 import { spawnRemoteSlot } from "../packages/core/src/core/remote-spawn.js";
 import { Orchestrator } from "../packages/core/src/platforms/discord/orchestrator.js";
@@ -12,7 +12,7 @@ import type { SessionRecord } from "../packages/core/src/core/types.js";
 import { fixtureModelCatalog } from "./model-catalog-fixture.js";
 
 const logger = pino({ level: "silent" });
-const profile = { id: "claude", defaultModel: "default", effort: { mechanism: "none", levels: [] } } as unknown as AgentProfile;
+const profile = { id: "claude", defaultModel: "default", effort: { mechanism: "none", levels: [] } } as unknown as AgentAdapter;
 function record(platform = "discord", channelRef = "thread-a", parentRef: string | null = "parent-a"): SessionRecord {
   return { id: `${platform}:${channelRef}`, platform, channelRef, parentRef, agentId: "claude",
     acpSessionId: "", repoPath: os.tmpdir(), configJson: "{}", createdUtc: "", updatedUtc: "" };

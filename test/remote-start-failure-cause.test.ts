@@ -9,7 +9,7 @@
  */
 import { EventEmitter } from "node:events";
 import { describe, expect, it, vi } from "vitest";
-import { makeMux, type AgentProfile } from "@seam/adapters";
+import { makeMux, type AgentAdapter } from "@seam/adapters";
 import { AgentRuntime } from "../packages/core/src/agents/agent-runtime.js";
 import { discordRenderer } from "../packages/core/src/platforms/discord/renderer.js";
 import { TurnStatus, renderStatusPanel } from "../packages/core/src/core/status-panel.js";
@@ -35,7 +35,7 @@ function remoteRuntime() {
   mux.attach(ws as never);
   let child: ReturnType<typeof mux.spawn> | undefined;
   const runtime = new AgentRuntime({
-    profile: { id: "agy" } as unknown as AgentProfile,
+    profile: { id: "agy" } as unknown as AgentAdapter,
     logger: logger as unknown as Logger,
     spawnFn: () => {
       child = mux.spawn();

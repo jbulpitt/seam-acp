@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { pino } from "pino";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import type { AgentProfile } from "@seam/adapters";
+import type { AgentAdapter } from "@seam/adapters";
 import type { SessionUpdate } from "@agentclientprotocol/sdk";
 import { AgentRuntime } from "../packages/core/src/agents/agent-runtime.js";
 import { SessionStore } from "../packages/core/src/core/session-store.js";
@@ -47,7 +47,7 @@ function setup(mode: "held-status" | "failed-status" | "held-file" | "held-wrap-
   let statusReleased = false;
   let run: Promise<void> | undefined;
   const pending: Promise<void>[] = [];
-  const profile = { id: agentId, defaultModel: "fixture-model" } as AgentProfile;
+  const profile = { id: agentId, defaultModel: "fixture-model" } as AgentAdapter;
   const runtime = new AgentRuntime({ profile, logger: logger as never,
     spawnFn: () => { throw new Error("provider spawning forbidden"); } });
   const feed = (update: SessionUpdate) => {

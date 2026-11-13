@@ -11,7 +11,7 @@ import path from "node:path";
 import { EventEmitter } from "node:events";
 import { PassThrough, Readable, Writable } from "node:stream";
 import { agent, methods, ndJsonStream, PROTOCOL_VERSION } from "@agentclientprotocol/sdk";
-import { classifyAgyError, type AgentProfile } from "@seam/adapters";
+import { classifyAgyError, type AgentAdapter } from "@seam/adapters";
 import { pino } from "pino";
 import { Orchestrator } from "../packages/core/src/platforms/discord/orchestrator.js";
 import { SessionStore } from "../packages/core/src/core/session-store.js";
@@ -60,7 +60,7 @@ function setup(location = REMOTE) {
   const profile = { id: "agy", displayName: "Synthetic", defaultModel: MODEL,
     classifyError: classifyAgyError,
     effort: { mechanism: "spawnArgs", levels: ["high"] }, spawn: localSpawn,
-    sessionManager: { deleteSession: localDelete, getTranscript: async () => "" } } as unknown as AgentProfile;
+    sessionManager: { deleteSession: localDelete, getTranscript: async () => "" } } as unknown as AgentAdapter;
   const now = new Date().toISOString();
   const record = { id: "discord:author", platform: "discord", channelRef: "author", parentRef: "parent",
     agentId: profile.id, acpSessionId: "live-session-untouched", repoPath: cwd, configJson: "{}", createdUtc: now, updatedUtc: now };

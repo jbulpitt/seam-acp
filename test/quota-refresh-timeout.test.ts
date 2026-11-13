@@ -21,7 +21,7 @@ import type { Logger } from "../packages/core/src/lib/logger.js";
 import type { ComponentEvent } from "../packages/core/src/platforms/chat-adapter.js";
 import { PluginHost } from "../packages/core/src/plugins/host.js";
 import { createQuotaPlugin } from "../packages/core/src/plugins/quota/index.js";
-import type { AgentProfile } from "@seam/adapters";
+import type { AgentAdapter } from "@seam/adapters";
 
 const silent = pino({ level: "silent" }) as unknown as Logger;
 
@@ -229,7 +229,7 @@ describe("bounded quota refresh", () => {
         if (stallAt === "headers") return stalled();
         return Promise.resolve({ ok: true, json: stalled } as Response);
       }));
-      const profile = { id: "copilot", displayName: "Copilot", configDir: dir } as AgentProfile;
+      const profile = { id: "copilot", displayName: "Copilot", configDir: dir } as AgentAdapter;
       const [source] = createAgentQuotaSources([profile], {});
       poller = new AgentQuotaPoller({
         logger: silent,

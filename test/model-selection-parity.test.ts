@@ -3,7 +3,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { pino } from "pino";
-import type { AgentProfile } from "@seam/adapters";
+import type { AgentAdapter } from "@seam/adapters";
 import { PresetsFileSchema, type Config, type ThreadPreset } from "../packages/core/src/config.js";
 import { createConfigFacades } from "../packages/core/src/core/config-apply-plan.js";
 import { ConfigMutationService } from "../packages/core/src/core/config-mutation.js";
@@ -63,7 +63,7 @@ async function fixture(warm: boolean) {
   cleanup.push(cache.close);
   const store = new SessionStore(path.join(dir, "seam.db"));
   cleanup.push(() => store.close());
-  const profile = { id: "claude", defaultModel: "known", effort: { mechanism: "meta", levels: ["low", "high"] } } as AgentProfile;
+  const profile = { id: "claude", defaultModel: "known", effort: { mechanism: "meta", levels: ["low", "high"] } } as AgentAdapter;
   const previousPreset = PresetsFileSchema.parse({
     channels: {}, threads: { [worker]: { effort: { value: "low" } } },
   }).threads![worker]!;

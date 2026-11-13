@@ -7,7 +7,7 @@ import { SessionStore } from "../packages/core/src/core/session-store.js";
 import { ConfigMutationService } from "../packages/core/src/core/config-mutation.js";
 import { applyPresetIdentity, applyWatchFeedback } from "../packages/core/src/core/dispatch/types.js";
 import type { ConfigDescription } from "../packages/core/src/core/session-router.js";
-import type { AgentProfile } from "@seam/adapters";
+import type { AgentAdapter } from "@seam/adapters";
 import type { SessionRecord } from "../packages/core/src/core/types.js";
 import type { Logger } from "../packages/core/src/lib/logger.js";
 import { fixtureModelCatalog } from "./model-catalog-fixture.js";
@@ -37,7 +37,7 @@ const claudeProfile = {
   id: "claude",
   defaultModel: "gpt-5.4",
   staticModels: [{ modelId: "gpt-5.4", name: "GPT-5.4" }],
-} as unknown as AgentProfile;
+} as unknown as AgentAdapter;
 const modelCatalog = fixtureModelCatalog([claudeProfile]);
 
 function describeConfig(record: SessionRecord): ConfigDescription {

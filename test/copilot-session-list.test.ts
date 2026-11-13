@@ -4,7 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import Database from "better-sqlite3";
-import { makeCopilotProfile, type CopilotCatalogLaunch, type AgentProfile } from "@seam/adapters";
+import { makeCopilotProfile, type CopilotCatalogLaunch, type AgentAdapter } from "@seam/adapters";
 import type { SessionInfo } from "@agentclientprotocol/sdk";
 
 const fixture = fileURLToPath(new URL("./fixtures/copilot-session-list.mjs", import.meta.url));
@@ -26,7 +26,7 @@ describe("Copilot session listing and history", () => {
   });
   afterEach(() => { vi.restoreAllMocks(); fs.rmSync(root, { recursive: true, force: true }); });
 
-  function profile(sessions: SessionInfo[] = [], overrides: Partial<Parameters<typeof makeCopilotProfile>[0]> = {}): AgentProfile {
+  function profile(sessions: SessionInfo[] = [], overrides: Partial<Parameters<typeof makeCopilotProfile>[0]> = {}): AgentAdapter {
     return makeCopilotProfile({
       defaultModel: "fixture-model", configDir: dir, cwd,
       environment: { ...process.env, DATA_DIR: dataDir },

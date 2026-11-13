@@ -9,7 +9,7 @@ import {
   AGENT_ADAPTER_VERSION,
   type AdapterModel,
   type AgentIdentity,
-  type AgentProfile,
+  type AgentAdapter,
 } from "../agent-profile.js";
 import { manifestCatalogScope, manifestCatalogSource, readCliVersion } from "../model-catalog.js";
 import {
@@ -210,7 +210,7 @@ export function makeClaudeProfile(opts: {
    * for non-Anthropic backends (e.g. a Claude Code instance routed to Ollama) so
    * the `/seam effort` picker correctly reports effort isn't settable.
    */
-  effort?: AgentProfile["effort"];
+  effort?: AgentAdapter["effort"];
   /** Accepted for parity; unused — MCP servers are forwarded via ACP. */
   mcpServers?: McpServer[];
   /** Custom environment variables to inject into the spawned process environment. */
@@ -243,7 +243,7 @@ export function makeClaudeProfile(opts: {
    * unset and probes this profile's own `claude-agent-acp`.
    */
   catalogProbe?: () => Promise<ClaudeCatalogProbe>;
-}): AgentProfile {
+}): AgentAdapter {
   const cli = opts.cliPath?.trim() || "claude-agent-acp";
   const configDir = opts.configDir?.trim() || undefined;
   const maxThinkingTokens = opts.maxThinkingTokens;

@@ -12,7 +12,7 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { pino } from "pino";
-import type { AgentProfile } from "@seam/adapters";
+import type { AgentAdapter } from "@seam/adapters";
 import { fixtureModelCatalog } from "./model-catalog-fixture.js";
 import { scanWorkspaces } from "@seam/adapters";
 import { SessionRouter } from "../packages/core/src/core/session-router.js";
@@ -32,7 +32,7 @@ import type { ThreadPreset, BridgeHostConfig } from "../packages/core/src/config
 
 const silent = pino({ level: "silent" }) as unknown as Logger;
 
-function stubProfile(id: string, spawnCalls: unknown[]): AgentProfile {
+function stubProfile(id: string, spawnCalls: unknown[]): AgentAdapter {
   return {
     id,
     displayName: id,
@@ -50,7 +50,7 @@ function stubProfile(id: string, spawnCalls: unknown[]): AgentProfile {
         kill() {},
       });
     },
-  } as unknown as AgentProfile;
+  } as unknown as AgentAdapter;
 }
 
 function stubStore(): SessionStore {

@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { savedSessionHost, SAVED_SESSION } from "./helpers/saved-session-recovery.js";
 import { AgentRuntime } from "../packages/core/src/agents/agent-runtime.js";
 import { pino } from "pino";
-import type { AgentProfile } from "@seam/adapters";
+import type { AgentAdapter } from "@seam/adapters";
 
 const cleanups: (() => Promise<void>)[] = [];
 afterEach(async () => {
@@ -67,7 +67,7 @@ describe("cancel the acquisition owner", () => {
     h.host.store.turnAttempts.bind(h.attempt, SAVED_SESSION);
     h.host.store.turnAttempts.startPrompt(h.attempt);
     const failure = Object.assign(new Error("synthetic cancel pipe closed"), { code: "EPIPE" });
-    const runtime = new AgentRuntime({ profile: { id: "codex" } as AgentProfile,
+    const runtime = new AgentRuntime({ profile: { id: "codex" } as AgentAdapter,
       logger: pino({ level: "silent" }) as any,
       spawnFn: () => { throw new Error("provider spawning forbidden"); } });
     Object.assign(runtime, { sessionId: SAVED_SESSION, promptInFlight: true,

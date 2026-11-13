@@ -3,7 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { pino } from "pino";
-import type { AgentProfile } from "@seam/adapters";
+import type { AgentAdapter } from "@seam/adapters";
 import { buildChannelPresetMaps, type Config } from "../packages/core/src/config.js";
 import { SessionStore } from "../packages/core/src/core/session-store.js";
 import { SessionRouter } from "../packages/core/src/core/session-router.js";
@@ -35,7 +35,7 @@ async function fixture() {
     staticModels: ["default", "channel", "pin"].map(name => ({ modelId: `${id}-${name}`, name })),
     effort: { mechanism: "meta", levels: ["low", "high"] },
     spawn: () => { throw new Error("No provider request in this test"); },
-  })) as unknown as AgentProfile[];
+  })) as unknown as AgentAdapter[];
   const catalog = fixtureModelCatalog(profiles);
   const maps = buildChannelPresetMaps(file);
   const config = { ...maps, ...visualConfig, DATA_DIR: dir, REPOS_ROOT: dir, CHANNEL_PRESETS_FILE: file,

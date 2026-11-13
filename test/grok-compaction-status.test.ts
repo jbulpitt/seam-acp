@@ -1,7 +1,7 @@
 import { EventEmitter } from "node:events";
 import { PassThrough, Readable, Writable } from "node:stream";
 import { agent, methods, ndJsonStream, PROTOCOL_VERSION } from "@agentclientprotocol/sdk";
-import type { AgentProfile } from "@seam/adapters";
+import type { AgentAdapter } from "@seam/adapters";
 import { pino } from "pino";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { AgentRuntime, type AgentEvent } from "../packages/core/src/agents/agent-runtime.js";
@@ -47,7 +47,7 @@ async function fixture(agentId = "grok", style: StatusCardStyle = "full") {
   const connection = server.connect(ndJsonStream(
     Writable.toWeb(stdout) as WritableStream<Uint8Array>, Readable.toWeb(stdin) as ReadableStream<Uint8Array>,
   ));
-  const rt = new AgentRuntime({ profile: { id: agentId } as AgentProfile,
+  const rt = new AgentRuntime({ profile: { id: agentId } as AgentAdapter,
     logger: pino({ level: "silent" }) as Logger, spawnFn: () => child as never });
   const status = new TurnStatus({ model: "grok-4.7", repoDisplay: "repo" });
   status.style = style;

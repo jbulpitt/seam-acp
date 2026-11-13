@@ -5,7 +5,7 @@ import path from "node:path";
 import { EventEmitter } from "node:events";
 import { PassThrough, Readable, Writable } from "node:stream";
 import { agent, methods, ndJsonStream, PROTOCOL_VERSION } from "@agentclientprotocol/sdk";
-import type { AgentProfile } from "@seam/adapters";
+import type { AgentAdapter } from "@seam/adapters";
 import { pino } from "pino";
 import { Orchestrator } from "../packages/core/src/platforms/discord/orchestrator.js";
 import { SessionRouter } from "../packages/core/src/core/session-router.js";
@@ -38,7 +38,7 @@ describe("Discord thread reconstruction uses one bridge path", () => {
         listSessions: async () => [], getTranscript: async () => "",
         cloneSession: async () => {}, deleteSession: async () => {},
       },
-    } as unknown as AgentProfile;
+    } as unknown as AgentAdapter;
     const wiring = localBridgeWiring(params => {
       launches.push(params);
       const child = Object.assign(new EventEmitter(), {

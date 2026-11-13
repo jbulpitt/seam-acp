@@ -11,6 +11,7 @@ import { discordRenderer } from "../packages/core/src/platforms/discord/renderer
 import { serializePanelText } from "../packages/core/src/platforms/renderer.js";
 import { visualConfig } from "./plugin-card-visuals-fixture.js";
 import { fixtureModelCatalog } from "./model-catalog-fixture.js";
+import type { AgentProfile } from "@seam/adapters";
 import type { DispatchSpec } from "../packages/core/src/core/dispatch/types.js";
 import type { Logger } from "../packages/core/src/lib/logger.js";
 import type { SessionRecord, StructuredPanel } from "../packages/core/src/core/types.js";
@@ -303,6 +304,7 @@ function makeOrch(opts: {
   timeoutSeconds?: number;
   cfg?: Record<string, unknown>;
   storeOverrides?: Record<string, unknown>;
+  profile?: AgentProfile;
 }): Orchestrator {
   const router = testSessionRouter({
     listProfiles: () => [],
@@ -315,7 +317,7 @@ function makeOrch(opts: {
     }),
     ensureSessionRecord: ({ channelRef }: { channelRef: string }) =>
       record({ id: `discord:${channelRef}`, channelRef }),
-    getProfile: () => undefined,
+    getProfile: id => opts.profile?.id === id ? opts.profile : undefined,
     getOrStartRuntime: async () => opts.rt,
   });
   const store = testSessionStore({
@@ -637,7 +639,10 @@ describe("dispatchInjectTurn: status panel ON (default)", () => {
       text: ["Hello ", "world"],
     });
     const { adapter, calls } = spyAdapter();
-    const orch = makeOrch({ dataDir, rt, adapter });
+    const orch = makeOrch({ dataDir, rt, adapter, profile: {
+      id: "claude", harness: "claude", provider: "anthropic", account: { provenance: "configured-context" },
+      displayName: "Claude", defaultModel: "opus",
+    } as AgentProfile });
 
     await orch.loadPlugins();
     const res = await orch.dispatchCanaryTurn(baseSpec());
@@ -698,6 +703,7 @@ describe("dispatchInjectTurn: status panel ON (default)", () => {
       const orch = makeOrch({ dataDir, rt, adapter });
       await orch.dispatchInjectTurn(baseSpec({ kind }));
       expect(calls.sendPanel[0]!.panel.title).toContain(marker);
+      expect(calls.sendPanel[0]!.panel.authorIconURL).toBeUndefined();
     }
   });
 

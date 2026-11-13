@@ -17,13 +17,12 @@ function gate() {
 }
 
 async function fixture(agent: "claude" | "codex") {
-  const h = await namingFixture();
-  cleanups.push(h.close);
-  Object.assign(h.router.getProfile(agent)!, {
+  const h = await namingFixture({ profileCapabilities: { [agent]: {
     effort: agent === "claude"
       ? { mechanism: "meta", levels: ["low", "high"] }
       : { mechanism: "configOption", configId: "effort", levels: ["low", "high"] },
-  });
+  } } });
+  cleanups.push(h.close);
   const row = await h.create(THREAD);
   h.store.upsert({ ...row, agentId: agent, acpSessionId: "existing-context",
     configJson: JSON.stringify({ model: h.router.getProfile(agent)!.defaultModel, reasoningEffort: "low" }) }, { source: "fixture", cause: "set provider binding for test" });

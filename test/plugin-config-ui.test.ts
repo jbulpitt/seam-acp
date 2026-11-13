@@ -88,8 +88,9 @@ function component(customId: string, user = "admin", fields?: Record<string, str
 
 describe("config UI built-in", () => {
   it("disables Codex Fast until the live current model advertises it, with its actual reason", async () => {
-    const h = await fixture();
-    Object.assign(h.router.getProfile("codex")!, { fastMode: { configId: "fast-mode", onValue: "on", offValue: "off", applicationMode: "live" } });
+    const h = await fixture({ profileCapabilities: { codex: {
+      fastMode: { configId: "fast-mode", onValue: "on", offValue: "off", applicationMode: "live" },
+    } } });
     const live = { getFastModeAvailability: () => ({ available: false, reason: 'The live codex/gpt-normal session does not advertise "fast-mode".' }) };
     vi.spyOn(h.router, "getRuntime").mockReturnValue(live as never);
     await h.orchestrator.handleSlashInteraction(interaction("edit") as never);

@@ -1,8 +1,11 @@
 import fs from "node:fs";
+import type { AttachmentBuilder } from "discord.js";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import type { SessionConfigState } from "../packages/core/src/core/types.js";
 import { buildSlashRegistrationBody } from "../packages/core/src/platforms/discord/commands.js";
 import { classifyDiscordInteraction } from "../packages/core/src/platforms/discord/adapter.js";
 import { DRAFT_IDLE_TTL_MS, parseCustomId } from "../packages/core/src/platforms/discord/config-editor.js";
+import { discordError, SyntheticInteraction } from "../packages/core/src/platforms/discord/synthetic-interaction.js";
 import { namingFixture, NAMING_PARENT } from "./plugin-naming-fixture.js";
 
 const THREAD = "100000000000000002";
@@ -32,6 +35,49 @@ function interaction(sub: string, values: Record<string, string | number | boole
   };
   return i;
 }
+
+function configShowInteraction() {
+  type Payload = { content?: string; files?: AttachmentBuilder[] };
+  const payloads: Payload[] = [];
+  const deliver = (payload: Payload) => {
+    if ((payload.content?.length ?? 0) > 2000) {
+      throw discordError(50035, "Invalid Form Body\ncontent[BASE_TYPE_MAX_LENGTH]: Must be 2000 or fewer in length.");
+    }
+    payloads.push(payload);
+  };
+  const message = { id: "config-reply", edit: vi.fn(), delete: vi.fn(async () => {}) };
+  message.edit.mockImplementation(async (payload: Payload) => { deliver(payload); return message; });
+  const send = vi.fn(async (payload: Payload) => { deliver(payload); return message; });
+  const native = new SyntheticInteraction(
+    { kind: "slash", channelId: THREAD, command: "seam", subcommandGroup: "config", subcommand: "show" },
+    {
+      client: {} as never,
+      channel: { id: THREAD, parentId: NAMING_PARENT, isThread: () => true, send } as never,
+      user: { id: "admin", username: "admin" } as never,
+      member: null,
+    },
+  );
+  return { native, payloads, send, message };
+}
+
+function saveConfig(h: Awaited<ReturnType<typeof fixture>>, config: SessionConfigState): string {
+  const record = h.store.getByChannel("discord", THREAD)!;
+  const configJson = h.store.writeConfig(config);
+  h.store.upsert({ ...record, configJson });
+  return configJson;
+}
+
+function expectEphemeralConfigReply(i: ReturnType<typeof configShowInteraction>) {
+  expect(i.native.ephemeral).toBe(true);
+  expect(i.native.transcript).toEqual([
+    expect.objectContaining({ op: "deferReply", ephemeral: true }),
+    expect.objectContaining({ op: "editReply", ephemeral: true }),
+  ]);
+  expect(i.send).toHaveBeenCalledTimes(1);
+  expect(i.message.edit).not.toHaveBeenCalled();
+  expect(i.payloads[0]!.content!.length).toBeLessThanOrEqual(2000);
+}
+
 function component(customId: string, user = "admin", fields?: Record<string, string>) {
   return {
     kind: fields ? "modal" as const : "button" as const, customId, userId: user, userName: user,
@@ -96,6 +142,73 @@ describe("config UI built-in", () => {
     const detail = interaction("audit", { entry: h.store.listConfigMutations()[0]!.id });
     await h.orchestrator.handleSlashInteraction(detail as never);
     expect((detail.editReply.mock.calls[0]![0] as any).embeds[0].toJSON().title).toBe("📜 Config mutation");
+  });
+
+  it("shows compact config inline through the ephemeral synthetic Discord reply", async () => {
+    const h = await fixture();
+    const config = { model: "gpt-6.1-sol", reasoningEffort: "high" };
+    const before = saveConfig(h, config);
+    const i = configShowInteraction();
+    await h.orchestrator.handleSlashInteraction(i.native as never);
+    expectEphemeralConfigReply(i);
+    expect(i.native.transcript[1]!.content).toBe(`\`\`\`json\n${JSON.stringify(config, null, 2)}\n\`\`\``);
+    expect(i.payloads[0]!.files).toBeUndefined();
+    expect(h.store.getByChannel("discord", THREAD)!.configJson).toBe(before);
+    expect(h.store.listConfigMutations()).toEqual([]);
+  });
+
+  it("delivers the complete Unicode config attachment instead of an oversized Discord message", async () => {
+    const h = await fixture();
+    const tail = "終端 🧪 literal-tail-1114";
+    const config = {
+      model: "gpt-6.1-sol",
+      codexModes: {
+        sessionId: "owned-fixture-session", currentModeId: "ordinary",
+        availableModes: [{ id: "ordinary", name: `${'設定 🌍 café e\u0301\n"quoted" \\ path '.repeat(100)}${tail}` }],
+      },
+    };
+    const before = saveConfig(h, config);
+    const json = JSON.stringify(config, null, 2);
+    expect(json.length).toBeGreaterThan(2000);
+    const i = configShowInteraction();
+    await h.orchestrator.handleSlashInteraction(i.native as never);
+    expectEphemeralConfigReply(i);
+    expect(i.payloads[0]!.content).toContain("config.json");
+    expect(i.payloads[0]!.content!.length).toBeLessThan(200);
+    expect(i.payloads[0]!.files).toHaveLength(1);
+    const file = i.payloads[0]!.files![0]!;
+    expect(file.name).toBe("config.json");
+    expect(Buffer.isBuffer(file.attachment)).toBe(true);
+    expect(file.attachment).toEqual(Buffer.from(json, "utf8"));
+    const text = (file.attachment as Buffer).toString("utf8");
+    expect(text).toContain(tail);
+    expect(JSON.parse(text)).toEqual(config);
+    expect(h.store.getByChannel("discord", THREAD)!.configJson).toBe(before);
+    expect(h.store.listConfigMutations()).toEqual([]);
+  });
+
+  it.each([1800, 1801])("budgets the complete fenced config at %i characters", async length => {
+    const h = await fixture();
+    const empty = `\`\`\`json\n${JSON.stringify({ mode: "" }, null, 2)}\n\`\`\``;
+    const config = { mode: "x".repeat(length - empty.length) };
+    const json = JSON.stringify(config, null, 2);
+    const fenced = `\`\`\`json\n${json}\n\`\`\``;
+    expect(fenced).toHaveLength(length);
+    expect(json.length).toBeLessThan(1800);
+    const before = saveConfig(h, config);
+    const i = configShowInteraction();
+    await h.orchestrator.handleSlashInteraction(i.native as never);
+    expectEphemeralConfigReply(i);
+    if (length === 1800) {
+      expect(i.native.transcript[1]!.content).toBe(fenced);
+      expect(i.payloads[0]!.files).toBeUndefined();
+    } else {
+      expect(i.payloads[0]!.files).toHaveLength(1);
+      expect(i.payloads[0]!.files![0]!.name).toBe("config.json");
+      expect(i.payloads[0]!.files![0]!.attachment).toEqual(Buffer.from(json, "utf8"));
+    }
+    expect(h.store.getByChannel("discord", THREAD)!.configJson).toBe(before);
+    expect(h.store.listConfigMutations()).toEqual([]);
   });
 
   it("keeps kernel lock/participant gates ahead of plugin commands", async () => {

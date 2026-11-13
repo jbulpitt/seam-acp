@@ -1,6 +1,6 @@
 import { ConfigEditorStore } from "./store.js";
 import { randomUUID } from "node:crypto";
-import { EmbedBuilder, MessageFlags } from "discord.js";
+import { AttachmentBuilder, EmbedBuilder, MessageFlags } from "discord.js";
 import type { ComponentEvent, IncomingMessage, ChannelRef } from "../../platforms/chat-adapter.js";
 import type { CatalogBinding } from "../../core/model-catalog/service.js";
 import { LOCAL_LOCATION, parseAgentAtLocation } from "../../core/location.js";
@@ -143,8 +143,11 @@ export class ConfigUi {
       return;
     }
     const cfg = this.ports.readConfig(record);
-    await i.reply({
-      content: this.ports.codeBlock(JSON.stringify(cfg, null, 2), "json"),
+    const json = JSON.stringify(cfg, null, 2);
+    const content = this.ports.codeBlock(json, "json");
+    await i.reply(content.length <= 1800 ? { content, flags: MessageFlags.Ephemeral } : {
+      content: "Configuration attached as config.json.",
+      files: [new AttachmentBuilder(Buffer.from(json, "utf8"), { name: "config.json" })],
       flags: MessageFlags.Ephemeral,
     });
   }

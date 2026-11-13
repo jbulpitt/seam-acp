@@ -213,14 +213,24 @@ describe("one channel configuration resolution", () => {
 
   it("preset agent, model, effort and repo become authoritative thread overrides", async () => {
     const h = fixture();
-    const preset = { agentId: "claude", model: "claude-explicit", effort: "low", repoPath: path.join(dir, "explicit"),
-      disableThreadPrefix: null } as Preset;
+    const namedPreset: Preset = {
+      id: "channel-resolution-explicit", name: "Explicit selection", projectRef: channel.parentId,
+      agentId: "claude", model: "claude-explicit", effort: "low", repoPath: path.join(dir, "explicit"),
+      description: null, role: null, disableThreadPrefix: null, permission: null,
+      toolsAllow: null, toolsExclude: null, instructions: null, statusCardStyle: null,
+      createdBy: actor.id, createdUtc: "2026-11-13T00:00:00.000Z", updatedUtc: "2026-11-13T00:00:00.000Z",
+    };
+    store.presets.upsertPreset(namedPreset);
+    const preset = store.presets.getPresetByNameScoped(namedPreset.name, channel.parentId)!;
     await h.plan.applyPresetToSession(channel, h.record, preset);
     const selected = h.router.describeConfig(store.get(h.record.id)!);
     expect(selected.agent).toEqual({ value: "claude", source: "thread preset" });
     expect(selected.model).toEqual({ value: "claude-explicit", source: "thread preset" });
     expect(selected.effort).toEqual({ value: "low", source: "thread preset" });
     expect(selected.cwd).toEqual({ value: preset.repoPath, source: "thread preset" });
+    expect(store.presets.getApplication(h.record.id)).toMatchObject({
+      id: namedPreset.id, projectRef: channel.parentId, name: namedPreset.name,
+    });
   });
 
   it("direct agent-only switch inherits matching channel model/effort without pins", async () => {

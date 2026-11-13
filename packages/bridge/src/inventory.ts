@@ -266,7 +266,7 @@ export function loadHostAdapters(
       make: () => makeClaudeProfile({
         id: vertexId,
         displayName: env.CLAUDE_VERTEX_DISPLAY_NAME?.trim() || "Claude (Vertex AI)",
-        brand: "vertex",
+        provider: "vertex",
         cliPath: claudeCli,
         configDir: vertexConfigDir!,
         defaultModel: env.CLAUDE_VERTEX_DEFAULT_MODEL?.trim() || "claude-sonnet-5-5",
@@ -437,6 +437,7 @@ export function inventoryFromAdapters(
         history: !!adapter.sessionManager.getHistoryPath,
         repair: !!adapter.sessionManager.repairSession,
       } : null,
+      harness: adapter.harness, provider: adapter.provider, account: adapter.account,
       displayName: adapter.displayName, defaultModel: adapter.defaultModel,
       brand: adapter.brand, requestedContextTier: adapter.requestedContextTier,
       effort: adapter.effort, fastMode: adapter.fastMode,

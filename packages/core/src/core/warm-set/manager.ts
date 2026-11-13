@@ -36,6 +36,7 @@ export interface WarmSetHub {
 }
 
 export interface WarmSetRouter {
+  getProfile: SessionRouter["getProfile"];
   hasRuntime(sessionId: string): boolean;
   turnHealth(sessionId: string, nowMs?: number): { busy: boolean; silentMs: number; stalled: boolean };
   getRuntime(sessionId: string): { markActivity(): void; getSlot?(): number | undefined } | undefined;
@@ -125,6 +126,7 @@ export class WarmSetManager {
       return {
         sessionId: row.sessionId,
         agentId: row.agentId,
+        harness: this.opts.router.getProfile(row.agentId, location)?.harness,
         updatedUtc: row.updatedUtc,
         acpSessionId: record?.acpSessionId ?? "",
         hot: this.opts.router.hasRuntime(row.sessionId),
@@ -160,7 +162,7 @@ export class WarmSetManager {
         loads.push(record);
       }
     }
-    await Promise.all(loads.map((record) => this.pool.run(() => this.loadOne(record, loadCost(record.agentId) === "high"))));
+    await Promise.all(loads.map((record) => this.pool.run(() => this.loadOne(record, loadCost(candidates.find(candidate => candidate.sessionId === record.id)?.harness) === "high"))));
   }
 
   private reverify(sessionId: string, location: string): void {

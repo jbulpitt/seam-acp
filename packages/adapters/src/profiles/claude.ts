@@ -173,6 +173,8 @@ async function resolveProjectDir(claudeDir: string, cwd: string): Promise<string
 export function makeClaudeProfile(opts: {
   /** Profile id. Defaults to "claude". Must be unique across registered profiles. */
   id?: string;
+  /** Serving route for compatible backends; independent of the display brand. */
+  provider?: string;
   /** Display name shown in pickers. Defaults to "Anthropic Claude". */
   displayName?: string;
   /** Path to the `claude-agent-acp` binary. Defaults to looking it up on PATH. */
@@ -329,30 +331,26 @@ export function makeClaudeProfile(opts: {
   }
 
   const profileId = opts.id ?? "claude";
+  const catalogIdentity = {
+    provider: opts.provider ?? (opts.directAnthropic ? "anthropic" : "claude-compatible"),
+    backend: opts.extraEnv?.CLAUDE_CODE_USE_VERTEX === "1" ? "vertex" : opts.extraEnv?.ANTHROPIC_BASE_URL,
+    credentialProfile: configDir ?? "default",
+    project: opts.extraEnv?.ANTHROPIC_VERTEX_PROJECT_ID,
+    region: opts.extraEnv?.CLOUD_ML_REGION,
+  };
   return asLocalAdapter({
     id: profileId,
+    harness: "claude", provider: catalogIdentity.provider,
+    account: { provenance: "configured-context" },
     displayName: opts.displayName ?? "Anthropic Claude",
     ...(opts.brand ? { brand: opts.brand } : {}),
     defaultModel: opts.defaultModel,
     catalog: {
-      scope: () => ({ ...manifestCatalogScope({
-        provider: opts.directAnthropic ? "anthropic" : (opts.brand ?? "claude-compatible"),
-        backend: opts.extraEnv?.CLAUDE_CODE_USE_VERTEX === "1" ? "vertex" : opts.extraEnv?.ANTHROPIC_BASE_URL,
-        credentialProfile: configDir ?? "default",
-        project: opts.extraEnv?.ANTHROPIC_VERTEX_PROJECT_ID,
-        region: opts.extraEnv?.CLOUD_ML_REGION,
-      }), ...(liveCatalog
+      scope: () => ({ ...manifestCatalogScope(catalogIdentity), ...(liveCatalog
         ? { sharing: catalogApiEnabled ? ("shared" as const) : ("binding" as const) }
         : {}) }),
       async fetch() {
-        const common = {
-          provider: opts.directAnthropic ? "anthropic" : (opts.brand ?? "claude-compatible"),
-          backend: opts.extraEnv?.CLAUDE_CODE_USE_VERTEX === "1" ? "vertex" : opts.extraEnv?.ANTHROPIC_BASE_URL,
-          credentialProfile: configDir ?? "default",
-          project: opts.extraEnv?.ANTHROPIC_VERTEX_PROJECT_ID,
-          region: opts.extraEnv?.CLOUD_ML_REGION,
-          adapterVersion: AGENT_ADAPTER_VERSION,
-        };
+        const common = { ...catalogIdentity, adapterVersion: AGENT_ADAPTER_VERSION };
         // Direct Anthropic only. With a catalog credential, `/v1/models` is the
         // whole canonical inventory; claude-agent-acp is not consulted. A fetch
         // failure throws so ModelCatalogService retains the previous generation.

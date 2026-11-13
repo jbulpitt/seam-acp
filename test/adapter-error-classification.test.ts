@@ -356,11 +356,11 @@ describe("#440 profile.classifyError is the producer on every factory", () => {
   it("attaches errorKind onto the error object for claude, zai, vertex, copilot, grok, codex, ollama-cloud", () => {
     const claude = makeClaudeProfile({ defaultModel: "default" });
     const zai = makeClaudeProfile({ id: "zai", defaultModel: "glm-5", effort: { mechanism: "none", levels: [] } });
-    const vertex = makeClaudeProfile({ id: "claude-vertex", defaultModel: "default", brand: "vertex" });
+    const vertex = makeClaudeProfile({ id: "claude-vertex", defaultModel: "default", provider: "vertex" });
     const copilot = makeCopilotProfile({ defaultModel: "gpt-5.2" });
     const grok = makeGrokProfile({ defaultModel: "grok-4.6" });
     const codex = makeCodexProfile({ defaultModel: "gpt-5.4" });
-    const ollama = makeCodexProfile({ id: "ollama-cloud", defaultModel: "kimi-k2.5:cloud" });
+    const ollama = makeCodexProfile({ id: "ollama-cloud", provider: "ollama-cloud", defaultModel: "kimi-k2.5:cloud" });
 
     const oauth = dispatchTurn(
       "Internal error: Failed to authenticate: OAuth session expired and could not be refreshed",

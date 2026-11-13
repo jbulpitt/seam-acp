@@ -564,6 +564,7 @@ process.exit(23);
     fs.writeFileSync(callsPath, "");
     const profile = makeCodexProfile({
       id: "ollama-cloud",
+      provider: "ollama-cloud",
       cliPath: executable,
       defaultModel: "qwen:cloud",
       sessionsRoot: path.join(root, "ollama-sessions"),

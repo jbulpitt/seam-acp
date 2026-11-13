@@ -43,7 +43,7 @@ describe("bridge-configured Vertex Claude", () => {
     expect([...adapters.keys()]).toEqual(["claude", "vertex-test"]);
     expect(adapterRefusals).toEqual([]);
     const vertex = adapters.get("vertex-test")!;
-    expect(vertex).toMatchObject({ displayName: "Vertex test", brand: "vertex", configDir: env.CLAUDE_VERTEX_CONFIG_DIR });
+    expect(vertex).toMatchObject({ displayName: "Vertex test", harness: "claude", provider: "vertex", configDir: env.CLAUDE_VERTEX_CONFIG_DIR });
     const catalog = await vertex.catalog.fetch();
     expect(catalog.scope).toMatchObject({ backend: "vertex", project: "test-project", region: "global" });
     expect(catalog.models.map(row => row.id)).toEqual(models);
@@ -51,7 +51,7 @@ describe("bridge-configured Vertex Claude", () => {
     expect(catalog.models.find(row => row.default)?.id).toBe("claude-sonnet-5-5");
     const hello = inventoryFromAdapters(adapters, "copilot", env);
     expect(hello.find(row => row.agentId === "vertex-test")).toMatchObject({
-      installed: true, metadata: { brand: "vertex", displayName: "Vertex test", claudeSessionOptions: {} },
+      installed: true, metadata: { harness: "claude", provider: "vertex", displayName: "Vertex test", claudeSessionOptions: {} },
     });
     expect(JSON.stringify(hello)).not.toContain(env.CLAUDE_VERTEX_CREDENTIALS_FILE);
   });
@@ -116,7 +116,7 @@ describe("bridge-configured Vertex Claude", () => {
 
   it("pins the Vertex default even when the caller supplies no model override", async () => {
     const vertex = makeClaudeProfile({
-      id: "vertex-test", cliPath: cli, defaultModel: "claude-sonnet-5-5",
+      id: "vertex-test", provider: "vertex", cliPath: cli, defaultModel: "claude-sonnet-5-5",
       configDir: env.CLAUDE_VERTEX_CONFIG_DIR,
       extraEnv: { CLAUDE_CODE_USE_VERTEX: "1" },
     });
@@ -139,8 +139,8 @@ describe("bridge-configured Vertex Claude", () => {
       claudeCode: { options: { effort: "high", thinking: { type: "adaptive", display: "summarized" } } },
     });
     expect(profile.fastMode).toBeUndefined();
-    expect(resolveAgentBrand(profile.id, profile.brand)).toBe("vertex");
-    expect(brandIconUrl(profile.brand!)).toMatch(/\/vertex\.webp$/);
+    expect(resolveAgentBrand(profile.provider, profile.brand)).toBe("vertex");
+    expect(brandIconUrl(resolveAgentBrand(profile.provider, profile.brand))).toMatch(/\/vertex\.webp$/);
     const choices = agentLocationPickerChoices(router.listProfiles("host-test"), {
       bridges: [{ id: "host-test", shortName: "test", emoji: "🌐" }],
       connected: new Set(["host-test"]), agentsByHost: new Map([["host-test", new Set(inventory.keys())]]),
@@ -149,7 +149,7 @@ describe("bridge-configured Vertex Claude", () => {
   });
 
   it("keeps GCP authentication, model access and quota failures' real details", () => {
-    const profile = makeClaudeProfile({ id: "vertex-test", defaultModel: models[1], brand: "vertex" });
+    const profile = makeClaudeProfile({ id: "vertex-test", defaultModel: models[1], provider: "vertex" });
     for (const [message, errorKind] of [
       ["Could not load the default credentials from /test/missing-key.json", "authentication_failed"],
       ["Publisher model projects/test-project/locations/global/publishers/anthropic/models/not-enabled was not found", "model_not_found"],

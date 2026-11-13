@@ -131,6 +131,8 @@ type DiscoveredModel = {
 
 export type GrokAuthSource = "subscription" | "api-key" | "unknown";
 
+const GROK_PROVIDER = "xai";
+
 export interface GrokAuthIdentity {
   source: Exclude<GrokAuthSource, "unknown">;
   /** One-way semantic identity. Raw account/key material is never returned. */
@@ -337,7 +339,7 @@ export function resolveGrokSubscriptionIdentity(env: NodeJS.ProcessEnv): GrokAut
 function apiKeyIdentity(apiKey: string): GrokAuthIdentity {
   return {
     source: "api-key",
-    fingerprint: catalogScopeFingerprint({ provider: "xai", source: "api-key", credential: apiKey }),
+    fingerprint: catalogScopeFingerprint({ provider: GROK_PROVIDER, source: "api-key", credential: apiKey }),
   };
 }
 
@@ -348,11 +350,11 @@ function sameAuthIdentity(left: GrokAuthIdentity, right: GrokAuthIdentity): bool
 function grokCatalogScope(identity: GrokAuthIdentity): CatalogScope {
   return {
     fingerprint: catalogScopeFingerprint({
-      provider: "xai",
+      provider: GROK_PROVIDER,
       authSource: identity.source,
       accountIdentity: identity.fingerprint,
     }),
-    provider: "xai",
+    provider: GROK_PROVIDER,
     credentialProfile: identity.source === "subscription" ? "subscription-account" : "api-key-account",
   };
 }
@@ -685,7 +687,9 @@ export function makeGrokProfile(opts: {
     else env.XAI_API_KEY = apiKey!;
     return env;
   };
+  let account: import("../agent-profile.js").AgentAccountContext = { provenance: "unknown" };
   const currentAuthIdentity = (): GrokAuthIdentity => {
+    account = { provenance: "unknown" };
     const identity = opts.authIdentityProbe
       ? opts.authIdentityProbe()
       : catalogMode === "api-key"
@@ -694,11 +698,14 @@ export function makeGrokProfile(opts: {
     if (identity.source !== catalogMode || !/^[a-f0-9]{64}$/.test(identity.fingerprint)) {
       throw new Error("Grok credential identity does not match the configured source mode");
     }
+    account = { provenance: "observed-context", contextKey: identity.fingerprint };
     return identity;
   };
 
   return asLocalAdapter({
     id: opts.id ?? "grok",
+    harness: "grok", provider: GROK_PROVIDER,
+    get account() { return account; },
     displayName: opts.displayName ?? "Grok Build",
     defaultModel: opts.defaultModel,
     catalog: {
@@ -897,7 +904,7 @@ export function makeGrokProfile(opts: {
           }
         }
         const candidate = await manifestCatalogSource({
-          provider: "xai",
+          provider: GROK_PROVIDER,
           credentialProfile: scope.credentialProfile,
           defaultModel,
           models: () => models,

@@ -6,37 +6,19 @@ import {
 } from "../packages/core/src/plugins/card-visuals/agent-brand.js";
 import { loadConfig } from "../packages/core/src/config.js";
 
-describe("resolveAgentBrand (#96)", () => {
-  it("groups copilot* onto copilot", () => {
-    expect(resolveAgentBrand("copilot")).toBe("copilot");
-    expect(resolveAgentBrand("copilot-amorgan")).toBe("copilot");
-    expect(resolveAgentBrand("copilot-fhr")).toBe("copilot");
+describe("resolveAgentBrand", () => {
+  it.each([
+    ["anthropic", "claude"], ["github-copilot", "copilot"], ["openai", "codex"],
+    ["xai", "grok"], ["google-antigravity", "agy"], ["vertex", "vertex"],
+    ["z-ai", "z-ai"], ["ollama-cloud", "ollama-cloud"], ["kimi", "kimi"],
+  ])("uses provider %s rather than the composite selector", (provider, brand) => {
+    expect(resolveAgentBrand(provider)).toBe(brand);
   });
 
-  it("groups claude and claude-<account> onto claude", () => {
-    expect(resolveAgentBrand("claude")).toBe("claude");
-    expect(resolveAgentBrand("claude-amorgan")).toBe("claude");
-  });
-
-  it("overrides Claude-harness services to their service brand (before grouping)", () => {
-    expect(resolveAgentBrand("zai")).toBe("z-ai");
-    expect(resolveAgentBrand("zai-work")).toBe("z-ai");
-    expect(resolveAgentBrand("ollama-cloud")).toBe("ollama-cloud");
-    expect(resolveAgentBrand("ollama-cloud-extra")).toBe("ollama-cloud");
-    expect(resolveAgentBrand("claude-vertex")).toBe("vertex");
-    expect(resolveAgentBrand("claude-vertex-prod")).toBe("vertex");
-  });
-
-  it("is 1:1 for grok/agy/codex/kimi", () => {
-    expect(resolveAgentBrand("grok")).toBe("grok");
-    expect(resolveAgentBrand("agy")).toBe("agy");
-    expect(resolveAgentBrand("codex")).toBe("codex");
-    expect(resolveAgentBrand("kimi")).toBe("kimi");
-  });
-
-  it("honors an explicit profile.brand override", () => {
-    expect(resolveAgentBrand("claude-vertex", "vertex")).toBe("vertex");
-    expect(resolveAgentBrand("something-else", "custom")).toBe("custom");
+  it("honors the explicit logo override without changing provider", () => {
+    expect(resolveAgentBrand("anthropic", "custom")).toBe("custom");
+    expect(resolveAgentBrand("unknown", "custom")).toBe("custom");
+    expect(resolveAgentBrand(undefined)).toBe("unknown");
   });
 });
 

@@ -118,12 +118,31 @@ export interface AttachmentBytes {
   size: number;
 }
 
+export type AgentHarness = "claude" | "codex" | "copilot" | "grok" | "agy" | "unknown";
+
+/** Host-qualified credential context, not a login or a sharing assertion. */
+export interface AgentAccountContext {
+  readonly provenance: "configured-context" | "observed-context" | "unknown";
+  /** Existing non-secret context identity, when actually available. */
+  readonly contextKey?: string;
+}
+
+export interface AgentExecutionIdentity {
+  readonly harness: AgentHarness;
+  readonly provider: string;
+  readonly account: AgentAccountContext;
+}
+
+export const UNKNOWN_AGENT_IDENTITY: AgentExecutionIdentity = {
+  harness: "unknown", provider: "unknown", account: { provenance: "unknown" },
+};
+
 /** Portable ACP client capabilities published by the process-owning host. */
 export type AgentClientMetadata = Pick<AgentAdapter,
   "displayName" | "defaultModel" | "brand" | "requestedContextTier" |
   "effort" | "fastMode" | "restrictDiscordAccess" | "mcpServersAtSpawn" |
   "submissionSignals" | "claudeSessionOptions"
-> & {
+> & Partial<AgentExecutionIdentity> & {
   catalogScope?: import("./model-catalog.js").CatalogScope;
   sessionManagement: { history: boolean; repair: boolean } | null;
 };
@@ -139,7 +158,7 @@ export type AgentClientMetadata = Pick<AgentAdapter,
  * New methods are real (not comments) but are safe no-ops or
  * `sessionManager` delegates until PR3/PR4 call them over the bus.
  */
-export interface AgentAdapter {
+export interface AgentAdapter extends AgentExecutionIdentity {
   /** Stable id used in commands and DB rows ("copilot", "claude-code", …). */
   readonly id: string;
 
@@ -148,9 +167,8 @@ export interface AgentAdapter {
 
   /**
    * Status-card brand key (#96): names the *service*, not the harness.
-   * Default resolution groups `copilot*`/`claude*` and overrides non-Anthropic
-   * Claude-harness profiles (`zai`→`z-ai`, `ollama-cloud`, `claude-vertex`→`vertex`).
-   * Set this to pin a logo that the id-based resolver would get wrong.
+   * Defaults to the declared provider's asset name. Set this to pin a
+   * different logo without changing provider or catalog identity.
    */
   readonly brand?: string;
 
@@ -368,6 +386,10 @@ export type AgentProfileCore = Omit<
 export function asLocalAdapter(core: AgentProfileCore): AgentAdapter {
   const adapter: AgentAdapter = {
     ...core,
+    harness: core.harness ?? "unknown",
+    provider: core.provider ?? "unknown",
+    // Dynamic observations are read without re-running credential discovery.
+    get account() { return core.account ?? UNKNOWN_AGENT_IDENTITY.account; },
     describe(): AdapterDescribe {
       // Host inventory is not an operational model authority. The catalog RPC
       // carries the complete normalized set; describe keeps one compatibility
@@ -477,6 +499,7 @@ export function asRemoteCatalogAdapter(
   const defaultModel = defaults[0]!;
   return asLocalAdapter({
     id,
+    ...UNKNOWN_AGENT_IDENTITY,
     displayName: id,
     defaultModel: defaultModel.runtimeId,
     catalog: {

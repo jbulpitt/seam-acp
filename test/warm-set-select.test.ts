@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { parseWarmSetHosts } from "../packages/core/src/core/warm-set/hosts.js";
-import { agentFamily, holdingMb, loadCost } from "../packages/core/src/core/warm-set/footprint.js";
+import { holdingMb, loadCost } from "../packages/core/src/core/warm-set/footprint.js";
 import { selectWarmSet, type WarmCandidate } from "../packages/core/src/core/warm-set/select.js";
 import { BoundPool } from "../packages/core/src/core/warm-set/pool.js";
 
@@ -8,6 +8,7 @@ function c(over: Partial<WarmCandidate> & Pick<WarmCandidate, "sessionId" | "age
   return {
     updatedUtc: "2026-09-20T00:00:00.000Z",
     acpSessionId: "acp-1",
+    harness: "unknown",
     hot: false,
     busy: false,
     ...over,
@@ -21,8 +22,7 @@ describe("footprint measurements", () => {
     expect(holdingMb("grok")).toBe(110);
     expect(holdingMb("copilot")).toBeNull();
     expect(holdingMb("agy")).toBeNull();
-    expect(holdingMb("copilot-example")).toBeNull();
-    expect(agentFamily("ollama-cloud")).toBe("codex");
+    expect(holdingMb("unknown")).toBeNull();
     expect(loadCost("codex")).toBe("high");
     expect(loadCost("claude")).toBe("low");
   });
@@ -49,10 +49,10 @@ describe("selectWarmSet", () => {
       loadSlots: 2,
       highCostLoadSlots: 1,
       candidates: [
-        c({ sessionId: "hot-claude", agentId: "claude", hot: true, updatedUtc: "2026-09-20T12:00:00.000Z" }),
-        c({ sessionId: "cold-grok", agentId: "grok", updatedUtc: "2026-09-20T11:00:00.000Z" }),
-        c({ sessionId: "cold-codex", agentId: "codex", updatedUtc: "2026-09-20T10:00:00.000Z" }),
-        c({ sessionId: "older-grok", agentId: "grok", updatedUtc: "2026-09-19T00:00:00.000Z" }),
+        c({ sessionId: "hot-claude", agentId: "claude", harness: "claude", hot: true, updatedUtc: "2026-09-20T12:00:00.000Z" }),
+        c({ sessionId: "cold-grok", agentId: "grok", harness: "grok", updatedUtc: "2026-09-20T11:00:00.000Z" }),
+        c({ sessionId: "cold-codex", agentId: "codex", harness: "codex", updatedUtc: "2026-09-20T10:00:00.000Z" }),
+        c({ sessionId: "older-grok", agentId: "grok", harness: "grok", updatedUtc: "2026-09-19T00:00:00.000Z" }),
       ],
     });
     const byId = Object.fromEntries(decisions.map((d) => [d.sessionId, d.action]));
@@ -68,9 +68,9 @@ describe("selectWarmSet", () => {
       loadSlots: 3,
       highCostLoadSlots: 1,
       candidates: [
-        c({ sessionId: "busy-claude", agentId: "claude", hot: true, busy: true }),
-        c({ sessionId: "cold-copilot", agentId: "copilot" }),
-        c({ sessionId: "no-acp", agentId: "grok", acpSessionId: "" }),
+        c({ sessionId: "busy-claude", agentId: "claude", harness: "claude", hot: true, busy: true }),
+        c({ sessionId: "cold-copilot", agentId: "copilot", harness: "copilot" }),
+        c({ sessionId: "no-acp", agentId: "grok", harness: "grok", acpSessionId: "" }),
       ],
     });
     const byId = Object.fromEntries(decisions.map((d) => [d.sessionId, d]));
@@ -87,8 +87,8 @@ describe("selectWarmSet", () => {
       loadSlots: 0,
       highCostLoadSlots: 0,
       candidates: [
-        c({ sessionId: "newer", agentId: "claude", hot: true, updatedUtc: "2026-09-20T12:00:00.000Z" }),
-        c({ sessionId: "older", agentId: "claude", hot: true, updatedUtc: "2026-09-19T12:00:00.000Z" }),
+        c({ sessionId: "newer", agentId: "claude", harness: "claude", hot: true, updatedUtc: "2026-09-20T12:00:00.000Z" }),
+        c({ sessionId: "older", agentId: "claude", harness: "claude", hot: true, updatedUtc: "2026-09-19T12:00:00.000Z" }),
       ],
     });
     const byId = Object.fromEntries(decisions.map((d) => [d.sessionId, d.action]));
@@ -102,9 +102,9 @@ describe("selectWarmSet", () => {
       loadSlots: 3,
       highCostLoadSlots: 1,
       candidates: [
-        c({ sessionId: "c1", agentId: "codex", updatedUtc: "2026-09-20T03:00:00.000Z" }),
-        c({ sessionId: "c2", agentId: "codex", updatedUtc: "2026-09-20T02:00:00.000Z" }),
-        c({ sessionId: "g1", agentId: "grok", updatedUtc: "2026-09-20T01:00:00.000Z" }),
+        c({ sessionId: "c1", agentId: "codex", harness: "codex", updatedUtc: "2026-09-20T03:00:00.000Z" }),
+        c({ sessionId: "c2", agentId: "codex", harness: "codex", updatedUtc: "2026-09-20T02:00:00.000Z" }),
+        c({ sessionId: "g1", agentId: "grok", harness: "grok", updatedUtc: "2026-09-20T01:00:00.000Z" }),
       ],
     });
     const byId = Object.fromEntries(decisions.map((d) => [d.sessionId, d.action]));

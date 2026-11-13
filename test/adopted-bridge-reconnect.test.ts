@@ -160,6 +160,8 @@ async function setup(source: "inbound" | "dispatch" | "schedule" = "inbound", st
   let runtime!: AgentRuntime;
   let adoptionUnavailable = options.adoptionUnavailable ?? false;
   const router = testSessionRouter({
+    getProfile: () => ({ id: "codex", displayName: "Codex", defaultModel: "test",
+      harness: "codex", provider: "openai", account: { provenance: "configured-context" } }) as AgentProfile,
     isBusy: () => runtime?.busy ?? false,
     getRuntime: () => runtime,
     describeConfig: () => ({ model: { value: "test" }, agent: { value: "codex" },

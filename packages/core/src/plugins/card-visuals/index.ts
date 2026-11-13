@@ -81,7 +81,7 @@ export function createCardVisualsPlugin(port: CardVisualsPort): Plugin {
       slash: [command("card"), command("gif")],
       statusCards: [{ name: "visuals", decorate: facts => ({
         style: facts.style,
-        ...(baseUrl ? { icon: brandIconUrl(resolveAgentBrand(facts.agentId, facts.profileBrand), baseUrl) } : {}),
+        ...(baseUrl ? { icon: brandIconUrl(resolveAgentBrand(facts.provider, facts.profileBrand), baseUrl) } : {}),
         ...(facts.style === "simple" && facts.gifOn ? { thumbnail: catalog?.randomGif() ?? undefined } : {}),
       }) }],
       jobs: [{ name: "gif-manifest", phase: "after-admission", intervalMs: DEFAULT_GIF_REFRESH_MS,

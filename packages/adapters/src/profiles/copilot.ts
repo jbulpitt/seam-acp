@@ -579,6 +579,7 @@ export function makeCopilotProfile(opts: {
   const runtimeCwd = opts.cwd ?? process.cwd();
   const credentialProfile = opts.credentialProfile?.trim() || configDir || "default";
 
+  const catalogIdentity = { provider: "github-copilot", credentialProfile };
   let identityCache: AgentIdentity | null | undefined;
 
   const probeEnvironment = (): NodeJS.ProcessEnv => {
@@ -593,14 +594,13 @@ export function makeCopilotProfile(opts: {
   const profileId = opts.id ?? "copilot";
   return asLocalAdapter({
     id: profileId,
+    harness: "copilot", provider: catalogIdentity.provider,
+    account: { provenance: "configured-context" },
     displayName: opts.displayName ?? "GitHub Copilot",
     defaultModel: opts.defaultModel,
     requestedContextTier: copilotRequestedContextTier(acpArgs),
     catalog: {
-      scope: () => manifestCatalogScope({
-        provider: "github-copilot",
-        credentialProfile,
-      }),
+      scope: () => manifestCatalogScope(catalogIdentity),
       async fetch() {
         const env = probeEnvironment();
         const catalogLaunch: CopilotCatalogLaunch = {
@@ -614,8 +614,7 @@ export function makeCopilotProfile(opts: {
           ? await opts.catalogProbe(catalogLaunch)
           : await probeCopilotCatalog({ ...catalogLaunch, cliVersion });
         const candidate = await manifestCatalogSource({
-          provider: "github-copilot",
-          credentialProfile,
+          ...catalogIdentity,
           defaultModel: probe.defaultModel || opts.defaultModel,
           models: () => probe.models.map((model) => ({
             modelId: model.modelId,

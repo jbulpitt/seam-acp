@@ -2821,7 +2821,7 @@ export class Orchestrator {
       }
     }
     const visuals = this.plugins.statusCards.decorate({ state: status.state, agentId,
-      profileBrand: profile?.brand, model: status.model, resolvedModel: status.resolvedModel,
+      provider: profile?.provider, profileBrand: profile?.brand, model: status.model, resolvedModel: status.resolvedModel,
       style: saved?.input.style ?? (described ? statusCardStyleForRender(described) : "full"), gifOn: false });
     status.style = visuals.style ?? "full";
     status.brandIconURL = visuals.icon;
@@ -3618,7 +3618,7 @@ export class Orchestrator {
     const effectiveCwd = described.cwd.value;
     const repoDisplay = this.repoDisplay(effectiveCwd);
     const turnProfile = this.router.getProfile(described.agent.value, described.location.value);
-    const visuals = this.plugins.statusCards.decorate({ state: "Working", agentId: described.agent.value, profileBrand: turnProfile?.brand,
+    const visuals = this.plugins.statusCards.decorate({ state: "Working", agentId: described.agent.value, provider: turnProfile?.provider, profileBrand: turnProfile?.brand,
       model: described.model.value, style: statusCardStyleForRender(described), gifOn: simpleCardGifForRender(described) });
     const gifUrl = visuals.thumbnail;
     const status = humanAttempt?.statusCardState?.status
@@ -7126,8 +7126,8 @@ export class Orchestrator {
       : outcome.runtimeReloaded
         ? "Runtime reloaded; ACP session and context preserved"
         : "Runtime kept";
-    const profile = this.router.getProfile(outcome.applied.agent);
-    const brandIconURL = this.plugins.statusCards.decorate({ state: "Done", agentId: outcome.applied.agent, profileBrand: profile?.brand,
+    const profile = this.router.getProfile(outcome.applied.agent, outcome.applied.location);
+    const brandIconURL = this.plugins.statusCards.decorate({ state: "Done", agentId: outcome.applied.agent, provider: profile?.provider, profileBrand: profile?.brand,
       model: outcome.applied.model, style: "full", gifOn: false }).icon;
     const panel: StructuredPanel = {
       color: 0x57f287,
@@ -11784,7 +11784,7 @@ export class Orchestrator {
         )?.context.effective ?? 0
       : 0;
     const visuals = this.plugins.statusCards.decorate({ state: waiting ? "Waiting" : "Working", agentId: resolved.profile?.id ?? destRecord?.agentId ?? "",
-      profileBrand: resolved.profile?.brand, model: resolved.model,
+      provider: resolved.profile?.provider, profileBrand: resolved.profile?.brand, model: resolved.model,
       style: destDescribed ? statusCardStyleForRender(destDescribed) : "full", gifOn: destDescribed ? simpleCardGifForRender(destDescribed) : false });
     const dispatchGifUrl = visuals.thumbnail;
     const origin = await this.resolveDispatchOrigin(spec, target);

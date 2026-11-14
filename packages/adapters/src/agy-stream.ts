@@ -250,6 +250,8 @@ export async function* subscribeToAgyStream(opts: {
   /** Capability owned by this exact child; never a session credential. */
   csrfToken?: string;
   subscriberId?: string;
+  /** Omit steps the live caller has already consumed. */
+  replayThrough?: number;
   signal?: AbortSignal;
 }): AsyncGenerator<AgyStreamUpdate, void, void> {
   const url =
@@ -259,6 +261,9 @@ export async function* subscribeToAgyStream(opts: {
     JSON.stringify({
       conversationId: opts.conversationId,
       subscriberId: opts.subscriberId ?? crypto.randomUUID(),
+      ...(opts.replayThrough !== undefined
+        ? { initialStepsPageBounds: { startIndex: opts.replayThrough + 1 } }
+        : {}),
     }),
   );
   const body = wrapConnectEnvelope(0, payload);

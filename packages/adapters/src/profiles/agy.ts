@@ -1934,6 +1934,7 @@ class AgyAgent implements Agent {
           for await (const update of subscribeToAgyStream({
             port: ls.port,
             conversationId: cid,
+            replayThrough: skipUpTo,
             ...(csrfToken ? { csrfToken } : {}),
             signal: cancelAbort.signal,
           })) {

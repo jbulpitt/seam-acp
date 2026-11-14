@@ -2,9 +2,11 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { randomUUID } from "node:crypto";
+import Database from "better-sqlite3";
 import { pino } from "pino";
 import { afterEach, describe, it, expect, vi } from "vitest";
-import { makeAgyProfile, readErrorClassification } from "@seam/adapters";
+import { AgySessionStore, makeAgyProfile, readErrorClassification } from "@seam/adapters";
 import { AgentRuntime, type AgentEvent } from "../packages/core/src/agents/agent-runtime.js";
 import type { Logger } from "../packages/core/src/lib/logger.js";
 import { createOrdinaryAgyFixture } from "./helpers/agy-runtime-fixture.js";
@@ -14,6 +16,8 @@ import { ModelCatalogStore } from "../packages/core/src/core/model-catalog/store
 const fixtures = fileURLToPath(new URL("./fixtures/agy-native-capabilities/", import.meta.url));
 const logger = pino({ level: "silent" }) as unknown as Logger;
 type Row = { scenario?: string; pid?: number; prompt?: string; conversationId?: string; resumedConversation?: string | null; args?: string[]; home?: string; signal?: string; mcpConfig?: unknown };
+type ReplayRow = Row & { request: { conversationId: string; subscriberId: string; initialStepsPageBounds?: { startIndex: number; endIndexExclusive?: number } };
+  unboundedBytes: number; selectedBytes: number; validJson: boolean; historicalCount: number; selectedIndices: number[] };
 const alive = (pid: number): boolean => { try { process.kill(pid, 0); return true; } catch { return false; } };
 const activeFixtures = new Set<() => Promise<void>>();
 afterEach(async () => { for (const close of [...activeFixtures]) await close(); });
@@ -28,7 +32,8 @@ vi.mock("../packages/core/src/core/recovery-directive.js", async importOriginal 
   } };
 });
 
-async function fixture(timeoutSeconds = 10, fixtureLogger: Logger = logger, stopAfterNativeFailure = false) {
+async function fixture(timeoutSeconds = 10, fixtureLogger: Logger = logger, stopAfterNativeFailure = false,
+  replay?: { stored: number; database?: number }) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "seam-agy-r5-"));
   const log = path.join(root, "invocations");
   const ordinary = createOrdinaryAgyFixture({
@@ -49,6 +54,7 @@ async function fixture(timeoutSeconds = 10, fixtureLogger: Logger = logger, stop
   const rows = (): Row[] => fs.existsSync(log) ? fs.readFileSync(log, "utf8").trim().split("\n")
     .filter(Boolean).map(line => JSON.parse(line) as Row) : [];
   let closing: Promise<void> | undefined;
+  let conversationDb: string | undefined;
   const close = (): Promise<void> => closing ??= (async () => {
     try { await runtime.dispose(); }
     finally {
@@ -57,19 +63,99 @@ async function fixture(timeoutSeconds = 10, fixtureLogger: Logger = logger, stop
         try { process.kill(row.pid, "SIGKILL"); } catch { /* already exited */ }
       }
       ordinary.cleanup();
+      if (conversationDb) fs.rmSync(conversationDb, { force: true });
       fs.rmSync(root, { recursive: true, force: true });
       activeFixtures.delete(close);
     }
   })();
   activeFixtures.add(close);
   try {
+    const restoredSession = randomUUID();
+    if (replay) {
+      const cascadeId = randomUUID();
+      await new AgySessionStore(path.join(root, "agy-sessions.json")).put(restoredSession, {
+        cascadeId, maxStepIndex: replay.stored, cwd: root, modelId: "fixture-native-model",
+      });
+      if (replay.database !== undefined) {
+        const dir = path.join(process.env.HOME!, ".gemini/antigravity-cli/conversations");
+        fs.mkdirSync(dir, { recursive: true });
+        conversationDb = path.join(dir, `${cascadeId}.db`);
+        const db = new Database(conversationDb);
+        try {
+          db.exec("CREATE TABLE steps (idx INTEGER)");
+          db.prepare("INSERT INTO steps (idx) VALUES (?)").run(replay.database);
+        } finally { db.close(); }
+      }
+    }
     await runtime.start();
-    await runtime.newSession({ cwd: root, model: "fixture-native-model", strictModel: true });
+    if (replay) await runtime.loadSession({ sessionId: restoredSession, cwd: root, model: "fixture-native-model", strictModel: true });
+    else await runtime.newSession({ cwd: root, model: "fixture-native-model", strictModel: true });
   } catch (error) { await close(); throw error; }
   return { root, runtime, ordinary, events, rows, close };
 }
 
 describe.sequential("R5 native production lifecycle", () => {
+  it.each([
+    { prompt: "r5-replay-fresh", replay: undefined, floor: -1 },
+    { prompt: "r5-replay-large", replay: { stored: 512 }, floor: 512 },
+    { prompt: "r5-replay-db", replay: { stored: 1, database: 4 }, floor: 4 },
+    { prompt: "r5-replay-db", replay: { stored: 9, database: 4 }, floor: 4 },
+  ])("bounds ordinary $prompt transport at reconciled floor $floor without losing later live work", async ({ prompt, replay, floor }) => {
+    const f = await fixture(10, logger, true, replay);
+    try {
+      await expect(f.runtime.prompt(prompt, undefined, { recoveryScope: "ephemeral" })).resolves.toMatchObject({ stopReason: "end_turn" });
+      const subscriptions = f.rows().filter(row => row.scenario === "replay-subscription") as ReplayRow[];
+      expect(subscriptions).toHaveLength(1);
+      const subscription = subscriptions[0]!;
+      expect(subscription.request).toEqual({ conversationId: expect.any(String), subscriberId: expect.any(String),
+        initialStepsPageBounds: { startIndex: floor + 1 } });
+      expect(subscription.validJson).toBe(true);
+      expect(subscription.selectedIndices).toEqual([floor + 1]);
+      expect(subscription.selectedBytes).toBeLessThan(64 * 1024 * 1024);
+      if (prompt === "r5-replay-large") {
+        expect(subscription.historicalCount).toBe(513);
+        expect(subscription.unboundedBytes).toBeGreaterThan(64 * 1024 * 1024);
+      }
+      expect(f.events.flatMap(event => event.kind === "agent-text" ? [event.text] : [])).toEqual(["Replay ", "safe🧭", " Future."]);
+      expect(f.events.flatMap(event => event.kind === "agent-thought" ? [event.text] : [])).toEqual(["Inspect ", "once🧭", " Future thought."]);
+      expect(f.events.filter(event => event.kind === "usage-update")).toEqual([
+        { kind: "usage-update", used: 101, size: 128000 }, { kind: "usage-update", used: 122, size: 128000 },
+        { kind: "usage-update", used: 144, size: 128000 },
+        { kind: "usage-update", used: 144, size: 4096 },
+      ]);
+      const toolId = `agy-step-${floor + 2}`;
+      expect(f.events.filter(event => event.kind === "tool-start" || event.kind === "tool-update")).toEqual([
+        expect.objectContaining({ kind: "tool-start", toolCallId: toolId }),
+        expect.objectContaining({ kind: "tool-update", toolCallId: toolId, status: "in_progress" }),
+        expect.objectContaining({ kind: "tool-update", toolCallId: toolId, status: "completed" }),
+      ]);
+      expect(f.rows().filter(row => row.scenario === "replay-fully-idle")).toHaveLength(1);
+      expect(f.events.some(event => event.kind === "agy-stdout-fallback" || event.kind === "recovery")).toBe(false);
+      const turns = f.rows().filter(row => row.prompt === prompt);
+      expect(turns).toHaveLength(1);
+      expect(turns[0]!.args).toContain("--dangerously-skip-permissions");
+      expect(alive(turns[0]!.pid!)).toBe(false);
+      const saved = JSON.parse(fs.readFileSync(path.join(f.root, "agy-sessions.json"), "utf8"));
+      expect(saved.sessions[f.runtime.getSessionInfo()!.sessionId].maxStepIndex).toBe(Math.max(replay?.stored ?? -1, floor + 3));
+    } finally { await f.close(); }
+  }, 15_000);
+
+  it("keeps the exact cap rejection for an eligible oversized current step", async () => {
+    const f = await fixture(10, logger, true);
+    try {
+      const error = await f.runtime.prompt("r5-replay-eligible-overflow", undefined, { recoveryScope: "ephemeral" }).catch(error => error);
+      const subscription = f.rows().find(row => row.scenario === "replay-subscription") as ReplayRow;
+      expect(subscription.validJson).toBe(true);
+      expect(subscription.selectedBytes).toBeGreaterThan(64 * 1024 * 1024);
+      expect(error.data).toMatchObject({ code: "output_overflow", errorKind: "output_overflow", overflow: {
+        limit: "StreamAgentStateUpdates frame", observedBytes: subscription.selectedBytes, limitBytes: 64 * 1024 * 1024,
+      } });
+      expect(error.message).toBe("Internal error: native AGY output_overflow: StreamAgentStateUpdates frame 64.0 MiB exceeds 64.0 MiB limit");
+      expect(f.events.some(event => event.kind === "recovery" || event.kind === "agy-stdout-fallback")).toBe(false);
+      expect(f.rows().filter(row => row.prompt === "r5-replay-eligible-overflow")).toHaveLength(1);
+    } finally { await f.close(); }
+  }, 15_000);
+
   it("carries the overflowing stream limit and byte counts through the real ACP prompt error", async () => {
     const f = await fixture(10, logger, true);
     try {

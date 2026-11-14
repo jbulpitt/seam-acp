@@ -28,7 +28,9 @@ it.each([
 
 it("releases the production subscription reader when its consumer breaks", async () => {
   let cancelled = false;
-  const json = Buffer.from('{"update":{"status":"RUNNING"}}');
+  const expected = { status: "RUNNING", fullyIdle: false, artifactSnapshotsUpdate: { marker: "artifact" },
+    mainTrajectoryUpdate: { generatorMetadatasUpdate: { marker: "generator" }, executorMetadatasUpdate: { marker: "executor" } } };
+  const json = Buffer.from(JSON.stringify({ update: expected }));
   const header = Buffer.alloc(5); header.writeUInt32BE(json.length, 1);
   const body = new ReadableStream<Uint8Array>({
     start(controller) { controller.enqueue(Buffer.concat([header, json])); },
@@ -37,6 +39,7 @@ it("releases the production subscription reader when its consumer breaks", async
   vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(body));
   for await (const update of subscribeToAgyStream({ port: 1, conversationId: "fixture" })) {
     expect(update.status).toBe("RUNNING");
+    expect(update).toEqual(expected);
     break;
   }
   expect(cancelled).toBe(true);

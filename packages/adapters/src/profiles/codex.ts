@@ -870,6 +870,7 @@ export function makeCodexProfile(opts: {
     },
     // Codex uses the same configOption effort mechanism as Copilot (both OpenAI).
     effort: catalogEffort,
+    errorClassifier: "codex",
     classifyError(error: unknown) {
       return classifyAndAttach(error, classifyCodexError(error, profileId));
     },

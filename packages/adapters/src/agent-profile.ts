@@ -120,6 +120,9 @@ export interface AttachmentBytes {
 
 export type AgentHarness = "claude" | "codex" | "copilot" | "grok" | "agy" | "unknown";
 
+/** Existing error parser, independent of execution identity and capabilities. */
+export type ErrorClassifierId = "claude" | "codex" | "copilot" | "grok" | "agy" | "unknown";
+
 /** Host-qualified credential context, not a login or a sharing assertion. */
 export interface AgentAccountContext {
   readonly provenance: "configured-context" | "observed-context" | "unknown";
@@ -141,7 +144,7 @@ export const UNKNOWN_AGENT_IDENTITY: AgentExecutionIdentity = {
 export type AgentClientMetadata = Pick<AgentAdapter,
   "displayName" | "defaultModel" | "brand" | "requestedContextTier" |
   "effort" | "fastMode" | "restrictDiscordAccess" | "mcpServersAtSpawn" |
-  "submissionSignals" | "claudeSessionOptions"
+  "submissionSignals" | "claudeSessionOptions" | "errorClassifier"
 > & Partial<AgentExecutionIdentity> & {
   catalogScope?: import("./model-catalog.js").CatalogScope;
   sessionManagement: { history: boolean; repair: boolean } | null;
@@ -346,6 +349,8 @@ export interface AgentAdapter extends AgentExecutionIdentity {
    * result by regexing English in the orchestrator — extend the matcher here.
    */
   classifyError?(error: unknown): AdapterErrorClassification;
+  /** Portable parser reference. Omitted preserves legacy controller selection. */
+  readonly errorClassifier?: ErrorClassifierId | null;
 }
 
 /** Fields a local factory already implements; `asLocalAdapter` fills the rest. */

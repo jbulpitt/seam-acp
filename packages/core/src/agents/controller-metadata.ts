@@ -1,4 +1,4 @@
-import { asLocalAdapter, claudeSessionMetadata, CLAUDE_FAST_MODE, CODEX_FAST_MODE, UNKNOWN_AGENT_IDENTITY, type AgentAdapter, type AgentClientMetadata, type AdapterCatalogSource, classifyAndAttach, classifyCodexError, classifyAgyError, classifyClaudeError, classifyCopilotError, classifyGrokError } from "@seam/adapters";
+import { asLocalAdapter, claudeSessionMetadata, CLAUDE_FAST_MODE, CODEX_FAST_MODE, UNKNOWN_AGENT_IDENTITY, type AgentAdapter, type AgentClientMetadata, type AdapterCatalogSource, resolveErrorClassifier, resolveLegacyControllerErrorClassifier } from "@seam/adapters";
 
 /** ACP client metadata, not a controller-side launch or session-file reader. */
 export function controllerMetadataAdapter(
@@ -10,8 +10,10 @@ export function controllerMetadataAdapter(
   const claude = profile.id === "claude" || profile.id.startsWith("claude-") || !!metadata?.claudeSessionOptions;
   const copilot = profile.id.startsWith("copilot");
   const defaultModel = metadata?.defaultModel ?? profile.defaultModel ?? "default";
+  const classifyError = metadata && Object.hasOwn(metadata, "errorClassifier")
+    ? resolveErrorClassifier(metadata.errorClassifier, profile.id)
+    : resolveLegacyControllerErrorClassifier(profile.id, metadata?.claudeSessionOptions, profile.classifyError);
   const policy: Partial<AgentAdapter> = claude ? {
-    classifyError: (error: unknown) => classifyAndAttach(error, classifyClaudeError(error, profile.id)),
     effort: { mechanism: "meta", levels: ["low", "medium", "high", "xhigh", "max"] },
     fastMode: metadata?.fastMode ?? profile.fastMode ?? (profile.id === "claude" ? CLAUDE_FAST_MODE : undefined),
     submissionSignals: "claude_sdk",
@@ -20,16 +22,10 @@ export function controllerMetadataAdapter(
       ...claudeSessionOptions,
     }, model, effort),
   } : copilot ? {
-    classifyError: (error: unknown) => classifyAndAttach(error, classifyCopilotError(error, profile.id)),
     mcpServersAtSpawn: true,
     effort: { mechanism: "configOption", configId: "reasoning_effort", levels: ["low", "medium", "high", "xhigh", "max"] },
   } : profile.id === "codex" || profile.id.startsWith("codex-") ? {
-    classifyError: (error: unknown) => classifyAndAttach(error, classifyCodexError(error, profile.id)),
     fastMode: metadata?.fastMode ?? profile.fastMode ?? (profile.id === "codex" ? CODEX_FAST_MODE : undefined),
-  } : profile.id === "agy" ? {
-    classifyError: (error: unknown) => classifyAndAttach(error, classifyAgyError(error, profile.id)),
-  } : profile.id.startsWith("grok") ? {
-    classifyError: (error: unknown) => classifyAndAttach(error, classifyGrokError(error, profile.id)),
   } : {};
   return asLocalAdapter({
     id: profile.id, displayName: metadata?.displayName ?? profile.displayName ?? profile.id, defaultModel,
@@ -37,10 +33,11 @@ export function controllerMetadataAdapter(
     effort: profile.effort, fastMode: profile.fastMode,
     restrictDiscordAccess: profile.restrictDiscordAccess,
     mcpServersAtSpawn: profile.mcpServersAtSpawn, submissionSignals: profile.submissionSignals,
-    newSessionMeta: profile.newSessionMeta, classifyError: profile.classifyError,
+    newSessionMeta: profile.newSessionMeta,
     catalog,
     ...metadata,
     ...policy,
+    classifyError,
     harness: metadata?.harness ?? UNKNOWN_AGENT_IDENTITY.harness,
     provider: metadata?.provider ?? UNKNOWN_AGENT_IDENTITY.provider,
     account: metadata?.account ?? UNKNOWN_AGENT_IDENTITY.account,

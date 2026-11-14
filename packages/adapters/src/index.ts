@@ -12,6 +12,7 @@ export type {
 export * from "./agent-profile.js";
 export * from "./thread-environment.js";
 export * from "./error-classification.js";
+export * from "./error-classifier.js";
 export * from "./session-failure.js";
 export * from "./provider-retry.js";
 export * from "./error-resolver.js";

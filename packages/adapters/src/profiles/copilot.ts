@@ -658,6 +658,7 @@ export function makeCopilotProfile(opts: {
       configId: "reasoning_effort",
       levels: ["low", "medium", "high", "xhigh", "max"],
     },
+    errorClassifier: "copilot",
     classifyError(error: unknown) {
       return classifyAndAttach(error, classifyCopilotError(error, profileId));
     },

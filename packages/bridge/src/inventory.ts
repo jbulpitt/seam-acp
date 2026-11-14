@@ -438,6 +438,7 @@ export function inventoryFromAdapters(
         repair: !!adapter.sessionManager.repairSession,
       } : null,
       harness: adapter.harness, provider: adapter.provider, account: adapter.account,
+      ...(adapter.errorClassifier !== undefined ? { errorClassifier: adapter.errorClassifier } : {}),
       displayName: adapter.displayName, defaultModel: adapter.defaultModel,
       brand: adapter.brand, requestedContextTier: adapter.requestedContextTier,
       effort: adapter.effort, fastMode: adapter.fastMode,

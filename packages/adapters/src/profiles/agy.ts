@@ -772,6 +772,7 @@ export function makeAgyProfile(opts: {
     // there is no separate reasoning-effort knob, so the picker is suppressed.
     effort: { mechanism: "modelBaked", levels: [] },
     runtime: runtime.descriptor,
+    errorClassifier: "agy",
     classifyError(error: unknown) {
       return classifyAndAttach(error, classifyAgyError(error, AGY_AGENT_ID));
     },

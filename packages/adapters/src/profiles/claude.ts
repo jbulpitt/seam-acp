@@ -452,6 +452,7 @@ export function makeClaudeProfile(opts: {
     // Even opted in, this is eligibility only: AgentRuntime still requires the
     // live session to advertise config id `fast` before applying anything.
     ...(opts.directAnthropic ? { fastMode: CLAUDE_FAST_MODE } : {}),
+    sessionMetaCodec: "claude",
     errorClassifier: "claude",
     classifyError(error: unknown) {
       return classifyAndAttach(error, classifyClaudeError(error, profileId));

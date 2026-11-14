@@ -439,11 +439,12 @@ export function inventoryFromAdapters(
       } : null,
       harness: adapter.harness, provider: adapter.provider, account: adapter.account,
       ...(adapter.errorClassifier !== undefined ? { errorClassifier: adapter.errorClassifier } : {}),
+      ...(adapter.sessionMetaCodec !== undefined ? { sessionMetaCodec: adapter.sessionMetaCodec } : {}),
       displayName: adapter.displayName, defaultModel: adapter.defaultModel,
       brand: adapter.brand, requestedContextTier: adapter.requestedContextTier,
-      effort: adapter.effort, fastMode: adapter.fastMode,
+      effort: adapter.effort ?? null, fastMode: adapter.fastMode,
       restrictDiscordAccess: adapter.restrictDiscordAccess,
-      mcpServersAtSpawn: adapter.mcpServersAtSpawn, submissionSignals: adapter.submissionSignals,
+      mcpServersAtSpawn: adapter.mcpServersAtSpawn ?? false, submissionSignals: adapter.submissionSignals ?? null,
       claudeSessionOptions: adapter.claudeSessionOptions,
     };
     rows.push({ agentId: id, version, installed, ready: false, ...(reason !== undefined ? { reason } : {}), metadata, ...(runtime ? { runtime } : {}) });

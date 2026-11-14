@@ -45,3 +45,5 @@ export * from "./profiles/codex.js";
 export * from "./profiles/codex-session-manager.js";
 export * from "./profiles/grok.js";
 export * from "./profiles/ollama-cloud.js";
+
+export * from "./session-client-policy.js";

@@ -923,6 +923,7 @@ export function makeGrokProfile(opts: {
     // mechanism "spawnArgs", SessionRouter treats grok as having no effort
     // and silently ignores channel/thread preset pins.
     effort: catalogEffort,
+    sessionMetaCodec: "unknown",
     errorClassifier: "grok",
     classifyError(error: unknown) {
       return classifyAndAttach(error, classifyGrokError(error, opts.id ?? "grok"));

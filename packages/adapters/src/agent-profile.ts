@@ -123,6 +123,9 @@ export type AgentHarness = "claude" | "codex" | "copilot" | "grok" | "agy" | "un
 /** Existing error parser, independent of execution identity and capabilities. */
 export type ErrorClassifierId = "claude" | "codex" | "copilot" | "grok" | "agy" | "unknown";
 
+/** Portable serializer reference, independent of identity and other controls. */
+export type SessionMetaCodecId = "claude" | "unknown";
+
 /** Host-qualified credential context, not a login or a sharing assertion. */
 export interface AgentAccountContext {
   readonly provenance: "configured-context" | "observed-context" | "unknown";
@@ -143,9 +146,12 @@ export const UNKNOWN_AGENT_IDENTITY: AgentExecutionIdentity = {
 /** Portable ACP client capabilities published by the process-owning host. */
 export type AgentClientMetadata = Pick<AgentAdapter,
   "displayName" | "defaultModel" | "brand" | "requestedContextTier" |
-  "effort" | "fastMode" | "restrictDiscordAccess" | "mcpServersAtSpawn" |
-  "submissionSignals" | "claudeSessionOptions" | "errorClassifier"
+  "fastMode" | "restrictDiscordAccess" | "mcpServersAtSpawn" |
+  "claudeSessionOptions" | "errorClassifier" | "sessionMetaCodec"
 > & Partial<AgentExecutionIdentity> & {
+  /** Wire null preserves explicit absence across JSON; omitted is legacy. */
+  effort?: EffortDescriptor | null;
+  submissionSignals?: AgentAdapter["submissionSignals"] | null;
   catalogScope?: import("./model-catalog.js").CatalogScope;
   sessionManagement: { history: boolean; repair: boolean } | null;
 };
@@ -232,6 +238,8 @@ export interface AgentAdapter extends AgentExecutionIdentity {
   readonly claudeSessionOptions?: {
     thinkingDisplay?: "summarized" | "omitted";
   };
+  /** Omitted host reference preserves legacy serializer selection. */
+  readonly sessionMetaCodec?: SessionMetaCodecId | null;
 
   /**
    * How this agent exposes reasoning effort, if at all. Drives both the

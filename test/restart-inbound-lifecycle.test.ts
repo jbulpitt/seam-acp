@@ -13,6 +13,9 @@ import { acceptReauthWait, REAUTH_WAITING_TEXT, REAUTH_COMPLETED_TEXT } from "..
 import { listLiveMarkers } from "../packages/core/src/core/dispatch/turn-resume.js";
 import type { DeliveryNonceLookup } from "../packages/core/src/platforms/chat-adapter.js";
 import { EventEmitter } from "node:events";
+import { RequestError } from "@agentclientprotocol/sdk";
+import { makeClaudeProfile, readErrorClassification } from "@seam/adapters";
+import { AgentRuntime } from "../packages/core/src/agents/agent-runtime.js";
 import {
   StreamingMessageRenderer,
   streamingMessageChunks,
@@ -20,7 +23,7 @@ import {
 
 const cleanups: (() => void)[] = [];
 afterEach(() => { for (const f of cleanups.splice(0).reverse()) f(); vi.restoreAllMocks(); });
-function setup(logger = pino({ level: "silent" })) {
+function setup(logger = pino({ level: "silent" }), recoverySleep?: (ms: number) => Promise<void>, claimInbound = true) {
   const dir = mkdtempSync(path.join(tmpdir(), "seam-250-inbound-"));
   cleanups.push(() => rmSync(dir, { force: true, recursive: true }));
   const store = new SessionStore(path.join(dir, "test.db"));
@@ -33,7 +36,7 @@ function setup(logger = pino({ level: "silent" })) {
   store.admitInbound({ messageId: "1", platform: "discord", channelRef: "worker",
     parentRef: null, sessionRecordId: record.id, authorId: "user", authorName: "User",
     text: "ORIGINAL DISPOSABLE WORK", attachments: [], createdUtc: now });
-  store.claimInbound("1", 0, now);
+  if (claimInbound) store.claimInbound("1", 0, now);
   let release!: () => void;
   let entered!: () => void;
   const started = new Promise<void>(r => { entered = r; });
@@ -73,7 +76,8 @@ function setup(logger = pino({ level: "silent" })) {
   const make = (bridgeHub?: unknown) => {
     const orch = new Orchestrator({ logger: logger as any,
       modelCatalog: fixtureModelCatalog([]), store, router: router as any,
-      adapter: adapter as any, renderer: discordRenderer as any, config: config as any });
+      adapter: adapter as any, renderer: discordRenderer as any, config: config as any,
+      ...(recoverySleep ? { recoverySleep } : {}) });
     if (bridgeHub) orch.setBridgeHub(bridgeHub as any);
     vi.spyOn(orch as any, "checkResumePreconditions").mockResolvedValue("ok");
     return orch;
@@ -82,7 +86,7 @@ function setup(logger = pino({ level: "silent" })) {
   const message = { messageId: "1", channel: { platform: "discord", id: "worker" },
     authorId: "user", authorIsBot: false, text: "ORIGINAL DISPOSABLE WORK" };
   const run = (host = orch) => (host as any).handleIncomingMessageInner(message) as Promise<void>;
-  return { dir, store, started, release, runtime, router, adapter, orch, make, run,
+  return { dir, store, record, started, release, runtime, router, adapter, orch, make, run,
     evidence: (evidence: unknown) => onEvent({ kind: "submission-evidence", evidence }),
     fallback: (code: string) => onEvent({ kind: "agy-stdout-fallback", code }),
     emit: (text: string) => onEvent({ kind: "agent-text", text }),
@@ -275,6 +279,83 @@ describe("#250 human turn production pipeline, synthetic transport only", () => 
     expect(h.adapter.sendMessage.mock.calls[0][1]).toContain("saved session `recorded-acp`");
     expect(h.adapter.sendMessage.mock.calls[0][1]).toContain("no rollout found for recorded-acp");
     expect(h.adapter.sendMessage.mock.calls.some(([, text]) => text === "fresh answer")).toBe(true);
+  });
+
+  it("recovers Claude's real classified load rejection before submitting the admitted brief once", async () => {
+    const sleep = vi.fn(async () => {});
+    const h = setup(undefined, sleep, false);
+    const lostId = "11111111-2222-4333-8444-555555555555";
+    const replacementId = "66666666-7777-4888-8999-aaaaaaaaaaaa";
+    const originalConfig = JSON.stringify({ model: "default", reasoningEffort: "high" });
+    Object.assign(h.record, { agentId: "claude", acpSessionId: lostId, configJson: originalConfig });
+    h.store.upsert(h.record, { source: "test.claudeSessionGone", cause: "fixture saved session" });
+    h.store.upsert({ ...h.record, id: "discord:unrelated", channelRef: "unrelated", acpSessionId: "unrelated-acp" });
+    const unrelated = h.store.get("discord:unrelated");
+    const described = h.router.describeConfig(h.record);
+    Object.assign(h.router, {
+      describeConfig: () => ({ ...described, agent: { value: "claude" }, model: { value: "default" },
+        effort: { value: "high" } }),
+      invalidate: vi.fn(async () => {}),
+    });
+    const raw = RequestError.resourceNotFound(lostId);
+    const profile = makeClaudeProfile({ defaultModel: "default" });
+    const failedRuntime = new AgentRuntime({ profile, logger: pino({ level: "silent" }),
+      spawnFn: () => { throw new Error("native spawn is outside this fixture"); } });
+    const load = vi.fn().mockRejectedValue(raw);
+    const failedPrompt = vi.fn();
+    Object.assign(failedRuntime, { connection: { loadSession: load, prompt: failedPrompt },
+      stderrRing: ["synthetic unavailable-session diagnostics"] });
+    const order: string[] = [];
+    const freshAcquisitions: Array<{ acpSessionId: string | null; configJson: string }> = [];
+    let loadFailure: unknown;
+    h.router.getOrStartRuntime.mockImplementationOnce(async () => {
+      order.push("load");
+      try { await failedRuntime.loadSession({ sessionId: lostId, cwd: "/synthetic" }); }
+      catch (error) { loadFailure = error; throw error; }
+      return h.runtime;
+    }).mockImplementationOnce(async record => {
+      order.push("fresh");
+      freshAcquisitions.push({ acpSessionId: (record as typeof h.record).acpSessionId,
+        configJson: (record as typeof h.record).configJson });
+      Object.assign(record as object, { acpSessionId: replacementId });
+      h.store.upsert(record as typeof h.record, {
+        source: "test.claudeSessionGone", cause: "fixture acquired provider session",
+      });
+      return { ...h.runtime, getSessionInfo: () => ({ sessionId: replacementId }),
+        getProviderIdentity: () => undefined };
+    });
+    h.adapter.sendMessage.mockImplementation(async (channel, text) => {
+      if (text.includes("saved session")) order.push("notice");
+      return { channel, id: "message" };
+    });
+    h.runtime.prompt.mockImplementationOnce(async () => {
+      order.push("prompt");
+      await h.emit("CLAUDE_FRESH_1121");
+      return { stopReason: "end_turn" };
+    });
+    await (h.orch as any).startRecoveredInbound(h.store.getInbound("1"));
+    expect(readErrorClassification(loadFailure)).toMatchObject({ errorKind: "session_gone", agentId: "claude" });
+    expect(loadFailure).toMatchObject({ cause: raw, code: -32002, data: { uri: lostId } });
+    expect(load).toHaveBeenCalledOnce();
+    expect(failedPrompt).not.toHaveBeenCalled();
+    expect(sleep).not.toHaveBeenCalled();
+    expect(order).toEqual(["load", "notice", "fresh", "prompt"]);
+    expect(freshAcquisitions).toEqual([{ acpSessionId: "", configJson: originalConfig }]);
+    expect(h.router.invalidate).toHaveBeenCalledExactlyOnceWith(h.record.id, { clearStartFailure: true });
+    expect(h.router.getOrStartRuntime).toHaveBeenCalledTimes(2);
+    expect(h.runtime.prompt).toHaveBeenCalledOnce();
+    expect(h.runtime.prompt.mock.calls[0][0].match(/ORIGINAL DISPOSABLE WORK/g)).toHaveLength(1);
+    const notice = h.adapter.sendMessage.mock.calls.find(([, text]) => text.includes("saved session"))?.[1];
+    expect(notice).toContain(`saved session \`${lostId}\``);
+    expect(notice).toContain("without the earlier context");
+    expect(notice).toContain(raw.message);
+    expect(h.store.get(h.record.id)).toMatchObject({ agentId: "claude", acpSessionId: replacementId,
+      repoPath: "/synthetic", configJson: originalConfig });
+    expect(h.store.get("discord:unrelated")).toEqual(unrelated);
+    expect(h.store.turnAttempts.get("inbound-1")).toMatchObject({ state: "completed", acpSessionId: replacementId,
+      promptStarted: true, deliveryDone: true, outcome: { status: "completed", output: "CLAUDE_FRESH_1121" } });
+    expect(h.store.getInbound("1")?.state).toBe("completed");
+    expect(h.adapter.sendMessage.mock.calls.filter(([, text]) => text === "CLAUDE_FRESH_1121")).toHaveLength(1);
   });
 
   it.each([

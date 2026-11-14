@@ -247,7 +247,7 @@ const server = http.createServer(async (request, response) => {
     const metadataMode = process.env.SEAM_AGY_R4B_METADATA_MODE_FILE
       ? fs.readFileSync(process.env.SEAM_AGY_R4B_METADATA_MODE_FILE, "utf8").trim()
       : process.env.SEAM_AGY_R4B_METADATA_MODE;
-    if (metadataMode === "late") await afterStream;
+    if (metadataMode === "late" || prompt.startsWith("r5-replay-")) await afterStream;
     if (metadataMode === "unavailable") {
       response.statusCode = 403;
       response.end();
@@ -326,6 +326,70 @@ const server = http.createServer(async (request, response) => {
   if (request.url?.endsWith("/StreamAgentStateUpdates") && trace) {
     response.statusCode = 200;
     response.setHeader("content-type", "application/connect+json");
+    if (prompt.startsWith("r5-replay-")) {
+      response.once("close", streamFinished);
+      const chunks = [];
+      for await (const chunk of request) chunks.push(chunk);
+      const body = Buffer.concat(chunks);
+      if (body[0] !== 0 || body.readUInt32BE(1) !== body.length - 5) throw new Error("invalid fixture Connect request");
+      const subscription = JSON.parse(body.subarray(5).toString("utf8"));
+      const floor = prompt === "r5-replay-large" ? 512 : prompt === "r5-replay-db" ? 4 : -1;
+      const first = floor + 1;
+      const planner = (text, thought, used) => ({
+        type: "CORTEX_STEP_TYPE_PLANNER_RESPONSE", status: "CORTEX_STEP_STATUS_GENERATING",
+        plannerResponse: { modifiedResponse: text, thinking: thought },
+        metadata: { generatorModel: "fixture-native-model", modelUsage: { inputTokens: String(used), outputTokens: "0" } },
+      });
+      const history = Array.from({ length: floor + 1 }, (_, index) => [index,
+        planner(prompt === "r5-replay-large" ? "H".repeat(128 * 1024) : "HISTORICAL", "OLD THOUGHT", 999)]);
+      const current = planner(prompt === "r5-replay-eligible-overflow" ? "x".repeat(64 * 1024 * 1024) : "Replay ", "Inspect ", 101);
+      const updateFor = entries => ({ status: "CASCADE_RUN_STATUS_RUNNING", mainTrajectoryUpdate: {
+        stepsUpdate: { indices: entries.map(([index]) => index), steps: entries.map(([, step]) => step) },
+      } });
+      // Native page bounds select against each update's current total; absent end stays open.
+      const select = entries => {
+        const bounds = subscription.initialStepsPageBounds;
+        if (!bounds) return entries;
+        const total = Math.max(...entries.map(([index]) => index)) + 1;
+        const start = Math.max(0, Math.min(bounds.startIndex, total));
+        const end = bounds.endIndexExclusive === undefined ? total : Math.max(start, Math.min(bounds.endIndexExclusive, total));
+        return entries.filter(([index]) => index >= start && index < end);
+      };
+      const initial = [...history, [first, current]];
+      const unbounded = envelope(0, { update: updateFor(initial) });
+      const selected = envelope(0, { update: updateFor(select(initial)) });
+      const parsed = JSON.parse(unbounded.subarray(5).toString("utf8"));
+      appendInvocation({ scenario: "replay-subscription", request: subscription,
+        unboundedBytes: unbounded.length - 5, selectedBytes: selected.length - 5,
+        validJson: parsed.update.mainTrajectoryUpdate.stepsUpdate.steps.length === initial.length,
+        historicalCount: history.length, selectedIndices: select(initial).map(([index]) => index) });
+      await writeFragmented(response, selected);
+      if (prompt === "r5-replay-eligible-overflow") return;
+      const tool = status => ({ type: "CORTEX_STEP_TYPE_RUN_COMMAND", status,
+        runCommand: { command: "printf synthetic", stdout: "SYNTHETIC TOOL OUTPUT" } });
+      const cumulative = planner("Replay safe🧭", "Inspect once🧭", 122);
+      const updates = [
+        updateFor([[first, cumulative], [first + 1, tool("CORTEX_STEP_STATUS_WAITING")]]),
+        updateFor([[first, cumulative], [first + 1, tool("CORTEX_STEP_STATUS_RUNNING")]]),
+        updateFor([[first + 1, tool("CORTEX_STEP_STATUS_DONE")]]),
+        { status: "CASCADE_RUN_STATUS_IDLE", fullyIdle: false },
+        updateFor([[first + 2, planner(" Future.", " Future thought.", 144)]]),
+      ];
+      for (const update of updates) {
+        const steps = update.mainTrajectoryUpdate?.stepsUpdate;
+        if (steps) {
+          const selectedEntries = select(steps.indices.map((index, i) => [index, steps.steps[i]]));
+          update.mainTrajectoryUpdate.stepsUpdate = updateFor(selectedEntries).mainTrajectoryUpdate.stepsUpdate;
+        }
+      }
+      // Split a header, then coalesce later envelopes, including fullyIdle.
+      const frames = Buffer.concat(updates.map(update => envelope(0, { update })));
+      response.write(frames.subarray(0, 2));
+      await new Promise(resolve => setImmediate(resolve));
+      appendInvocation({ scenario: "replay-fully-idle" });
+      response.write(Buffer.concat([frames.subarray(2), envelope(0, { update: { status: "CASCADE_RUN_STATUS_IDLE", fullyIdle: true } })]));
+      return;
+    }
     if (prompt === "r5-turn-auth-exit" || prompt === "r5-turn-unknown-exit" || prompt === "r5-turn-unknown-exit-once") {
       // #491: the real incident emitted a message before the nested `agy -p`
       // child exited. Keep the stream open after one real update so the child

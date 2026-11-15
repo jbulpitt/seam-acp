@@ -146,11 +146,12 @@ export const UNKNOWN_AGENT_IDENTITY: AgentExecutionIdentity = {
 /** Portable ACP client capabilities published by the process-owning host. */
 export type AgentClientMetadata = Pick<AgentAdapter,
   "displayName" | "defaultModel" | "brand" | "requestedContextTier" |
-  "fastMode" | "restrictDiscordAccess" | "mcpServersAtSpawn" |
+  "restrictDiscordAccess" | "mcpServersAtSpawn" |
   "claudeSessionOptions" | "errorClassifier" | "sessionMetaCodec"
 > & Partial<AgentExecutionIdentity> & {
   /** Wire null preserves explicit absence across JSON; omitted is legacy. */
   effort?: EffortDescriptor | null;
+  fastMode?: FastModeDescriptor | null;
   submissionSignals?: AgentAdapter["submissionSignals"] | null;
   catalogScope?: import("./model-catalog.js").CatalogScope;
   sessionManagement: { history: boolean; repair: boolean } | null;

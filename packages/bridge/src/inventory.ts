@@ -442,7 +442,7 @@ export function inventoryFromAdapters(
       ...(adapter.sessionMetaCodec !== undefined ? { sessionMetaCodec: adapter.sessionMetaCodec } : {}),
       displayName: adapter.displayName, defaultModel: adapter.defaultModel,
       brand: adapter.brand, requestedContextTier: adapter.requestedContextTier,
-      effort: adapter.effort ?? null, fastMode: adapter.fastMode,
+      effort: adapter.effort ?? null, fastMode: adapter.fastMode ?? null,
       restrictDiscordAccess: adapter.restrictDiscordAccess,
       mcpServersAtSpawn: adapter.mcpServersAtSpawn ?? false, submissionSignals: adapter.submissionSignals ?? null,
       claudeSessionOptions: adapter.claudeSessionOptions,

@@ -1,4 +1,4 @@
-import { asLocalAdapter, CLAUDE_FAST_MODE, CODEX_FAST_MODE, UNKNOWN_AGENT_IDENTITY, type AgentAdapter, type AgentClientMetadata, type AdapterCatalogSource, resolveErrorClassifier, resolveLegacyControllerErrorClassifier, resolveSessionMetaCodec, resolveLegacyControllerSessionPolicy } from "@seam/adapters";
+import { asLocalAdapter, UNKNOWN_AGENT_IDENTITY, type AgentAdapter, type AgentClientMetadata, type AdapterCatalogSource, resolveErrorClassifier, resolveLegacyControllerErrorClassifier, resolveSessionMetaCodec, resolveLegacyControllerSessionPolicy, resolveLegacyControllerFastMode } from "@seam/adapters";
 
 /** ACP client metadata, not a controller-side launch or session-file reader. */
 export function controllerMetadataAdapter(
@@ -7,8 +7,6 @@ export function controllerMetadataAdapter(
   catalog: AdapterCatalogSource = profile.catalog,
   claudeSessionOptions?: AgentClientMetadata["claudeSessionOptions"],
 ): AgentAdapter {
-  const claude = profile.id === "claude" || profile.id.startsWith("claude-") || !!metadata?.claudeSessionOptions;
-  const copilot = profile.id.startsWith("copilot");
   const defaultModel = metadata?.defaultModel ?? profile.defaultModel ?? "default";
   const classifyError = metadata && Object.hasOwn(metadata, "errorClassifier")
     ? resolveErrorClassifier(metadata.errorClassifier, profile.id)
@@ -27,20 +25,16 @@ export function controllerMetadataAdapter(
       ? resolveSessionMetaCodec(metadata?.sessionMetaCodec, sessionOptions)
       : legacy.newSessionMeta ?? profile.newSessionMeta,
   };
-  const fastPolicy: Partial<AgentAdapter> = claude ? {
-    fastMode: metadata?.fastMode ?? profile.fastMode ?? (profile.id === "claude" ? CLAUDE_FAST_MODE : undefined),
-  } : copilot ? {} : profile.id === "codex" || profile.id.startsWith("codex-") ? {
-    fastMode: metadata?.fastMode ?? profile.fastMode ?? (profile.id === "codex" ? CODEX_FAST_MODE : undefined),
-  } : {};
+  const fastMode = owns("fastMode") ? metadata?.fastMode ?? undefined
+    : resolveLegacyControllerFastMode(profile.id, metadata, profile.fastMode);
   return asLocalAdapter({
     id: profile.id, displayName: metadata?.displayName ?? profile.displayName ?? profile.id, defaultModel,
     requestedContextTier: profile.requestedContextTier,
-    fastMode: profile.fastMode,
     restrictDiscordAccess: profile.restrictDiscordAccess,
     catalog,
     ...metadata,
     ...sessionPolicy,
-    ...fastPolicy,
+    fastMode,
     classifyError,
     harness: metadata?.harness ?? UNKNOWN_AGENT_IDENTITY.harness,
     provider: metadata?.provider ?? UNKNOWN_AGENT_IDENTITY.provider,

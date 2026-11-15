@@ -32,3 +32,19 @@ export const CODEX_FAST_MODE: FastModeDescriptor = {
   offValue: FAST_MODE_OFF,
   applicationMode: "live",
 };
+
+/** Compatibility only for hosts that omit the Fast declaration. */
+export function resolveLegacyControllerFastMode(
+  id: string,
+  metadata: { claudeSessionOptions?: unknown; fastMode?: FastModeDescriptor | null } | undefined,
+  supplied?: FastModeDescriptor,
+): FastModeDescriptor | undefined {
+  if (id === "claude" || id.startsWith("claude-") || metadata?.claudeSessionOptions) {
+    return metadata?.fastMode ?? supplied ?? (id === "claude" ? CLAUDE_FAST_MODE : undefined);
+  }
+  if (id.startsWith("copilot")) return supplied;
+  if (id === "codex" || id.startsWith("codex-")) {
+    return metadata?.fastMode ?? supplied ?? (id === "codex" ? CODEX_FAST_MODE : undefined);
+  }
+  return supplied;
+}

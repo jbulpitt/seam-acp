@@ -9,7 +9,7 @@ import { makeMux, type AgentAdapter } from "@seam/adapters";
 import { classifyCodexError } from "../../packages/adapters/src/profiles/codex.js";
 import { SessiondServer } from "../../packages/bridge/src/sessiond-server.js";
 import { SessiondClient } from "../../packages/bridge/src/sessiond-client.js";
-import { SupervisedSlots } from "../../packages/bridge/src/supervised-slots.js";
+import { SupervisedSlots, forwardInput } from "../../packages/bridge/src/supervised-slots.js";
 import { SessionRouter } from "../../packages/core/src/core/session-router.js";
 import { SessionStore } from "../../packages/core/src/core/session-store.js";
 import { Orchestrator } from "../../packages/core/src/platforms/discord/orchestrator.js";
@@ -24,6 +24,7 @@ export const SAVED_SESSION = "saved-conversation";
 
 export async function savedSessionHost(options: {
   agentFixture?: string;
+  onInputUnavailable?: (slot: number, error: Error) => void;
   failLoad?: boolean;
   loadGate?: boolean;
   newGate?: boolean;
@@ -54,10 +55,11 @@ export async function savedSessionHost(options: {
   let client = await SessiondClient.connect(path.join(root, "control.sock"));
   const logger = pino({ level: "silent" });
   const commands: any[] = [];
+  const inputFailures: Array<{ slot: number; reason: string }> = [];
   let slots!: SupervisedSlots;
   class Socket extends EventEmitter {
     readyState = 1;
-    deliver(frame: unknown) { this.emit("message", Buffer.from(JSON.stringify(frame))); }
+    deliver(frame: unknown) { if (this.readyState === 1) this.emit("message", Buffer.from(JSON.stringify(frame))); }
     send(raw: string) {
       const frame = JSON.parse(raw);
       commands.push(frame);
@@ -67,7 +69,15 @@ export async function savedSessionHost(options: {
         : { type: "cmd_reply", cmdId: frame.cmdId, error: error.message }));
     }
     async handle(frame: any) {
-      if (frame.type === "data") { await slots.writeInput(frame.slot, frame.data); return; }
+      if (frame.type === "data") {
+        await forwardInput(slots, frame.slot, frame.data,
+          (slot, reason) => {
+            inputFailures.push({ slot, reason });
+            this.deliver({ slot, type: "exit", code: 1, spawnError: reason });
+          },
+          (slot, error) => { this.close(); options.onInputUnavailable?.(slot, error); });
+        return;
+      }
       if (frame.type === "kill") { await slots.kill(frame.slot); return; }
       if (frame.type === "ping") { this.deliver({ type: "pong" }); return; }
       if (frame.type === "rpc" && frame.method === "spawn") {
@@ -147,7 +157,7 @@ export async function savedSessionHost(options: {
     const orch = new Orchestrator({ logger, store, router, modelCatalog: catalog,
       adapter: adapter as any, renderer: discordRenderer as any,
       ...(options.recoverySleep ? { recoverySleep: options.recoverySleep } : {}),
-      config: { ...visualConfig, DATA_DIR: root, REPOS_ROOT: root, REPO_EMOJIS: new Map(),
+      config: { ...visualConfig, DATA_DIR: root, REPOS_ROOT: root, TURN_TIMEOUT_SECONDS: 60, REPO_EMOJIS: new Map(),
         DISCORD_ALLOWED_USER_IDS: new Set(["fixture-user"]),
         channelPresets: new Map(), threadPresets: new Map() } as any });
     orch.setBridgeHub({ isBridgeReady: () => true, muxFor: () => mux, onBridgeReady: () => () => {} } as any);
@@ -155,8 +165,14 @@ export async function savedSessionHost(options: {
   }
   const requests = async () => (await fs.readFile(path.join(root, "requests.jsonl"), "utf8"))
     .trim().split("\n").map(line => JSON.parse(line));
-  return { root, db, record, store, mux, get slots() { return slots; }, get client() { return client; },
-    commands, notices, makeRouter, makeOrchestrator, requests,
+  return { root, db, record, store, mux, server, get slots() { return slots; }, get client() { return client; },
+    commands, inputFailures, notices, makeRouter, makeOrchestrator, requests,
+    reconnectController() {
+      socket.close();
+      socket = new Socket();
+      mux.attach(socket as never);
+      socket.deliver({ type: "hello", instanceId: "fixture", capabilities: { durableSlots: true } });
+    },
     async restartBridge() {
       socket.close();
       client.close();

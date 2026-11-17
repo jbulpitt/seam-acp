@@ -737,7 +737,10 @@ export class SessiondServer {
     const reply = await this.holderRequest(entry, `write:${id}`, {
       v: SLOT_HOLDER_PROTOCOL_VERSION, type: "write", id, dataBase64: data.toString("base64"),
     });
-    return reply.type === "write_result" && reply.ok;
+    if (reply.type !== "write_result" || reply.id !== id) {
+      throw new Error("slot holder disconnected before acknowledging write");
+    }
+    return reply.ok;
   }
 
   private onHolderFrame(entry: SlotEntry, frame: SlotHolderFrame): void {
@@ -788,7 +791,9 @@ export class SessiondServer {
       throw new SessiondError("invalid_request", "write dataBase64 is invalid");
     }
     if (data.length > MAX_WRITE_BYTES) throw new SessiondError("invalid_request", "write exceeds the 128 MiB limit");
-    const ok = await this.holderWrite(entry, data).catch(() => false);
+    const ok = await this.holderWrite(entry, data).catch((error: Error) => {
+      throw new SessiondError("write_failed", `write outcome unknown: ${error.message}`);
+    });
     if (!ok) throw new SessiondError("write_failed", "write failed before bytes were accepted");
     entry.lastStdinAt = Date.now();
     return { slot: params.slot, acceptedBytes: data.length, backpressured: this.backpressured.has(params.slot) };

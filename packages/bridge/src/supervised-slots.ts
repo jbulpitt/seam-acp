@@ -34,6 +34,7 @@ interface SlotBinding {
   buffered: Map<number, SupervisedBridgeFrame>;
   gap?: { afterSeq: number; firstAvailableSeq: number; droppedFrames: number };
   exitSeen?: boolean;
+  reportingRecovery?: boolean;
   /** Dead bindings retain output; only a fresh configure permits a replacement child.
    * Unlike exitSeen, this survives replay cursor resets. */
   dead?: boolean;
@@ -82,18 +83,25 @@ function outputFrame(frame: SessiondOutputFrame, parsedOutput?: ReturnType<typeo
   return { seq: frame.seq, type: "exit", code: 1, signal: null, spawnError };
 }
 
-/** Report undeliverable writes as well as spawn failures to the controller. */
+class RetainedInputError extends Error {}
+
+/** An uncertain write detaches the consumer; only a known exit ends its turn. */
 export async function forwardInput(
   slots: Pick<SupervisedSlots, "writeInput"> & Partial<Pick<SupervisedSlots, "undeliverableReason">>,
   slot: number,
   data: string,
   onUndeliverable: (slot: number, reason: string) => void,
+  onUnavailable?: (slot: number, error: Error) => void,
 ): Promise<void> {
   let delivered = false;
   let reason: string | undefined;
   try {
     delivered = await slots.writeInput(slot, data);
   } catch (error) {
+    if (error instanceof RetainedInputError && onUnavailable) {
+      onUnavailable(slot, error);
+      return;
+    }
     reason = error instanceof Error ? error.message : String(error);
   }
   if (!delivered) onUndeliverable(slot, reason ?? slots.undeliverableReason?.(slot) ?? "cause not recorded");
@@ -194,10 +202,12 @@ export class SupervisedSlots {
           dataBase64: Buffer.from(data).toString("base64"),
         });
       } catch (error) {
-        this.undeliverable.set(slot, `sessiond refused a ${data.length}-byte write (${error instanceof Error ? error.message : String(error)})`);
-        const binding = this.bindings.get(slot);
-        if (binding) binding.dead = true;
-        return false;
+        const reason = `sessiond could not confirm a ${data.length}-byte write (${error instanceof Error ? error.message : String(error)})`;
+        this.undeliverable.set(slot, reason);
+        if (this.bindings.get(slot)?.dead) return false;
+        // Neither a pre-write refusal nor a lost ACK proves process death.
+        // Reattachment replays pending requests, never these opaque bytes.
+        throw new RetainedInputError(reason, { cause: error });
       }
       return true;
     }) as Promise<boolean>;
@@ -371,10 +381,6 @@ export class SupervisedSlots {
     binding.buffered.clear();
     binding.gap = undefined;
     await this.options.client.subscribe({ slot, afterSeq }, (event) => this.onEvent(slot, event));
-    // Transport acknowledgement can precede durable turn completion.
-    if (!binding.dead) await this.writeControl(slot, {
-      v: ADAPTER_CHILD_PROTOCOL_VERSION, type: "report_recovery", replayPermissions: true,
-    });
     const frames = [...binding.buffered.values()]
       .filter((frame) => frame.seq > afterSeq)
       .sort((left, right) => left.seq - right.seq);
@@ -393,8 +399,32 @@ export class SupervisedSlots {
         binding.buffered.clear();
         binding.mode = "live";
         for (const frame of pending) this.options.onFrame({ slot, ...frame });
+        void this.reportRecovery(slot, binding).catch(error =>
+          console.error(`[bridge] slot ${slot} recovery report failed: ${String(error)}`));
       },
     };
+  }
+
+  private async reportRecovery(slot: number, binding: SlotBinding): Promise<void> {
+    if (binding.reportingRecovery) return;
+    binding.reportingRecovery = true;
+    try {
+      while (this.bindings.get(slot) === binding && !binding.dead) {
+        try {
+          await this.writeControl(slot, {
+            v: ADAPTER_CHILD_PROTOCOL_VERSION, type: "report_recovery", replayPermissions: true,
+          });
+          return;
+        } catch (error) {
+          if (!(error instanceof SessiondClientError) || error.code !== "slot_not_alive") throw error;
+          // Output stays live while the holder returns. Only this idempotent
+          // report is retried after a known pre-write refusal, never ACP input.
+          await new Promise<void>(resolve => setTimeout(resolve, 5_000).unref());
+        }
+      }
+    } finally {
+      binding.reportingRecovery = false;
+    }
   }
 
   private async ensure(slot: number): Promise<SlotBinding> {

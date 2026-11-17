@@ -636,9 +636,13 @@ async function makeSlotManager(opts: {
 
     if (msg.type === "data" && msg.data !== undefined) {
       // Partial frames belong with the surviving child, just like complete input.
+      const inputWs = currentWs;
       void forwardInput(supervised, msg.slot, msg.data, (slot, reason) => {
         console.error(`[bridge] Slot ${slot}: input undeliverable: ${reason}`);
         wsSend({ slot, type: "exit", code: 1, spawnError: `supervised slot unavailable: ${reason}` });
+      }, (slot, error) => {
+        console.error(`[bridge] Slot ${slot}: retaining owner and reconnecting: ${error.message}`);
+        if (currentWs === inputWs) inputWs?.terminate();
       });
     } else if (msg.type === "kill") {
       console.error(`[bridge] Slot ${msg.slot}: kill received — terminating supervised agent`);

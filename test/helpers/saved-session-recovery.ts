@@ -167,6 +167,12 @@ export async function savedSessionHost(options: {
     .trim().split("\n").map(line => JSON.parse(line));
   return { root, db, record, store, mux, server, get slots() { return slots; }, get client() { return client; },
     commands, inputFailures, notices, makeRouter, makeOrchestrator, requests,
+    reconnectController() {
+      socket.close();
+      socket = new Socket();
+      mux.attach(socket as never);
+      socket.deliver({ type: "hello", instanceId: "fixture", capabilities: { durableSlots: true } });
+    },
     async restartBridge() {
       socket.close();
       client.close();

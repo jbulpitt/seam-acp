@@ -52,6 +52,7 @@ async function pending() {
 }
 
 async function completed(p: Awaited<ReturnType<typeof pending>>) {
+  await vi.waitFor(() => expect(p.h.store.getInbound("owned-input")?.state).toBe("completed"), { timeout: 10_000 });
   const result = await p.result;
   expect(result).toBeUndefined();
   expect(p.h.store.getInbound("owned-input")?.state).toBe("completed");
@@ -86,13 +87,60 @@ describe("retained permission input ownership", () => {
       expect(p.unavailable[0]!.error.message).toContain("write refused: slot has no attached live process");
       expect(p.entry.exited).not.toBe(true);
       expect(p.h.commands.filter(row => row.type === "kill")).toEqual([]);
+      const originalSlots = p.h.slots;
+      const originalClient = p.h.client;
+      const replayWrite = vi.spyOn(p.h.client, "write");
+      p.h.reconnectController();
+      await vi.waitFor(() => expect(replayWrite.mock.calls.some(([, data]) =>
+        String(data).includes('"replayPermissions":true'))).toBe(true));
+      if (fault === "detached") expect(p.entry.attached).toBe(false);
+      expect(p.h.slots).toBe(originalSlots);
+      expect(p.h.client).toBe(originalClient);
+      if (fault === "detached") expect(p.h.store.turnAttempts.get("inbound-owned-input"))
+        .toMatchObject({ state: "active", generation: 1 });
       reconnect.mockRestore();
       expect(await connect(p.entry, 0)).toBe(true);
-      // The application callback detaches its socket; ordinary mux reattachment
-      // replays pending requests, not opaque input or the original prompt.
-      await p.h.restartBridge();
       await completed(p);
     } finally { reconnect.mockRestore(); await p.close(); }
+  }, 25_000);
+
+  it("retains an accepted permission when the holder disconnects before its acknowledgement", async () => {
+    const p = await pending();
+    const request = p.daemon.holderRequest.bind(p.h.server);
+    const connect = p.daemon.connectHolder.bind(p.h.server);
+    const reconnect = vi.spyOn(p.daemon, "connectHolder").mockResolvedValue(false);
+    let injected = false;
+    const writes = vi.spyOn(p.daemon, "holderRequest").mockImplementation(async (...args: any[]) => {
+      const message = args[2];
+      if (!injected && message.type === "write" && isPermission(Buffer.from(message.dataBase64, "base64").toString())) {
+        injected = true;
+        p.entry.link.pause();
+        const reply = request(...args);
+        await vi.waitFor(async () => expect((await p.h.requests())
+          .filter(row => row.id === "isolated-permission" && row.result)).toHaveLength(1));
+        p.entry.link.destroy();
+        return reply;
+      }
+      return request(...args);
+    });
+    try {
+      p.answer();
+      await vi.waitFor(() => expect(p.unavailable).toHaveLength(1));
+      expect(p.h.inputFailures).toEqual([]);
+      expect(p.unavailable[0]!.error.cause).toMatchObject({ code: "write_failed",
+        message: "write outcome unknown: slot holder disconnected before acknowledging write" });
+      const sameSlots = p.h.slots;
+      const replayWrite = vi.spyOn(p.h.client, "write");
+      p.h.reconnectController();
+      await vi.waitFor(() => expect(replayWrite.mock.calls.some(([, data]) =>
+        String(data).includes('"replayPermissions":true'))).toBe(true));
+      expect(p.entry.attached).toBe(false);
+      expect(p.h.slots).toBe(sameSlots);
+      writes.mockRestore();
+      reconnect.mockRestore();
+      expect(await connect(p.entry, 0)).toBe(true);
+      await completed(p);
+    } finally { writes.mockRestore(); reconnect.mockRestore(); await p.close(); }
   }, 25_000);
 
   it("does not replay input after an accepted permission write loses its acknowledgement", async () => {

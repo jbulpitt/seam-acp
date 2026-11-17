@@ -172,6 +172,6 @@ export async function bridgeDetachFixture() {
     expect(new Set(native.map(value => value.pid)).size).toBe(1);
   };
   return { first, start, arm, data, prompt, input, handled, frame, replay, completed, blockWrite,
-    directory, requestedCwd, hostServer, requests, daemon, childPid };
+    directory, requestedCwd, hostServer, requests, daemon, childPid, frames };
 }
 

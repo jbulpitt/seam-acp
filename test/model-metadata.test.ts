@@ -153,7 +153,8 @@ describe("model metadata source and catalog", () => {
     const gate = new Promise<void>((resolve) => { release = resolve; });
     const fetchImpl = vi.fn(async () => {
       await gate;
-      return new Response(JSON.stringify(aaPayload), {
+      return new Response(JSON.stringify({ ...aaPayload,
+        pagination: { page: 1, total_pages: 1, has_more: false } }), {
         status: 200,
         headers: { "content-type": "application/json" },
       });

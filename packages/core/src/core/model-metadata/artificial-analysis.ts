@@ -1,6 +1,6 @@
 import type { MetadataSource, MetadataSourceModel, ModelCreator, ModelPricing } from "./types.js";
 
-export const AA_MODELS_URL = "https://artificialanalysis.ai/api/v2/data/llms/models";
+export const AA_MODELS_URL = "https://artificialanalysis.ai/api/v2/language/models/free";
 export const MODEL_METADATA_REFRESH_CRON = "0 */12 * * *";
 
 type FetchLike = typeof fetch;
@@ -12,8 +12,8 @@ function finiteNumber(value: unknown): number | null {
 function parseCreator(value: unknown): ModelCreator | null {
   if (!value || typeof value !== "object") return null;
   const row = value as Record<string, unknown>;
-  return typeof row.id === "string" && typeof row.name === "string" && typeof row.slug === "string"
-    ? { id: row.id, name: row.name, slug: row.slug }
+  return typeof row.id === "string" && typeof row.name === "string"
+    ? { id: row.id, name: row.name, slug: typeof row.slug === "string" ? row.slug : null }
     : null;
 }
 
@@ -24,6 +24,10 @@ function parsePricing(value: unknown): ModelPricing | null {
     input_per_million: finiteNumber(row.price_1m_input_tokens),
     output_per_million: finiteNumber(row.price_1m_output_tokens),
     blended_per_million: finiteNumber(row.price_1m_blended_3_to_1),
+    ...(Object.hasOwn(row, "price_1m_cache_hit_tokens")
+      ? { cached_input_per_million: finiteNumber(row.price_1m_cache_hit_tokens) } : {}),
+    ...(Object.hasOwn(row, "price_1m_cache_write_tokens")
+      ? { cache_write_per_million: finiteNumber(row.price_1m_cache_write_tokens) } : {}),
   };
   return Object.values(pricing).some((entry) => entry !== null) ? pricing : null;
 }
@@ -94,14 +98,40 @@ export class ArtificialAnalysisMetadataSource implements MetadataSource {
   }
 
   private async fetchInner(signal?: AbortSignal): Promise<MetadataSourceModel[]> {
-    if (!this.apiKey.trim()) throw new Error("AA_API_KEY is not configured");
-    const response = await this.fetchImpl(AA_MODELS_URL, {
-      headers: { "x-api-key": this.apiKey },
-      signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(30_000)]) : AbortSignal.timeout(30_000),
-    });
-    if (!response.ok) throw new Error(`Artificial Analysis request failed: HTTP ${response.status}`);
-    return parseAaModels(await response.json());
+    return parseAaModels({ data: await fetchAaModelData(this.apiKey, this.fetchImpl, signal) });
   }
+}
+
+/** Complete Free response, shared with the optional host MCP compatibility API. */
+export async function fetchAaModelData(
+  apiKey: string,
+  fetchImpl: FetchLike = fetch,
+  signal?: AbortSignal
+): Promise<unknown[]> {
+  if (!apiKey.trim()) throw new Error("AA_API_KEY is not configured");
+  const requestSignal = signal ? AbortSignal.any([signal, AbortSignal.timeout(30_000)]) : AbortSignal.timeout(30_000);
+  const data: unknown[] = [];
+  let totalPages = 1;
+  for (let page = 1; page <= totalPages; page++) {
+    const response = await fetchImpl(page === 1 ? AA_MODELS_URL : `${AA_MODELS_URL}?page=${page}`, {
+      headers: { "x-api-key": apiKey }, signal: requestSignal,
+    });
+    if (!response.ok) throw new Error(`Artificial Analysis request failed: HTTP ${response.status} (page ${page})`);
+    const payload: unknown = await response.json();
+    if (!payload || typeof payload !== "object" || !Array.isArray((payload as { data?: unknown }).data)) {
+      throw new Error(`Artificial Analysis response is missing the data array (page ${page})`);
+    }
+    const row = payload as { data: unknown[]; pagination?: { page?: unknown; total_pages?: unknown; has_more?: unknown } };
+    const pagination = row.pagination;
+    const pages = pagination?.total_pages;
+    if (!Number.isSafeInteger(pages) || (pages as number) < page || pagination?.page !== page
+      || pagination.has_more !== (page < (pages as number)) || (page > 1 && pages !== totalPages)) {
+      throw new Error(`Artificial Analysis response has inconsistent pagination (page ${page})`);
+    }
+    totalPages = pages as number;
+    data.push(...row.data);
+  }
+  return data;
 }
 
 export async function fetchAaModels(

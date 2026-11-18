@@ -4,13 +4,15 @@ export const DEFAULT_METADATA_BENCHMARK = "artificial_analysis_intelligence_inde
 export interface ModelCreator {
   id: string;
   name: string;
-  slug: string;
+  slug: string | null;
 }
 
 export interface ModelPricing {
   input_per_million: number | null;
   output_per_million: number | null;
   blended_per_million: number | null;
+  cached_input_per_million?: number | null;
+  cache_write_per_million?: number | null;
 }
 
 /** Provider-normalized row returned by a MetadataSource. */

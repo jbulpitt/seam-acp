@@ -290,6 +290,63 @@ top-level `effort`, following the [model runbook](../model-management-runbook.md
   (`artificial-analysis`) for direct model lookups, but for cost-aware decisions
   prefer `model_value_rankings` (it joins in Copilot pricing).
 
+## Artificial Analysis refresh and local MCP compatibility
+
+Seam uses the supported [Free language-model endpoint](https://artificialanalysis.ai/data-api/docs/reference)
+with the existing `AA_API_KEY`, following every page before recording a successful
+source snapshot. A failed page retains the previous complete snapshot. All pages
+share the existing 30-second request deadline and in-flight refresh. The
+[legacy API was retired](https://artificialanalysis.ai/data-api/migrate-v2-data);
+changing credentials does not repair its HTTP 410 response.
+
+Free data has creator IDs/names but no creator slug. `creator.slug` is nullable;
+known input/output and cache prices are retained, and unavailable blended prices
+and benchmarks remain unknown. No blended price or creator slug is derived.
+The matching, effort-selection and Copilot-pricing policies are unchanged.
+
+For an existing `artificial-analysis-mcp@1.0.1` stdio backend, the optional
+[API compatibility module](../../ops/artificial-analysis-mcp/api.mjs) preserves
+its `ArtificialAnalysisAPI.fetchModels()` interface. It leaves the package's
+`dist/index.js`, `list_models` / `get_model` schemas, filter/sort/search handlers,
+and the surrounding HTTP broker unchanged. A URL-only edit is insufficient:
+the published client also requires the retired `status` envelope and old
+performance field locations. The compatibility module uses the same paginated
+reader as Seam; median speed keeps its original meaning and Performance v3
+means are exposed separately. Missing legacy fields are `null`.
+
+After building the reviewed release through normal deployment tooling, an
+operator can prepare these two files for each existing backend installation:
+
+```bash
+# AA_DIST is the confirmed existing npm package dist directory, not the broker.
+# RELEASE is the reviewed Seam build, with matching source/compiled hashes.
+cp "$AA_DIST/api.js" "$BACKUP/api.js"
+# Also preserve a pre-existing seam-aa-source.js, if present, for rollback.
+cp "$RELEASE/packages/core/dist/core/model-metadata/artificial-analysis.js" "$AA_DIST/seam-aa-source.js"
+cp "$RELEASE/ops/artificial-analysis-mcp/api.mjs" "$AA_DIST/api.js"
+```
+
+The compiled reader has no runtime imports, so the copied module needs no Seam
+installation or new dependencies beside it. Use Seam's supported Node version
+(Node 22+) and the existing broker's normal restart procedure; no endpoint,
+credential or launch-policy edit is required. This is an explicit version-scoped
+compatibility overlay, not an npm upgrade or fork. Reinstallation of the npm
+package overwrites the overlay, so record both installed file hashes and revisit
+it when upstream publishes a migration. Rollback restores the saved API module
+and prior helper state, followed by that same broker restart.
+
+Verification must call both data tools, including a model from a later page;
+health and tool discovery alone do not prove retrieval. Separately verify a new
+successful AA source snapshot with the supported URL/parser version and inspect
+normal generation-publication diagnostics. Existing matching regression policy
+may retain a generation; do not weaken it to force publication. These operator
+steps are separate from source-only/client-fixture checks.
+
+AA's [official hosted MCP](https://artificialanalysis.ai/data-api/docs/mcp) uses a
+remote URL and API-key/OAuth authentication. Its documentation does not establish
+the same two-tool contract. Switching to it requires a separate integration
+migration; it is not a transparent replacement for the configured local broker.
+
 ## Gotchas
 - **Value ranking is Copilot-cost-specific** (GitHub per-token pricing). The raw
   `model_metadata_*` benchmarks are provider-agnostic.

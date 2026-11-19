@@ -137,6 +137,13 @@ describe.sequential("#346 real-session catalog enrichment", () => {
       expect(processes.filter((entry) => entry.prompt === "capability-turn-one")).toHaveLength(1);
       expect(processes.filter((entry) => (entry.args ?? []).includes("models"))).toHaveLength(1);
 
+      expect(await catalog.refresh(localBinding, "scheduled")).toMatchObject({ result: "unchanged", generation: 2 });
+      expect(catalog.model(localBinding, "fixture-native-model")?.context.maximum).toBe(4_096);
+      const refreshedProcesses = fs.readFileSync(invocationLog, "utf8").trim().split("\n")
+        .map(line => JSON.parse(line) as { pid?: number; scenario: string });
+      expect(refreshedProcesses.filter(entry => entry.pid !== undefined).map(entry => entry.scenario))
+        .toEqual(["catalog", "turn-one", "catalog"]);
+
       // The exact same agent id on another host may use this as a labeled hint,
       // never as authoritative metadata for that host.
       expect(catalog.models(peerBinding)).toEqual([]);

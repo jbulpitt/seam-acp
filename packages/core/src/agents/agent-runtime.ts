@@ -1396,21 +1396,6 @@ export class AgentRuntime {
     // happened during loadSession, this prompt is fully live: do NOT gate it,
     // else with no echo to un-gate on we'd eat the response.
     const firstResumedPrompt = this.justResumed;
-    if (firstResumedPrompt) {
-      this.justResumed = false; // consume: only the first prompt after a resume
-      if (!this.replayLoadedDuringLoad) {
-        this.suppressResumeReplay = true;
-        this.resumeLiveSegment = true; // no replayed user echo yet ⇒ treat as live
-        this.resumeSawUserEcho = false;
-        this.resumePreEchoBuffer = [];
-        this.resumeEchoBuffer = "";
-        // Match the echoed user message against the sent text. An
-        // attachment-only prompt has no text to match — leave suppression armed
-        // but harmless: `resumeLiveSegment` stays true, so nothing is eaten.
-        this.resumePromptText = text.trim() || undefined;
-      }
-    }
-
     this.touchActivity();
     this.promptInFlight = true;
     const recoveryAbort = this.recoveryAbort = new AbortController();
@@ -1425,55 +1410,69 @@ export class AgentRuntime {
     let remoteRecoveryDelegated = false;
     let remoteRecoveryBinding: RemoteRecoveryDelegation | undefined;
     const slot = this.getSlot();
-    if (
-      slot !== undefined
-      && (this.child as { remoteRung1Recovery?: unknown } | undefined)?.remoteRung1Recovery === true
-      && this.bridgeHealth?.sendCmd
-      && opts?.onRemoteRecovery
-      && opts.onRemoteRecoveryReleased
-    ) {
-      const snapshot = await this.bridgeHealth.sendCmd("armRung1Recovery", {
-        slot,
-        submissionId: receipt.submission.id,
-        acpSessionId: sid,
-        // Never the original brief. All adapters share this ACP prompt path,
-        // so this is the same no-replay guarantee for every remote profile.
-        continuation: CONTINUE_PROMPT,
-      });
-      if (!isRemoteRecoverySnapshot(snapshot)
-        || snapshot.submissionId !== receipt.submission.id
-        || snapshot.acpSessionId !== sid
-        || snapshot.phase !== "armed") {
-        throw new Error("remote rung-1 recovery acknowledgement was invalid");
-      }
-      const binding: RemoteRecoveryDelegation = {
-          version: 1,
-          slot,
-          submissionId: receipt.submission.id,
-          acpSessionId: sid,
-          delegatedUtc: snapshot.updatedUtc,
-          ...(this.lastModelFallbackNotice ? { modelFallbackNotice: this.lastModelFallbackNotice } : {}),
-      };
-      try {
-        await opts.onRemoteRecovery(binding);
-      } catch (error) {
-        // Undo the unsent arm when its durable binding failed.
-        await this.bridgeHealth.sendCmd("disarmRung1Recovery", {
-          slot,
-          submissionId: receipt.submission.id,
-        }).catch(() => {});
-        throw error;
-      }
-      remoteRecoveryDelegated = true;
-      remoteRecoveryBinding = binding;
-      this.delegatedTurn = true;
-    }
     // Captured so the teardown fail-safe below can tell a CLEAN completion
     // (end_turn) from an abnormal one (cancel/abort/error). Stays undefined if
     // the RPC rejects (dispose/child-death) — which is itself an abnormal end.
     let outcomeStopReason: string | undefined;
     let lastErrorKind: string | undefined;
     try {
+      if (
+        slot !== undefined
+        && (this.child as { remoteRung1Recovery?: unknown } | undefined)?.remoteRung1Recovery === true
+        && this.bridgeHealth?.sendCmd
+        && opts?.onRemoteRecovery
+        && opts.onRemoteRecoveryReleased
+      ) {
+        try {
+          const snapshot = await this.bridgeHealth.sendCmd("armRung1Recovery", {
+            slot,
+            submissionId: receipt.submission.id,
+            acpSessionId: sid,
+            // Never the original brief. All adapters share this ACP prompt path,
+            // so this is the same no-replay guarantee for every remote profile.
+            continuation: CONTINUE_PROMPT,
+          });
+          if (!isRemoteRecoverySnapshot(snapshot)
+            || snapshot.submissionId !== receipt.submission.id
+            || snapshot.acpSessionId !== sid
+            || snapshot.phase !== "armed") {
+            throw new Error("remote rung-1 recovery acknowledgement was invalid");
+          }
+          const binding: RemoteRecoveryDelegation = {
+            version: 1,
+            slot,
+            submissionId: receipt.submission.id,
+            acpSessionId: sid,
+            delegatedUtc: snapshot.updatedUtc,
+            ...(this.lastModelFallbackNotice ? { modelFallbackNotice: this.lastModelFallbackNotice } : {}),
+          };
+          await opts.onRemoteRecovery(binding);
+          remoteRecoveryDelegated = true;
+          remoteRecoveryBinding = binding;
+          this.delegatedTurn = true;
+        } catch (error) {
+          // No prompt RPC was invoked; the child decides whether this exact arm is still unsent.
+          await this.bridgeHealth.sendCmd("disarmRung1Recovery", {
+            slot, submissionId: receipt.submission.id,
+          }).catch(err => this.logger.warn({ err, slot }, "pre-submit recovery disarm could not be confirmed"));
+          throw error;
+        }
+      }
+      if (firstResumedPrompt) {
+        this.justResumed = false; // consume: only the first prompt after a resume
+        if (!this.replayLoadedDuringLoad) {
+          this.suppressResumeReplay = true;
+          this.resumeLiveSegment = true; // no replayed user echo yet ⇒ treat as live
+          this.resumeSawUserEcho = false;
+          this.resumePreEchoBuffer = [];
+          this.resumeEchoBuffer = "";
+          // Match the echoed user message against the sent text. An
+          // attachment-only prompt has no text to match — leave suppression armed
+          // but harmless: `resumeLiveSegment` stays true, so nothing is eaten.
+          this.resumePromptText = text.trim() || undefined;
+        }
+      }
+
       // Race the ACP prompt RPC against a death/dispose rejection. Storing the
       // reject lets the child-exit handler (and dispose) force this await to
       // settle instead of hanging when the connection dies without a clean
@@ -1624,6 +1623,7 @@ export class AgentRuntime {
         ...(rejected ? { rejectedAttachments: rejected } : {}),
       };
     } catch (error) {
+      if (receipt.submission.phase === "intent") throw error;
       if (readErrorClassification(error)?.errorKind === "quota_exhausted") {
         await this.emit({ kind: "notice", agent: this.profile.id, severity: "warning",
           title: "Paused — quota or balance exhausted", description: `${errorMessage(error)}\nRetry after the reset or top-up; no further automatic retries.` });

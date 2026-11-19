@@ -3733,18 +3733,20 @@ export class Orchestrator {
     let pendingRefresh: NodeJS.Timeout | undefined;
     const statusEditQueue = new SerialQueue();
     let statusCardSettled = false;
-    // Read the latest snapshot when the queued write runs, like adopted cards.
+    // Keep live edits current; freeze terminal projections before later output arrives.
     // Status I/O must never hold the ACP answer-processing queue.
     const editStatusSnapshot = (settlement = false): void => {
+      const settledStatus = settlement ? TurnStatus.restore(status.snapshot()) : undefined;
       void statusEditQueue.run(async () => {
+        const renderedStatus = settledStatus ?? status;
         if (statusCardSettled && !settlement) return;
-        if (humanAttempt) this.store.turnAttempts.saveStatusCardState(humanAttempt, status.snapshot());
+        if (humanAttempt) this.store.turnAttempts.saveStatusCardState(humanAttempt, renderedStatus.snapshot());
         const now = Date.now();
-        const viewed = observationFromTurn(status);
+        const viewed = observationFromTurn(renderedStatus);
         statusCard.publish(viewed.observation, viewed.contextWindow, now);
         if (statusCard.plan().action === "skip") return;
-        const stamped = status.startedUtc + (statusCard.current()?.elapsedSeconds ?? 0) * 1000;
-        const panel = renderStatusPanel(this.renderer, status.toInput(), stamped);
+        const stamped = renderedStatus.startedUtc + (statusCard.current()?.elapsedSeconds ?? 0) * 1000;
+        const panel = renderStatusPanel(this.renderer, renderedStatus.toInput(), stamped);
         const fingerprint = JSON.stringify(panel);
         if (fingerprint === lastRendered) {
           statusCard.acknowledge();
@@ -3781,6 +3783,14 @@ export class Orchestrator {
       }
       editStatusSnapshot();
     };
+    const freezeStatusCard = (): void => {
+      statusCardSettled = true;
+      if (pendingRefresh) {
+        clearTimeout(pendingRefresh);
+        pendingRefresh = undefined;
+      }
+      editStatusSnapshot(true);
+    };
     const settleAttemptCard = async (): Promise<void> => {
       if (!humanAttempt) return;
       const projection = projectAttemptCard(
@@ -3789,14 +3799,9 @@ export class Orchestrator {
       );
       if (!projection) return;
       // Final settlement grants no execution ownership; it edits only this captured card.
-      statusCardSettled = true;
-      if (pendingRefresh) {
-        clearTimeout(pendingRefresh);
-        pendingRefresh = undefined;
-      }
       status.setState(projection.state);
       status.setAction(projection.action);
-      editStatusSnapshot(true);
+      freezeStatusCard();
     };
 
     // Heartbeat: tick the elapsed clock while nothing else changes, so a long
@@ -4073,7 +4078,7 @@ export class Orchestrator {
         // after it goes quiet, back to Done. Display-only — no session state
         // touched. A tool title is not evidence of pending work.
         if (
-          turnFinalized &&
+          turnFinalized && !statusCardSettled &&
           (event.kind === "agent-text" ||
             event.kind === "agent-thought" ||
             event.kind === "tool-start")
@@ -4933,7 +4938,8 @@ export class Orchestrator {
           this.currentSpeakerIds.delete(record.channelRef);
           this.currentAuthorIds.delete(record.channelRef);
         }
-        void refresh(true);
+        if (status.state === "Failed" && humanAttempt) freezeStatusCard();
+        else void refresh(true);
         if (isSimpleCardGifTerminal(status.state)) {
           await wrapUpStep("status-gif-delete", () => deleteSimpleCardGifMessage({
             ref: gifMsg,

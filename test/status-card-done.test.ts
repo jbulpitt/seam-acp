@@ -18,6 +18,8 @@ import { discordRenderer } from "../packages/core/src/platforms/discord/renderer
 import { fixtureModelCatalog } from "./model-catalog-fixture.js";
 import type { DeliveryNonceLookup } from "../packages/core/src/platforms/chat-adapter.js";
 import { simulateRetiredOwnerProcess } from "./restart-process-fixture.js";
+import { recoveryArmFixture } from "./helpers/recovery-arm.js";
+import type { AgentRuntime } from "../packages/core/src/agents/agent-runtime.js";
 
 const cleanups: (() => void)[] = [];
 afterEach(() => {
@@ -53,7 +55,7 @@ function setup() {
     getProviderIdentity: () => "synthetic-codex",
     getFastModeOutcome: () => undefined,
     getPromptCapabilities: () => ({}),
-    prompt: vi.fn(async () => {
+    prompt: vi.fn(async (..._args: Parameters<AgentRuntime["prompt"]>) => {
       await onEvent({ kind: "tool-start", toolCallId: "t1", title: "Monitor the build" });
       await onEvent({ kind: "agent-text", text: "finished the turn" });
       return { stopReason: "end_turn" };
@@ -137,6 +139,30 @@ function setup() {
 }
 
 describe("finished turn card (#437)", () => {
+  it("keeps a timed-out unsent request Failed while unrelated background output is delivered", async () => {
+    vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout", "setInterval", "clearInterval"] });
+    const h = setup();
+    const arm = recoveryArmFixture({ fail: "timeout" });
+    arm.runtime.onEvent(event => h.emit(event));
+    h.runtime.prompt.mockImplementationOnce((...args) => arm.runtime.prompt(...args));
+    const running = h.run();
+    await arm.armPending;
+    await vi.advanceTimersByTimeAsync(15_000);
+    await running;
+    const failed = h.store.turnAttempts.get("inbound-1")!;
+    const last = () => h.writes.filter(w => w.id === failed.statusCard!.messageId).at(-1)!.panel;
+    expect(last().title).toBe("Failed");
+    expect(failed.outcome).toMatchObject({ status: "failed", error: expect.stringContaining("armRung1Recovery timed out") });
+    expect(arm.prompt).not.toHaveBeenCalled();
+    await h.emit({ kind: "agent-text", text: "synthetic retained background answer" });
+    await h.emit({ kind: "tool-start", toolCallId: "background-tool", title: "Synthetic background tool" });
+    await vi.advanceTimersByTimeAsync(15_000);
+    expect(h.adapter.sendMessage.mock.calls.some(call => JSON.stringify(call).includes("synthetic retained background answer"))).toBe(true);
+    expect(last().title).toBe("Failed");
+    expect(last().fields?.find(field => field.name === "Action")?.value).toContain("armRung1Recovery timed out");
+    expect(h.store.turnAttempts.get(failed.id)?.outcome).toEqual(failed.outcome);
+  });
+
   it("settles the previous card after resumed output even while the next turn owns a new card", async () => {
     vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout", "setInterval", "clearInterval"] });
     const h = setup();

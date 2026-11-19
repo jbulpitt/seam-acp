@@ -9346,7 +9346,7 @@ export class Orchestrator {
       || (spec.kind === "ingest" && spec.session !== "live")) return;
     const target: ChannelRef = { platform: this.platformForChannel(spec.target), id: spec.target };
     const record = await this.bindThreadRecord(target, spec.cwd);
-    const preset = spec.preset ? this.store.getPresetByName(spec.preset) : null;
+    const preset = spec.preset ? this.store.getPresetByNameScoped(spec.preset, record.parentRef) : null;
     const isolated = spec.session === "isolated" || Boolean(preset || spec.agentId);
     const described = this.router.describeConfig(record, isolated ? {
       agent: preset?.agentId ?? spec.agentId ?? spec.preset,
@@ -9541,7 +9541,7 @@ export class Orchestrator {
     // the target thread's own session. Resolve the preset, force an isolated run
     // under its agent/model/effort/cwd, and prepend its instructions as cold-start
     // identity. `target` remains where output is posted for visibility.
-    const preset = spec.preset ? this.store.getPresetByName(spec.preset) : null;
+    const preset = spec.preset ? this.store.getPresetByNameScoped(spec.preset, record.parentRef) : null;
     const threadLocation = this.router.describeConfig(record).location?.value
       ?? resolveThreadLocation(this.config, spec.target);
     const requestedWorkerLocation = spec.location ?? threadLocation;

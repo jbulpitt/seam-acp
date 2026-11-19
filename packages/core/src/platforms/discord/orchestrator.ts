@@ -3783,6 +3783,14 @@ export class Orchestrator {
       }
       editStatusSnapshot();
     };
+    const freezeStatusCard = (): void => {
+      statusCardSettled = true;
+      if (pendingRefresh) {
+        clearTimeout(pendingRefresh);
+        pendingRefresh = undefined;
+      }
+      editStatusSnapshot(true);
+    };
     const settleAttemptCard = async (): Promise<void> => {
       if (!humanAttempt) return;
       const projection = projectAttemptCard(
@@ -3791,14 +3799,9 @@ export class Orchestrator {
       );
       if (!projection) return;
       // Final settlement grants no execution ownership; it edits only this captured card.
-      statusCardSettled = true;
-      if (pendingRefresh) {
-        clearTimeout(pendingRefresh);
-        pendingRefresh = undefined;
-      }
       status.setState(projection.state);
       status.setAction(projection.action);
-      editStatusSnapshot(true);
+      freezeStatusCard();
     };
 
     // Heartbeat: tick the elapsed clock while nothing else changes, so a long
@@ -4935,7 +4938,7 @@ export class Orchestrator {
           this.currentSpeakerIds.delete(record.channelRef);
           this.currentAuthorIds.delete(record.channelRef);
         }
-        if (status.state === "Failed" && humanAttempt) await settleAttemptCard();
+        if (status.state === "Failed" && humanAttempt) freezeStatusCard();
         else void refresh(true);
         if (isSimpleCardGifTerminal(status.state)) {
           await wrapUpStep("status-gif-delete", () => deleteSimpleCardGifMessage({

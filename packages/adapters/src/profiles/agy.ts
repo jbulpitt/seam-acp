@@ -716,59 +716,58 @@ export function makeAgyProfile(opts: {
     mappingFile,
     mappingFile === LEGACY_MAPPING_FILE ? undefined : LEGACY_MAPPING_FILE,
   );
-  const makeCatalog = (refresh: boolean): AgentAdapter["catalog"] => ({
-    scope: () => catalogScope,
-    async fetch() {
-      let models: ReadonlyArray<ManifestCatalogModel>;
-      if (opts.staticModels && opts.staticModels.length > 0) {
-        const rows = await getCatalogRows(runtime, refresh);
-        const byId = new Map(rows.map((row) => [row.modelId, row]));
-        models = opts.staticModels.map((model) => {
-          const row = byId.get(model.modelId);
-          return agyManifestModel(
-            model,
-            row,
-            runtime.descriptor.provenance.version,
-            catalogScope.fingerprint,
-          );
-        });
-      } else {
-        const rows = await getCatalogRows(runtime, refresh);
-        models = [...rows.filter((row) => row.recommended), ...rows.filter((row) => !row.recommended)]
-          .map((row) => agyManifestModel(
-            { modelId: row.modelId, name: row.displayName },
-            row,
-            runtime.descriptor.provenance.version,
-            catalogScope.fingerprint,
-          ));
-      }
-      const enriched = models.some((model) => model.evidence?.some((entry) =>
-        entry.kind === "live-observation" && entry.source === "agy language server"));
-      const candidate = await manifestCatalogSource({
-        provider: "google-antigravity",
-        backend: catalogScope.backend,
-        credentialProfile: catalogScope.credentialProfile,
-        policy: catalogScope.policy,
-        defaultModel,
-        models: () => models,
-        effort: { mechanism: "modelBaked", choices: ["default"] },
-        adapterVersion: AGENT_ADAPTER_VERSION,
-        source: opts.staticModels?.length
-          ? enriched ? "validated-manifest+agy-session-language-server" : "validated-manifest+agy-models"
-          : enriched ? "agy-models+session-language-server" : "agy-models",
-      }).fetch();
-      runtime.verify(process.cwd());
-      candidate.cliVersion = runtime.descriptor.provenance.version;
-      return candidate;
-    },
-  });
+  const fetchCatalog = async (refresh: boolean) => {
+    const rows = await getCatalogRows(runtime, refresh);
+    let models: ReadonlyArray<ManifestCatalogModel>;
+    if (opts.staticModels && opts.staticModels.length > 0) {
+      const byId = new Map(rows.map((row) => [row.modelId, row]));
+      models = opts.staticModels.map((model) => {
+        const row = byId.get(model.modelId);
+        return agyManifestModel(
+          model,
+          row,
+          runtime.descriptor.provenance.version,
+          catalogScope.fingerprint,
+        );
+      });
+    } else {
+      models = [...rows.filter((row) => row.recommended), ...rows.filter((row) => !row.recommended)]
+        .map((row) => agyManifestModel(
+          { modelId: row.modelId, name: row.displayName },
+          row,
+          runtime.descriptor.provenance.version,
+          catalogScope.fingerprint,
+        ));
+    }
+    const enriched = models.some((model) => model.evidence?.some((entry) =>
+      entry.kind === "live-observation" && entry.source === "agy language server"));
+    const candidate = await manifestCatalogSource({
+      provider: "google-antigravity",
+      backend: catalogScope.backend,
+      credentialProfile: catalogScope.credentialProfile,
+      policy: catalogScope.policy,
+      defaultModel,
+      models: () => models,
+      effort: { mechanism: "modelBaked", choices: ["default"] },
+      adapterVersion: AGENT_ADAPTER_VERSION,
+      source: opts.staticModels?.length
+        ? enriched ? "validated-manifest+agy-session-language-server" : "validated-manifest+agy-models"
+        : enriched ? "agy-models+session-language-server" : "agy-models",
+    }).fetch();
+    runtime.verify(process.cwd());
+    candidate.cliVersion = runtime.descriptor.provenance.version;
+    return candidate;
+  };
   const profile: AgentAdapter = asLocalAdapter({
     id: "agy",
     harness: "agy", provider: catalogScope.provider,
     account: { provenance: "configured-context" },
     displayName: "Antigravity",
     defaultModel,
-    catalog: makeCatalog(true),
+    catalog: {
+      scope: () => catalogScope,
+      fetch: () => fetchCatalog(true),
+    },
     // agy bakes effort into the model choice (high/med/low model variants) —
     // there is no separate reasoning-effort knob, so the picker is suppressed.
     effort: { mechanism: "modelBaked", levels: [] },
@@ -781,7 +780,7 @@ export function makeAgyProfile(opts: {
     spawn() {
       return makeFakeAgyProcess(
         runtime,
-        makeCatalog(false),
+        { scope: profile.catalog.scope, fetch: () => fetchCatalog(false) },
         sessionStore,
         defaultModel,
         opts.printTimeoutSeconds,

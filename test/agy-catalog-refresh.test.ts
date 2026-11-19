@@ -93,6 +93,38 @@ describe.sequential("AGY catalog refresh on a retained bridge", () => {
     } finally { await runtime.dispose(); f.close(); }
   });
 
+  it("applies retained session metadata without replacing the refreshed selectable ids", async () => {
+    const f = fixture();
+    try {
+      const common = [...baseRows, ["model-c", "Model C"]];
+      f.write([...common, ["model-retired", "Model Retired"]]);
+      await f.catalog.refresh(f.binding, "startup");
+      const sessionCandidate = await f.rpc(f.profile);
+      sessionCandidate.source = "agy-models+session-language-server";
+      const observed = sessionCandidate.models.find(row => row.id === "model-b")!;
+      observed.context = { native: 4096, maximum: 4096, effective: 4096 };
+      observed.evidence = [{
+        kind: "live-observation",
+        source: "agy language server",
+        observedAt: new Date().toISOString(),
+        runtimeVersion: sessionCandidate.cliVersion!,
+        adapterVersion: sessionCandidate.adapterVersion,
+        scopeRef: sessionCandidate.scope.fingerprint,
+        resolvedModel: observed.id,
+        context: { ...observed.context, method: "GetAvailableModels" },
+      }];
+      f.write([...common, ["model-neon", "Model Neon"]]);
+      expect(await f.catalog.refresh(f.binding, "manual")).toMatchObject({ added: 1, removed: 1 });
+
+      expect(await f.catalog.refresh(f.binding, "session", { candidate: sessionCandidate }))
+        .toMatchObject({ result: "published", added: 0, removed: 0 });
+      expect(f.catalog.models(f.binding).map(row => row.id))
+        .toEqual(["model-a", "model-b", "model-c", "model-neon"]);
+      expect(f.catalog.model(f.binding, observed.id)?.context).toEqual(observed.context);
+      expect(f.calls()).toEqual([["models"], ["models"], ["models"]]);
+    } finally { f.close(); }
+  });
+
   it("coalesces concurrent discoveries for one runtime, with credential scopes kept separate", async () => {
     const f = fixture();
     try {

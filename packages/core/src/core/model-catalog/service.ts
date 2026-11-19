@@ -532,6 +532,11 @@ export class ModelCatalogService {
       const known = this.lookup(binding).snapshot?.candidate;
       if (candidate.scope.provider === "google-antigravity"
         && known?.scope.fingerprint === candidate.scope.fingerprint) {
+        if (opts.candidate) {
+          validateCandidate(candidate);
+          // A retained session may still know the list from before a refresh.
+          candidate.models = mergeAgySessionMetadata(known.models, candidate.models, candidate.scope.fingerprint);
+        }
         candidate.models = candidate.models.map(model => {
           const priorModel = known.models.find(row => row.id === model.id);
           const evidence = priorModel?.evidence?.filter(row => row.kind === "live-observation"
@@ -834,6 +839,30 @@ export function bindingKey(binding: CatalogBinding): string { return `${binding.
 
 function uniqueBindings(bindings: ReadonlyArray<CatalogBinding>): CatalogBinding[] {
   return [...new Map(bindings.map((binding) => [bindingKey(binding), binding])).values()];
+}
+
+function mergeAgySessionMetadata(
+  selectable: ReadonlyArray<CatalogModel>,
+  observed: ReadonlyArray<CatalogModel>,
+  scope: string,
+): CatalogModel[] {
+  const byId = new Map(observed.map(model => [model.id, model]));
+  const latestObservation = (model: CatalogModel) => model.evidence
+    ?.filter(row => row.kind === "live-observation" && row.source === "agy language server"
+      && row.resolvedModel === model.id && row.scopeRef === scope)
+    .map(row => row.observedAt).sort().at(-1);
+  return selectable.map(model => {
+    const observation = byId.get(model.id);
+    const observedAt = observation && latestObservation(observation);
+    if (!observation || !observedAt || observedAt < (latestObservation(model) ?? "")) return model;
+    return {
+      ...model,
+      context: observation.context,
+      modalities: observation.modalities,
+      visionMode: observation.visionMode,
+      evidence: observation.evidence,
+    };
+  });
 }
 
 export function validateCandidate(candidate: AdapterCatalogCandidate): void {

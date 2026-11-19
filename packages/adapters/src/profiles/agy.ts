@@ -716,6 +716,48 @@ export function makeAgyProfile(opts: {
     mappingFile,
     mappingFile === LEGACY_MAPPING_FILE ? undefined : LEGACY_MAPPING_FILE,
   );
+  const fetchCatalog = async (refresh: boolean) => {
+    const rows = await getCatalogRows(runtime, refresh);
+    let models: ReadonlyArray<ManifestCatalogModel>;
+    if (opts.staticModels && opts.staticModels.length > 0) {
+      const byId = new Map(rows.map((row) => [row.modelId, row]));
+      models = opts.staticModels.map((model) => {
+        const row = byId.get(model.modelId);
+        return agyManifestModel(
+          model,
+          row,
+          runtime.descriptor.provenance.version,
+          catalogScope.fingerprint,
+        );
+      });
+    } else {
+      models = [...rows.filter((row) => row.recommended), ...rows.filter((row) => !row.recommended)]
+        .map((row) => agyManifestModel(
+          { modelId: row.modelId, name: row.displayName },
+          row,
+          runtime.descriptor.provenance.version,
+          catalogScope.fingerprint,
+        ));
+    }
+    const enriched = models.some((model) => model.evidence?.some((entry) =>
+      entry.kind === "live-observation" && entry.source === "agy language server"));
+    const candidate = await manifestCatalogSource({
+      provider: "google-antigravity",
+      backend: catalogScope.backend,
+      credentialProfile: catalogScope.credentialProfile,
+      policy: catalogScope.policy,
+      defaultModel,
+      models: () => models,
+      effort: { mechanism: "modelBaked", choices: ["default"] },
+      adapterVersion: AGENT_ADAPTER_VERSION,
+      source: opts.staticModels?.length
+        ? enriched ? "validated-manifest+agy-session-language-server" : "validated-manifest+agy-models"
+        : enriched ? "agy-models+session-language-server" : "agy-models",
+    }).fetch();
+    runtime.verify(process.cwd());
+    candidate.cliVersion = runtime.descriptor.provenance.version;
+    return candidate;
+  };
   const profile: AgentAdapter = asLocalAdapter({
     id: "agy",
     harness: "agy", provider: catalogScope.provider,
@@ -724,49 +766,7 @@ export function makeAgyProfile(opts: {
     defaultModel,
     catalog: {
       scope: () => catalogScope,
-      async fetch() {
-        let models: ReadonlyArray<ManifestCatalogModel>;
-        if (opts.staticModels && opts.staticModels.length > 0) {
-          const rows = await getCatalog(runtime);
-          const byId = new Map(rows.map((row) => [row.modelId, row]));
-          models = opts.staticModels.map((model) => {
-            const row = byId.get(model.modelId);
-            return agyManifestModel(
-              model,
-              row,
-              runtime.descriptor.provenance.version,
-              catalogScope.fingerprint,
-            );
-          });
-        } else {
-          const rows = await getCatalog(runtime);
-          models = [...rows.filter((row) => row.recommended), ...rows.filter((row) => !row.recommended)]
-            .map((row) => agyManifestModel(
-              { modelId: row.modelId, name: row.displayName },
-              row,
-              runtime.descriptor.provenance.version,
-              catalogScope.fingerprint,
-            ));
-        }
-        const enriched = models.some((model) => model.evidence?.some((entry) =>
-          entry.kind === "live-observation" && entry.source === "agy language server"));
-        const candidate = await manifestCatalogSource({
-          provider: "google-antigravity",
-          backend: catalogScope.backend,
-          credentialProfile: catalogScope.credentialProfile,
-          policy: catalogScope.policy,
-          defaultModel,
-          models: () => models,
-          effort: { mechanism: "modelBaked", choices: ["default"] },
-          adapterVersion: AGENT_ADAPTER_VERSION,
-          source: opts.staticModels?.length
-            ? enriched ? "validated-manifest+agy-session-language-server" : "validated-manifest+agy-models"
-            : enriched ? "agy-models+session-language-server" : "agy-models",
-        }).fetch();
-        runtime.verify(process.cwd());
-        candidate.cliVersion = runtime.descriptor.provenance.version;
-        return candidate;
-      },
+      fetch: () => fetchCatalog(true),
     },
     // agy bakes effort into the model choice (high/med/low model variants) —
     // there is no separate reasoning-effort knob, so the picker is suppressed.
@@ -780,7 +780,7 @@ export function makeAgyProfile(opts: {
     spawn() {
       return makeFakeAgyProcess(
         runtime,
-        profile.catalog,
+        { scope: profile.catalog.scope, fetch: () => fetchCatalog(false) },
         sessionStore,
         defaultModel,
         opts.printTimeoutSeconds,
@@ -2754,6 +2754,7 @@ export function selectAgyTurnModel(opts: {
 }
 
 const catalogRowsPromises = new Map<string, Promise<AgyCatalogEntry[]>>();
+const catalogRowsRefreshes = new Map<string, Promise<AgyCatalogEntry[]>>();
 const sessionCatalogMetadata = new Map<string, {
   rows: AgyCatalogEntry[];
   observedAt: string;
@@ -2768,29 +2769,29 @@ function catalogFailure(error: unknown): never {
   throw error;
 }
 
-async function getCatalogRows(runtime: AgyLaunchRuntime): Promise<AgyCatalogEntry[]> {
-  const cached = catalogRowsPromises.get(runtime.identityKey);
-  const base = cached ?? fetchAgyModelCatalog(runtime)
-    .then((rows) => {
-      // Don't PIN an empty result. A cold-start LS (or any transient empty
-      // response) would otherwise poison this module-level cache for the whole
-      // process lifetime, leaving the model picker permanently empty for every
-      // agy session — direct /seam model AND the new-thread wizard both read it.
-      // Only memoize a real catalog; reset so the next caller retries.
-      if (rows.length === 0) {
-        catalogRowsPromises.delete(runtime.identityKey);
-        console.error("[agy] catalog fetch returned no usable models — not caching; will retry");
-      }
-      return rows;
-    })
-    .catch((err) => {
-      // Don't pin the cache to an error — let the next caller retry.
-      catalogRowsPromises.delete(runtime.identityKey);
-      console.error("[agy] catalog fetch failed");
-      // A failed lifecycle is not an empty catalog; retain its classified error.
-      throw err;
-    });
-  if (!cached) catalogRowsPromises.set(runtime.identityKey, base);
+async function getCatalogRows(runtime: AgyLaunchRuntime, refresh = false): Promise<AgyCatalogEntry[]> {
+  const key = runtime.identityKey;
+  // Operational refreshes rediscover selectable ids; sessions reuse the last
+  // successful rows. Concurrent discoveries still share the same scoped probe.
+  let base = (!refresh && catalogRowsPromises.get(key)) || catalogRowsRefreshes.get(key);
+  if (!base) {
+    base = fetchAgyModelCatalog(runtime)
+      .then((rows) => {
+        if (rows.length === 0) {
+          console.error("[agy] catalog fetch returned no usable models — not caching; will retry");
+        } else {
+          catalogRowsPromises.set(key, Promise.resolve(rows));
+        }
+        return rows;
+      })
+      .catch((err) => {
+        console.error("[agy] catalog fetch failed");
+        // Return the real failure while retaining warm rows for sessions.
+        throw err;
+      })
+      .finally(() => catalogRowsRefreshes.delete(key));
+    catalogRowsRefreshes.set(key, base);
+  }
   const rows = await base;
   const observed = sessionCatalogMetadata.get(runtime.identityKey);
   return observed ? mergeAgyCatalogMetadata(rows, observed.rows, observed.observedAt, observed.runtimeVersion) : rows;

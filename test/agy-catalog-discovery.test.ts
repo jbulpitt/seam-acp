@@ -156,6 +156,8 @@ describe("#260 native catalog discovery is prompt-free", () => {
       cwd: root,
       environment: {
         SEAM_AGY_CAPABILITY_FIXTURE_DIR: fixtures,
+        // Context comes from the turn's LS; catalog children need no simulated lifetime here.
+        SEAM_AGY_MODELS_HOLD_MS: "0",
       },
     });
     const profile = makeAgyProfile({

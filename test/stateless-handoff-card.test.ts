@@ -131,6 +131,7 @@ function makeOrch(opts: {
   const store = testSessionStore({
     getByChannel: () => null,
     getPresetByName: (name: string) => fakePreset(name),
+    getPresetByNameScoped: (name: string): Preset | null => store.getPresetByName(name),
     recordDelegation: () => {},
     getDelegation: () => null,
     updateDelegationStatus: () => {},

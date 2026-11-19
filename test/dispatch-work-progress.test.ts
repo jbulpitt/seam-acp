@@ -79,6 +79,7 @@ beforeEach(async () => {
 afterEach(async () => {
   for (const watcher of watchers) watcher.stop();
   watchers.clear();
+  await host.loadPlugins();
   store.close();
   await rm(dataDir, { recursive: true, force: true });
 });

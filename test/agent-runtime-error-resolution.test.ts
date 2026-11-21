@@ -180,6 +180,33 @@ describe("#441 real runtime boundary to pure resolver (no providers)", () => {
       data: { trace: "native-resume", agentId: "codex", errorKind: "unclassified" } });
   });
 
+  it("carries Claude's unavailable-session SDK error through load stderr without a prompt", async () => {
+    const sessionId = "11111111-2222-4333-8444-555555555555";
+    const original = RequestError.resourceNotFound(sessionId);
+    const agentId = "claude-office";
+    const { runtime, logger, prompt } = fixture(original, error => classifyClaudeError(error, agentId), agentId);
+    const load = vi.fn().mockRejectedValue(original);
+    Object.assign(runtime, { connection: { loadSession: load, prompt },
+      stderrRing: ["synthetic resume diagnostics"] });
+    const thrown = await runtime.loadSession({ sessionId, cwd: "/fixture" }).catch(error => error);
+    expect(load).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ sessionId, cwd: "/fixture" }));
+    expect(prompt).not.toHaveBeenCalled();
+    expect(thrown).toMatchObject({ code: -32002, cause: original,
+      data: { uri: sessionId, errorKind: "session_gone", agentId } });
+    expect(thrown.message).toContain(original.message);
+    expect(thrown.message).toContain("synthetic resume diagnostics");
+    const classification = readErrorClassification(thrown)!;
+    expect(classification).toMatchObject({ errorKind: "session_gone", agentId, details: original.message });
+    expect(isRetryableBootAcquisitionError(thrown)).toBe(false);
+    expect(resolveError(classification, DEFAULT_ERROR_RULES)).toMatchObject({
+      startRung: 4, action: "recover", sessionUsable: "no",
+    });
+    expect(logger.warn).toHaveBeenCalledWith(expect.objectContaining({
+      agentId, operation: "session/load", errorKind: "session_gone", errorCode: -32002,
+      errorMessage: original.message, errorData: { uri: sessionId },
+    }), "adapter error classified");
+  });
+
   it("leaves a successful prompt unchanged and emits no failure metric", async () => {
     const classify = vi.fn(classifyClaudeError);
     const { runtime, logger, prompt } = fixture(new Error("unused"), classify);

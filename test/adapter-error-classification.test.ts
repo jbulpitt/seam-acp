@@ -58,6 +58,63 @@ function expectKind(
 }
 
 describe("#440 journal corpus — Claude", () => {
+  const missingSessionId = "11111111-2222-4333-8444-555555555555";
+
+  it.each(["SDK URI", "code/message only"])("recognizes an unavailable Claude session from %s", shape => {
+    const sdkError = RequestError.resourceNotFound(missingSessionId);
+    const error = shape === "SDK URI" ? sdkError
+      : Object.assign(new Error(sdkError.message), { code: sdkError.code });
+    expect(classifyClaudeError(error)).toMatchObject({
+      errorKind: "session_gone", agentId: "claude", details: sdkError.message,
+    });
+    expect(error.code).toBe(-32002);
+    expect(sdkError.data).toEqual({ uri: missingSessionId });
+  });
+
+  it("attributes the SDK missing-session error to its actual Claude profile", () => {
+    const profile = makeClaudeProfile({ id: "claude-office", defaultModel: "default" });
+    const error = RequestError.resourceNotFound(missingSessionId);
+    expect(profile.classifyError?.(error)).toMatchObject({
+      errorKind: "session_gone", agentId: "claude-office", details: error.message,
+    });
+    expect(error).toMatchObject({ code: -32002,
+      data: { uri: missingSessionId, errorKind: "session_gone", agentId: "claude-office" } });
+  });
+
+  it.each([
+    { name: "wrong code", code: -32603, message: `Resource not found: ${missingSessionId}` },
+    { name: "string code", code: "-32002", message: `Resource not found: ${missingSessionId}` },
+    { name: "no code", code: undefined, message: `Resource not found: ${missingSessionId}` },
+    { name: "code alone", code: -32002, message: "Resource not found" },
+    { name: "file URI", code: -32002, message: "Resource not found: file:///fixture/session.jsonl",
+      data: { uri: "file:///fixture/session.jsonl" } },
+    { name: "non-UUID session", code: -32002, message: "Resource not found: saved-session" },
+    { name: "query closed", code: -32002, message: "Query closed before response received" },
+    { name: "message suffix", code: -32002, message: `Resource not found: ${missingSessionId} during load` },
+    { name: "trailing newline", code: -32002, message: `Resource not found: ${missingSessionId}\n` },
+    { name: "different UUID URI", code: -32002, message: `Resource not found: ${missingSessionId}`,
+      data: { uri: "66666666-7777-4888-8999-aaaaaaaaaaaa" } },
+    { name: "file URI alongside UUID message", code: -32002, message: `Resource not found: ${missingSessionId}`,
+      data: { uri: "file:///fixture/session.jsonl" } },
+    { name: "null supplied URI", code: -32002, message: `Resource not found: ${missingSessionId}`, data: { uri: null } },
+  ])("does not infer a missing session from $name", ({ code, message, data }) => {
+    const error = Object.assign(new Error(message), { code, ...(data ? { data } : {}) });
+    expectKind(classifyClaudeError(error), "unclassified", "claude");
+  });
+
+  it.each([
+    { data: { errorKind: "authentication_failed" }, kind: "auth_required" },
+    { data: { errorKind: "auth_expired" }, kind: "auth_expired" },
+    { data: { errorKind: "model_not_found" }, kind: "model_not_found" },
+    { data: { errorKind: "server_error" }, kind: "server_error" },
+    { data: { status: 401 }, kind: "auth_required" },
+    { data: { status: 429 }, kind: "rate_limit" },
+    { data: { status: 500 }, kind: "server_error" },
+  ] as const)("retains explicit $kind precedence over the resource signature", ({ data, kind }) => {
+    const error = new RequestError(-32002, `Resource not found: ${missingSessionId}`, { uri: missingSessionId, ...data });
+    expectKind(classifyClaudeError(error), kind, "claude");
+  });
+
   it("classifies an expired OAuth session flattened into DispatchTurnError (data null)", () => {
     // journal 2026-09-13: err.type DispatchTurnError, data absent, reason in the message.
     const err = dispatchTurn(

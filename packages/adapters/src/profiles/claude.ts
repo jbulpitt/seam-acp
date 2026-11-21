@@ -30,6 +30,7 @@ import { redactProbeText } from "../probe-process.js";
 import {
   classifyAndAttach,
   classifyWith,
+  classifySharedRuntimeError,
   classified,
   isAdapterErrorKind,
   httpStatusOf,
@@ -107,6 +108,12 @@ function matchClaudeError(ctx: ClassifyContext): AdapterErrorClassification | Ad
   }
   if (acpKind && isAdapterErrorKind(acpKind) && acpKind !== "unclassified") {
     return classified(agentId, acpKind, { details: message, sourceKind: acpKind });
+  }
+  const session = /^Resource not found: ([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})$/.exec(message);
+  if (ctx.errorCode === -32002 && session && session[0] === message
+      && (!data || !("uri" in data) || data.uri === session[1])) {
+    return classifySharedRuntimeError(ctx)
+      ?? classified(agentId, "session_gone", { details: message });
   }
   return null;
 }

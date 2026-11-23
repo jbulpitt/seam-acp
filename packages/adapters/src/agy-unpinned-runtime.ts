@@ -166,7 +166,16 @@ function probeOrdinaryAgyVersion(executable: string, cwd: string, env: NodeJS.Pr
     maxBuffer: VERSION_OUTPUT_LIMIT,
   });
   if (result.error || result.status !== 0 || result.signal) {
-    throw new Error("ordinary agy --version failed; the unpinned binary is not usable");
+    const details = [
+      result.error && `code=${(result.error as NodeJS.ErrnoException).code ?? result.error.name}`,
+      result.status !== null && `exit=${result.status}`,
+      result.signal && `signal=${result.signal}`,
+    ].filter(Boolean).join(", ");
+    // Keep launch paths and captured output out of the published diagnostic.
+    throw new Error(
+      `ordinary agy --version failed (${details}); the unpinned binary is not usable`,
+      { cause: result.error },
+    );
   }
   const observed = result.stdout.trim().split(/\r?\n/, 1)[0]?.slice(0, 256) ?? "";
   return observed || "unpinned";

@@ -221,6 +221,46 @@ async function prepromptBoundary(h: ReturnType<typeof offlineSchedule>, id: stri
 }
 
 describe("pre-prompt bridge reconnect on the scheduled execution paths", () => {
+  it.each(["fresh", "stale"] as const)("delivers a scheduled turn on a retained session with %s activity", async activity => {
+    const h = offlineSchedule("live", true);
+    const updatedUtc = new Date(Date.now() - (activity === "stale" ? 60_000 : 0)).toISOString();
+    h.store.upsert({ ...h.record, updatedUtc });
+    const child = h.remoteSpawn();
+    h.remoteSpawn.mockClear();
+    const adopt = vi.fn(() => child);
+    Object.assign(h.mux, { adopt });
+    const sendCmd = h.mux.sendCmd.getMockImplementation()!;
+    h.mux.sendCmd.mockImplementation((action, payload) => action === "listSlots"
+      ? Promise.resolve({ health: [{
+          slot: child.slot, alive: true,
+          session: { agentId: h.record.agentId, acpSessionId: h.record.acpSessionId,
+            threadId: h.record.channelRef, busy: false, updatedUtc },
+        }] })
+      : sendCmd(action, payload));
+    await h.orch.loadPlugins();
+    const manager = new ScheduledPromptManager({ store: h.store, logger: h.logger,
+      resolveExecution: row => h.orch.scheduleExecution(row),
+      onFire: (id, occurrence) => h.orch.runScheduledPrompt(id, occurrence) });
+    const key = scheduledOccurrenceKey(h.row.id);
+    try { await manager["fire"](h.row.id, key); }
+    finally { manager.stop(); }
+
+    expect(adopt).toHaveBeenCalledOnce();
+    const attempt = h.store.turnAttempts.get(key.id);
+    expect(attempt, JSON.stringify({
+      error: attempt?.outcome?.error,
+      submissions: attempt?.submissions?.map(({ phase, rpcInvokedUtc }) => ({ phase, rpcInvokedUtc })),
+      prompts: h.calls.prompts.length,
+    })).toMatchObject({
+      state: "completed", deliveryDone: true, outcome: { status: "completed", output: "synthetic result" },
+    });
+    expect(h.store.getScheduled(h.row.id)?.lastStatus).toBe("ok");
+    expect(h.calls.prompts).toHaveLength(1);
+    expect(h.calls.prompts[0].sessionId).toBe(h.record.acpSessionId);
+    expect(h.remoteSpawn).not.toHaveBeenCalled();
+    expect(h.calls.loads).toEqual([]);
+  });
+
   it.each([true, false])("keeps only durable waits alive beyond the optional-analysis fallback (durable=%s)", async durable => {
     const h = offlineSchedule("live"); h.disconnect();
     vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout"] });

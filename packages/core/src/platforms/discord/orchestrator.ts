@@ -20736,15 +20736,14 @@ async function raceWithTimeout<T>(
   timeoutMs: number,
   lastActivityAt?: () => number,
 ): Promise<T | "timeout"> {
-  // #460: the deadline is silence since the same last-output mark turnHealth
-  // reads, not wall time since prompt start. Omitting the mark keeps the old
-  // wall clock (no runtime yet). A missing hang-probe report is not read.
+  // A new prompt gets a full silence window while it prepares its submission.
+  // Later runtime activity extends the deadline.
   const started = Date.now();
   return raceUntilSilence(promise, {
     silenceMs: timeoutMs,
     lastActivityAt: () => {
       const at = lastActivityAt?.();
-      return typeof at === "number" && Number.isFinite(at) ? at : started;
+      return typeof at === "number" && Number.isFinite(at) ? Math.max(started, at) : started;
     },
   });
 }
